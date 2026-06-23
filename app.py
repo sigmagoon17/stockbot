@@ -64,12 +64,12 @@ st.markdown(
             font-weight: 600;
         }
         div.stButton > button[kind="primary"] {
-            background: #0c604e;
-            border-color: #0c604e;
+            background: #000080;
+            border-color: #000080;
         }
         div.stButton > button[kind="primary"]:hover {
-            background: #084a3c;
-            border-color: #084a3c;
+            background: #1E2A56;
+            border-color: #1E2A56;
         }
         [data-baseweb="tab-list"] {
             gap: 1.25rem;
