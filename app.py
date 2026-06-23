@@ -976,9 +976,9 @@ if scan_button:
         event_analyses,
     ) = scan_watchlist(tickers, preferences)
     st.session_state["latest_event_analyses"] = event_analyses
-    errors = history_errors + errors
     history_candidates = select_history_candidates(scored_trades)
-    save_history(history_candidates, event_analyses)
+    history_save_errors = save_history(history_candidates, event_analyses)
+    errors = history_errors + errors + history_save_errors
 
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)

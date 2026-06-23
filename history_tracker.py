@@ -87,7 +87,7 @@ def append_scan_history(scored_trades, event_analyses=None):
         )
 
     if not rows:
-        return
+        return []
 
     def candidate_key(row):
         return (
@@ -99,13 +99,16 @@ def append_scan_history(scored_trades, event_analyses=None):
             row["entry_type"],
         )
 
-    existing_rows = (
-        supabase.table("scan_history")
-        .select("ticker,strategy,expiration,long_strike,short_strike,entry_type")
-        .gte("scan_time", date.today().isoformat())
-        .execute()
-        .data
-    )
+    try:
+        existing_rows = (
+            supabase.table("scan_history")
+            .select("ticker,strategy,expiration,long_strike,short_strike,entry_type")
+            .gte("scan_time", date.today().isoformat())
+            .execute()
+            .data
+        )
+    except Exception as error:
+        return [f"Could not check existing scan history: {error}"]
     existing_keys = {candidate_key(row) for row in existing_rows}
     new_rows = []
     for row in rows:
@@ -115,7 +118,12 @@ def append_scan_history(scored_trades, event_analyses=None):
             existing_keys.add(key)
 
     if new_rows:
-        supabase.table("scan_history").insert(new_rows).execute()
+        try:
+            supabase.table("scan_history").insert(new_rows).execute()
+        except Exception as error:
+            return [f"Could not save scan history: {error}"]
+
+    return []
 
 
 def expiration_close(ticker: str, expiration: date) -> float | None:
