@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 import datetime
 import supabase
-from yfinance import yf
+import yfinance as yf
 
 from history_tracker import (
     append_scan_history as save_history,
