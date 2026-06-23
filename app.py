@@ -1,5 +1,7 @@
 from collections import Counter
 from datetime import date
+import hmac
+import os
 import pandas as pd
 import streamlit as st
 import datetime
@@ -584,6 +586,26 @@ def render_results():
     )
 
 
+def render_private_results():
+    owner_password = os.getenv("OWNER_DASHBOARD_PASSWORD")
+    if not owner_password:
+        return
+
+    if st.session_state.get("results_unlocked"):
+        with st.sidebar:
+            if st.button("Lock Results", width="stretch"):
+                st.session_state["results_unlocked"] = False
+                st.rerun()
+        render_results()
+        return
+
+    with st.sidebar:
+        entered_password = st.text_input("Owner Password", type="password")
+        if entered_password and hmac.compare_digest(entered_password, owner_password):
+            st.session_state["results_unlocked"] = True
+            st.rerun()
+
+
 st.title("Options Scanner")
 
 with st.sidebar:
@@ -726,4 +748,4 @@ if scan_button:
     )
 
 
-render_results()
+render_private_results()
