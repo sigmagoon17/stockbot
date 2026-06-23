@@ -68,8 +68,8 @@ st.markdown(
             border-color: #000080;
         }
         div.stButton > button[kind="primary"]:hover {
-            background: #1E2A56;
-            border-color: #1E2A56;
+            background: #123499;
+            border-color: #123499;
         }
         [data-baseweb="tab-list"] {
             gap: 1.25rem;
