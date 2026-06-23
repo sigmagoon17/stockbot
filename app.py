@@ -8,6 +8,7 @@ import yfinance as yf
 
 from history_tracker import (
     append_scan_history as save_history,
+    fetch_expired_history,
     update_expired_history as update_history,
 )
 
@@ -465,6 +466,124 @@ def ticker_rejection_rows(trades, rejected_trades, scored_trades):
     return rows
 
 
+def render_results():
+    st.subheader("Results")
+    result_rows, result_errors = fetch_expired_history()
+    for error in result_errors:
+        st.warning(error)
+    if not result_rows:
+        st.info("No expired candidates have results yet.")
+        return
+
+    results = pd.DataFrame(result_rows)
+    results["expiration_pnl"] = pd.to_numeric(results["expiration_pnl"])
+
+    expired_count = len(results)
+    win_rate = (results["expiration_pnl"] > 0).mean() * 100
+    average_pnl = results["expiration_pnl"].mean()
+    total_pnl = results["expiration_pnl"].sum()
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Expired Candidates", expired_count)
+    metric_columns[1].metric("Win Rate", f"{win_rate:.1f}%")
+    metric_columns[2].metric("Average Expiration P/L", f"${average_pnl:.2f}")
+    metric_columns[3].metric("Total Expiration P/L", f"${total_pnl:.2f}")
+
+    strategy_results = (
+        results.groupby("strategy", as_index=False)
+        .agg(
+            Candidates=("id", "count"),
+            Win_Rate=("expiration_pnl", lambda pnl: (pnl > 0).mean() * 100),
+            Average_PnL=("expiration_pnl", "mean"),
+            Total_PnL=("expiration_pnl", "sum"),
+        )
+        .rename(
+            columns={
+                "strategy": "Strategy",
+                "Win_Rate": "Win Rate",
+                "Average_PnL": "Average P/L",
+                "Total_PnL": "Total P/L",
+            }
+        )
+    )
+    strategy_results["Win Rate"] = strategy_results["Win Rate"].round(1)
+    strategy_results["Average P/L"] = strategy_results["Average P/L"].round(2)
+    strategy_results["Total P/L"] = strategy_results["Total P/L"].round(2)
+    st.dataframe(
+        strategy_results,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
+            "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Total P/L": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+
+    results["Score Band"] = pd.cut(
+        results["setup_score"],
+        bins=[-1, 59, 69, 79, 89, 100],
+        labels=["Below 60", "60-69", "70-79", "80-89", "90-100"],
+    )
+    score_results = (
+        results.groupby("Score Band", observed=True, as_index=False)
+        .agg(
+            Candidates=("id", "count"),
+            Win_Rate=("expiration_pnl", lambda pnl: (pnl > 0).mean() * 100),
+            Average_PnL=("expiration_pnl", "mean"),
+            Total_PnL=("expiration_pnl", "sum"),
+        )
+        .rename(
+            columns={
+                "Win_Rate": "Win Rate",
+                "Average_PnL": "Average P/L",
+                "Total_PnL": "Total P/L",
+            }
+        )
+    )
+    score_results["Win Rate"] = score_results["Win Rate"].round(1)
+    score_results["Average P/L"] = score_results["Average P/L"].round(2)
+    score_results["Total P/L"] = score_results["Total P/L"].round(2)
+    st.dataframe(
+        score_results,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
+            "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Total P/L": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+
+    recent_results = results[
+        [
+            "ticker",
+            "strategy",
+            "expiration",
+            "setup_score",
+            "expiration_close",
+            "expiration_pnl",
+        ]
+    ].rename(
+        columns={
+            "ticker": "Ticker",
+            "strategy": "Strategy",
+            "expiration": "Expiration",
+            "setup_score": "Setup Score",
+            "expiration_close": "Expiration Close",
+            "expiration_pnl": "Expiration P/L",
+        }
+    )
+    st.dataframe(
+        recent_results,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Expiration Close": st.column_config.NumberColumn(format="$%.2f"),
+            "Expiration P/L": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+
+
 st.title("Options Scanner")
 
 with st.sidebar:
@@ -605,3 +724,6 @@ if scan_button:
         hide_index=True,
         column_config={"Rejected %": st.column_config.NumberColumn(format="%.0f%%")},
     )
+
+
+render_results()

@@ -210,3 +210,17 @@ def update_expired_history(include_today: bool = False) -> list[str]:
             errors.append(f"Could not save {row['ticker']} expiration result: {error}")
 
     return errors
+
+
+def fetch_expired_history() -> tuple[list[dict], list[str]]:
+    try:
+        response = (
+            supabase.table("scan_history")
+            .select("*")
+            .eq("expiration_status", "expired")
+            .order("expiration", desc=True)
+            .execute()
+        )
+        return response.data, []
+    except Exception as error:
+        return [], [f"Could not load results from Supabase: {error}"]
