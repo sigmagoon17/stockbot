@@ -30,6 +30,64 @@ from stock2dupe import (
 
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
+st.markdown(
+    """
+    <style>
+        .stApp {
+            background: #f6f8f6;
+            color: #15221e;
+        }
+        .block-container {
+            max-width: 1440px;
+            padding-top: 2rem;
+            padding-bottom: 2.5rem;
+        }
+        [data-testid="stSidebar"] {
+            background: #eef2ef;
+            border-right: 1px solid #d8e0db;
+        }
+        [data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #d8e0db;
+            border-radius: 6px;
+            padding: 0.7rem 0.85rem;
+        }
+        [data-testid="stMetricLabel"] {
+            color: #53645c;
+        }
+        [data-testid="stMetricValue"] {
+            color: #0c604e;
+        }
+        div.stButton > button,
+        div.stDownloadButton > button {
+            border-radius: 6px;
+            font-weight: 600;
+        }
+        div.stButton > button[kind="primary"] {
+            background: #0c604e;
+            border-color: #0c604e;
+        }
+        div.stButton > button[kind="primary"]:hover {
+            background: #084a3c;
+            border-color: #084a3c;
+        }
+        [data-baseweb="tab-list"] {
+            gap: 1.25rem;
+            border-bottom: 1px solid #d8e0db;
+        }
+        [data-baseweb="tab"] {
+            height: 42px;
+            padding: 0 0.2rem;
+            font-weight: 600;
+        }
+        [data-baseweb="tab-highlight"] {
+            background-color: #0c604e;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def select_top_candidates(scored_trades, per_ticker: int = 3):
     selected = []
@@ -348,6 +406,33 @@ def candidate_row(scored):
 
 def candidate_rows(scored_trades):
     return [candidate_row(scored) for scored in select_top_candidates(scored_trades)]
+
+
+def candidate_column_config():
+    return {
+        "Credit": st.column_config.NumberColumn(
+            "Credit", help="Premium received per spread.", format="$%.2f"
+        ),
+        "Debit": st.column_config.NumberColumn(
+            "Debit", help="Amount paid to open the spread.", format="$%.2f"
+        ),
+        "Max Profit": st.column_config.NumberColumn(
+            "Max Profit", help="Maximum profit per spread at expiration.", format="$%.2f"
+        ),
+        "Max Risk": st.column_config.NumberColumn(
+            "Max Risk", help="Maximum loss per spread at expiration.", format="$%.2f"
+        ),
+        "Setup Score": st.column_config.NumberColumn(
+            "Setup Score",
+            help="How closely the candidate matches the scanner's current rules.",
+            format="%d / 100",
+        ),
+        "Volatility Rank": st.column_config.NumberColumn(
+            "Volatility Rank",
+            help="Current realized volatility compared with the last year of price movement.",
+            format="%.1f",
+        ),
+    }
 
 
 def debit_candidate_rows(scored_trades):
@@ -699,25 +784,27 @@ def render_private_results():
 
 
 st.title("Options Scanner")
+st.caption(
+    "Yahoo Finance data may be delayed. Volatility Rank uses historical price movement."
+)
 
 with st.sidebar:
-    st.header("Scan Settings")
+    st.header("Scanner")
     ticker_text = st.text_area("Tickers", "AAPL, SPY, QQQ, NVDA, MSFT, COHR")
     outlook = st.selectbox("Outlook", ["neutral", "bullish", "bearish", "income"])
     max_risk = st.number_input("Maximum Risk Per Spread", min_value=50, value=500, step=50)
     risk_tolerance = st.selectbox("Risk Tolerance", ["conservative", "moderate", "aggressive"], index=1)
-    use_nearest_expiration = st.checkbox("Use Nearest Available Expiration")
-    use_test_expiration = st.checkbox(
-        "Test a Specific Expiration", disabled=use_nearest_expiration
-    )
-    test_expiration = (
-        st.date_input("Test Expiration", min_value=date.today())
-        if use_test_expiration
-        else None
-    )
-    scan_button = st.button("Scan Watchlist", type="primary", width='stretch')
-
-st.caption("Yahoo Finance data can be delayed. Realized volatility rank is a historical-price proxy, not implied-volatility rank.")
+    with st.expander("Advanced Expiration Settings"):
+        use_nearest_expiration = st.checkbox("Use Nearest Available Expirations")
+        use_test_expiration = st.checkbox(
+            "Test a Specific Expiration", disabled=use_nearest_expiration
+        )
+        test_expiration = (
+            st.date_input("Test Expiration", min_value=date.today())
+            if use_test_expiration
+            else None
+        )
+    scan_button = st.button("Scan Watchlist", type="primary", width="stretch")
 
 if scan_button:
     tickers = [ticker.strip().upper() for ticker in ticker_text.split(",") if ticker.strip()]
@@ -738,106 +825,123 @@ if scan_button:
     errors = history_errors + errors
     history_candidates = select_history_candidates(scored_trades)
     save_history(history_candidates)
-    st.subheader("Strategy Diagnostics")
-    strategy_df = pd.DataFrame(
-        strategy_rejection_rows(trades, rejected_trades, scored_trades)
-    )
-    for ticker in sorted(strategy_df["Ticker"].unique()):
-        ticker_strategies = strategy_df[strategy_df["Ticker"] == ticker].drop(
-            columns="Ticker"
-        )
-        with st.expander(f"{ticker} strategy diagnostics"):
-            st.dataframe(
-                ticker_strategies,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Rejected %": st.column_config.NumberColumn(format="%.0f%%")
-                },
-            )
+
+    top_score = scored_trades[0].total_score if scored_trades else None
+    metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
+    metric_candidates.metric("Passing Candidates", len(scored_trades))
+    metric_score.metric("Highest Score", f"{top_score}/100" if top_score else "None")
+    metric_tracked.metric("Saved to History", len(history_candidates))
+    metric_tickers.metric("Tickers Scanned", len(ticker_data))
+
     if errors:
         for error in errors:
             st.warning(error)
 
-    st.subheader("Data Snapshot")
-    st.dataframe(pd.DataFrame(ticker_data), width='stretch', hide_index=True)
-
-    st.subheader("Top Candidates")
-    candidates = candidate_rows(scored_trades)
-    if candidates:
-        st.dataframe(pd.DataFrame(candidates), width='stretch', hide_index=True)
-        top_25_csv = pd.DataFrame(
-            [candidate_row(scored) for scored in history_candidates]
-        ).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Top 25 CSV",
-            data=top_25_csv,
-            file_name="top_25_options_candidates.csv",
-            mime="text/csv",
-            width="content",
-        )
-        for scored in select_top_candidates(scored_trades):
-            trade = scored.trade
-            with st.expander(
-                f"{trade.ticker} {trade.strategy.title()} | "
-                f"Setup Score {scored.total_score}/100"
-            ):
-                st.write(scored.explanation)
-                st.json(scored.category_scores)
-    else:
-        st.info("No candidates passed the current filters.")
-
-    st.subheader("Best Debit Spread Candidates")
-    debit_candidates = debit_candidate_rows(scored_trades)
-    scored_debit_candidates = [
-        scored for scored in scored_trades if scored.trade.entry_type == "debit"
-    ]
-    if debit_candidates:
-        st.dataframe(
-            pd.DataFrame(debit_candidates),
-            width="stretch",
-            hide_index=True,
-        )
-        for scored in scored_debit_candidates[:3]:
-            trade = scored.trade
-            with st.expander(
-                f"{trade.ticker} {trade.strategy.title()} | "
-                f"Setup Score {scored.total_score}/100"
-            ):
-                st.write(scored.explanation)
-                st.json(scored.category_scores)
-    else:
-        st.info("No debit spreads passed the current filters.")
-
-    st.subheader("Best Credit Spread Candidates")
-    credit_candidates = credit_candidate_rows(scored_trades)
-    scored_credit_candidates = [
-        scored for scored in scored_trades if scored.trade.entry_type == "credit"
-    ]
-    if credit_candidates:
-        st.dataframe(
-            pd.DataFrame(credit_candidates),
-            width="stretch",
-            hide_index=True,
-        )
-        for scored in scored_credit_candidates[:3]:
-            trade = scored.trade
-            with st.expander(
-                f"{trade.ticker} {trade.strategy.title()} | "
-                f"Setup Score {scored.total_score}/100"
-            ):
-                st.write(scored.explanation)
-                st.json(scored.category_scores)
-    else:
-        st.info("No credit spreads passed the current filters.")
-
-    st.subheader("Ticker Status")
-    st.dataframe(
-        pd.DataFrame(ticker_rejection_rows(trades, rejected_trades, scored_trades)),
-        width='stretch',
-        hide_index=True,
-        column_config={"Rejected %": st.column_config.NumberColumn(format="%.0f%%")},
+    candidates_tab, market_tab, diagnostics_tab = st.tabs(
+        ["Candidates", "Market Data", "Diagnostics"]
     )
+
+    with candidates_tab:
+        st.subheader("Top Candidates")
+        candidates = candidate_rows(scored_trades)
+        if candidates:
+            st.dataframe(
+                pd.DataFrame(candidates),
+                width="stretch",
+                hide_index=True,
+                column_config=candidate_column_config(),
+            )
+            top_25_csv = pd.DataFrame(
+                [candidate_row(scored) for scored in history_candidates]
+            ).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Tracked Candidates CSV",
+                data=top_25_csv,
+                file_name="top_25_options_candidates.csv",
+                mime="text/csv",
+                width="content",
+            )
+
+            st.subheader("Candidate Details")
+            for scored in select_top_candidates(scored_trades):
+                trade = scored.trade
+                with st.expander(
+                    f"{trade.ticker} | {trade.strategy.title()} | "
+                    f"Score {scored.total_score}/100"
+                ):
+                    st.write(scored.explanation)
+                    score_rows = pd.DataFrame(
+                        [
+                            {"Score Area": area, "Points": points}
+                            for area, points in scored.category_scores.items()
+                        ]
+                    )
+                    st.dataframe(score_rows, width="content", hide_index=True)
+        else:
+            st.info("No candidates passed the current filters.")
+
+        debit_column, credit_column = st.columns(2)
+        with debit_column:
+            st.subheader("Best Debit Spreads")
+            debit_candidates = debit_candidate_rows(scored_trades)
+            if debit_candidates:
+                st.dataframe(
+                    pd.DataFrame(debit_candidates),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=candidate_column_config(),
+                )
+            else:
+                st.info("No debit spreads passed.")
+
+        with credit_column:
+            st.subheader("Best Credit Spreads")
+            credit_candidates = credit_candidate_rows(scored_trades)
+            if credit_candidates:
+                st.dataframe(
+                    pd.DataFrame(credit_candidates),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=candidate_column_config(),
+                )
+            else:
+                st.info("No credit spreads passed.")
+
+    with market_tab:
+        st.subheader("Market Data")
+        st.dataframe(pd.DataFrame(ticker_data), width="stretch", hide_index=True)
+
+    with diagnostics_tab:
+        st.subheader("Strategy Diagnostics")
+        strategy_df = pd.DataFrame(
+            strategy_rejection_rows(trades, rejected_trades, scored_trades)
+        )
+        if not strategy_df.empty:
+            for ticker in sorted(strategy_df["Ticker"].unique()):
+                ticker_strategies = strategy_df[strategy_df["Ticker"] == ticker].drop(
+                    columns="Ticker"
+                )
+                with st.expander(f"{ticker} strategy diagnostics"):
+                    st.dataframe(
+                        ticker_strategies,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "Rejected %": st.column_config.NumberColumn(format="%.0f%%")
+                        },
+                    )
+
+        st.subheader("Ticker Status")
+        st.dataframe(
+            pd.DataFrame(
+                ticker_rejection_rows(trades, rejected_trades, scored_trades)
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Rejected %": st.column_config.NumberColumn(format="%.0f%%")
+            },
+        )
 
 
 render_private_results()
