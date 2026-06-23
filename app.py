@@ -669,7 +669,26 @@ def render_results():
     for error in result_errors:
         st.warning(error)
     if not result_rows:
-        st.info("No expired candidates have results yet.")
+        metric_columns = st.columns(4)
+        metric_columns[0].metric("Completed Candidates", 0)
+        metric_columns[1].metric("Win Rate", "N/A")
+        metric_columns[2].metric("Average Outcome P/L", "N/A")
+        metric_columns[3].metric("Total Outcome P/L", "N/A")
+
+        st.subheader("Performance Scorecard")
+        st.caption("Completed candidates will appear here after they expire or are closed.")
+        score_tab, strategy_tab, entry_type_tab = st.tabs(
+            ["Score Bands", "Strategies", "Debit vs. Credit"]
+        )
+        with score_tab:
+            st.info("No completed candidates are available yet.")
+        with strategy_tab:
+            st.info("No completed candidates are available yet.")
+        with entry_type_tab:
+            st.info("No completed candidates are available yet.")
+
+        st.subheader("Completed Candidates")
+        st.info("No completed candidates are available yet.")
         return
 
     results = pd.DataFrame(result_rows)
