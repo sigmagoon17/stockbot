@@ -536,7 +536,7 @@ def score_profit_risk(trade: Trade) -> int:
     return 4
 
 
-def score_trade(trade: Trade, preferences: ScanPreferences) -> ScoredTrade:
+def score_trade(trade: Trade, preferences: ScanPreferences, event_adjustment: int = 0) -> ScoredTrade:
     category_scores = {
         "Expected Move": score_expected_move(trade),
         "Volatility Rank": score_volatility_rank(trade),
@@ -548,7 +548,6 @@ def score_trade(trade: Trade, preferences: ScanPreferences) -> ScoredTrade:
     }
     raw_total_score = sum(category_scores.values())
     quant_score = max(0, min(100, round(raw_total_score / MAX_SETUP_SCORE * 100)))
-    event_adjustment = 0
     total_score = max(0, min(100, quant_score + event_adjustment))
     reasons = passing_reasons(trade)
 
@@ -662,15 +661,17 @@ def spread_summary(trade: Trade) -> str:
     )
 
 
-def scan_trades(trades: list[Trade], preferences: ScanPreferences,) -> tuple[list[ScoredTrade], list[tuple[Trade, list[str]]]]:
+def scan_trades(trades: list[Trade], preferences: ScanPreferences, event_adjustments: dict[str, int] | None= None) -> tuple[list[ScoredTrade], list[tuple[Trade, list[str]]]]:
     passing = []
     rejected = []
-
+    if event_adjustments is None:
+        event_adjustments = {}
     for trade in trades:
         passed, reasons = passes_filters(trade, preferences)
 
         if passed:
-            passing.append(score_trade(trade, preferences))
+            event_adjustment = event_adjustments.get(trade.ticker, 0)
+            passing.append(score_trade(trade, preferences, event_adjustment))
         else:
             rejected.append((trade, reasons))
 
@@ -1086,6 +1087,34 @@ def sample_trades() -> list[Trade]:
         Trade("COIN", "call credit spread", "2026-08-07", "call",   0.23, 88,  False, 700,  180, 49, 2.10, 2.34, 2.20,   7.80, 245,  30,      286,   296,  4.70,       4.94,       2.50,      2.60,      0.23,        0.14),
         Trade("AMZN", "put credit spread",  "2026-07-17", "put",   -0.14, 41,  False, 350,  70,  24, 0.75, 0.86, 0.80,   4.20, 185,  10,      176,   171,  1.40,       1.49,       0.60,      0.63,     -0.14,       -0.08),
     ]
+
+
+def test_event_adjustments() -> None:
+    preferences = ScanPreferences(
+        max_risk=500,
+        outlook="neutral",
+        risk_tolerance="moderate",
+    )
+    scored_trades, _ = scan_trades(
+        sample_trades(), preferences, event_adjustments={"AAPL": -5}
+    )
+
+    aapl_trade = next(
+        scored for scored in scored_trades if scored.trade.ticker == "AAPL"
+    )
+    expected_aapl_score = max(0, min(100, aapl_trade.quant_score - 5))
+    assert aapl_trade.event_adjustment == -5
+    assert aapl_trade.total_score == expected_aapl_score
+
+    for scored in scored_trades:
+        if scored.trade.ticker != "AAPL":
+            assert scored.event_adjustment == 0
+
+    print(
+        "Event adjustment test passed: "
+        f"AAPL {aapl_trade.quant_score} + ({aapl_trade.event_adjustment}) "
+        f"= {aapl_trade.total_score}"
+    )
 
 def print_rejections(trades, rejected_trades, scored_trades):
     passing_by_ticker = Counter(

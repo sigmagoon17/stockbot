@@ -28,6 +28,8 @@ from stock2dupe import (
     scan_trades,
 )
 
+from event_analysis import get_event_analysis
+
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
 st.markdown(
@@ -144,6 +146,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
     trades = []
     ticker_data = []
     errors = []
+    event_adjustments = {}
     progress = st.progress(0, text="Preparing scan")
 
     for index, ticker in enumerate(tickers, start=1):
@@ -174,6 +177,8 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     ),
                 }
             )
+            event_analysis = get_event_analysis(ticker, preferences.outlook)
+            event_adjustments[ticker] = event_analysis.adjustment
             trades.extend(
                 build_iron_condor(
                     option_chain, price, earnings_date, volatility_rank, preferences
@@ -204,7 +209,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
             errors.append(f"{ticker}: {error}")
 
     progress.empty()
-    scored_trades, rejected_trades = scan_trades(trades, preferences)
+    scored_trades, rejected_trades = scan_trades(trades, preferences, event_adjustments)
     return scored_trades, rejected_trades, trades, ticker_data, errors
 def append_scan_history(scored_trades):
     rows = []
