@@ -1,5 +1,6 @@
 import os
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from dotenv import load_dotenv
@@ -20,12 +21,17 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 def append_scan_history(scored_trades):
     rows = []
-    current_time = datetime.now(timezone.utc).isoformat()
+    scan_timestamp = datetime.now(timezone.utc)
+    current_time = scan_timestamp.isoformat()
+    current_time_est = scan_timestamp.astimezone(
+        ZoneInfo("America/New_York")
+    ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
     for scored in scored_trades:
         trade = scored.trade
         rows.append(
             {
                 "scan_time": current_time,
+                "scan_time_est": current_time_est,
                 "ticker": trade.ticker,
                 "strategy": trade.strategy,
                 "expiration": trade.expiration,
