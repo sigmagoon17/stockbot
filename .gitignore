@@ -1,0 +1,6 @@
+.env
+.streamlit/secrets.toml
+.yfinance-cache/
+scan_history.csv
+__pycache__/
+*.pyc

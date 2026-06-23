@@ -1,0 +1,6 @@
+streamlit
+pandas
+yfinance
+supabase
+python-dotenv
+lxml
