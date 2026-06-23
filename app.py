@@ -772,15 +772,34 @@ def render_private_results():
         with st.sidebar:
             if st.button("Lock Results", width="stretch"):
                 st.session_state["results_unlocked"] = False
+                st.session_state["admin_clicks"] = 0
+                st.session_state["show_admin_prompt"] = False
                 st.rerun()
         render_results()
         return
 
     with st.sidebar:
-        entered_password = st.text_input("Owner Password", type="password")
-        if entered_password and hmac.compare_digest(entered_password, owner_password):
-            st.session_state["results_unlocked"] = True
-            st.rerun()
+        st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
+        if st.button(
+            " ",
+            icon=":material/lock:",
+            help="Owner access",
+            key="admin_access_trigger",
+            width="content",
+        ):
+            st.session_state["admin_clicks"] = (
+                st.session_state.get("admin_clicks", 0) + 1
+            )
+            if st.session_state["admin_clicks"] >= 3:
+                st.session_state["show_admin_prompt"] = True
+
+        if st.session_state.get("show_admin_prompt"):
+            entered_password = st.text_input("Owner Password", type="password")
+            if entered_password and hmac.compare_digest(entered_password, owner_password):
+                st.session_state["results_unlocked"] = True
+                st.session_state["admin_clicks"] = 0
+                st.session_state["show_admin_prompt"] = False
+                st.rerun()
 
 
 st.title("Options Scanner")
