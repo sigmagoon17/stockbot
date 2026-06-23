@@ -19,7 +19,8 @@ if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
-def append_scan_history(scored_trades):
+def append_scan_history(scored_trades, event_analyses=None):
+    event_analyses = event_analyses or {}
     rows = []
     scan_timestamp = datetime.now(timezone.utc)
     current_time = scan_timestamp.isoformat()
@@ -28,6 +29,7 @@ def append_scan_history(scored_trades):
     ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
     for scored in scored_trades:
         trade = scored.trade
+        event_analysis = event_analyses.get(trade.ticker)
         rows.append(
             {
                 "scan_time": current_time,
@@ -62,6 +64,17 @@ def append_scan_history(scored_trades):
                 "credit": round(trade.credit * CONTRACT_MULTIPLIER, 2),
                 "max_risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "max_profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
+                "quant_score": scored.quant_score,
+                "event_adjustment": scored.event_adjustment,
+                "event_label": (
+                    event_analysis.label if event_analysis is not None else None
+                ),
+                "event_confidence": (
+                    event_analysis.confidence if event_analysis is not None else None
+                ),
+                "event_summary": (
+                    event_analysis.summary if event_analysis is not None else None
+                ),
                 "setup_score": scored.total_score,
                 "risk_level": scored.risk_level,
                 "dte": trade.dte,

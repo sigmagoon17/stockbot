@@ -660,8 +660,8 @@ def render_results():
         open_candidates["Scan Time"] = open_candidates["scan_time_est"].fillna(
             open_candidates["scan_time"]
         )
-        open_candidates = open_candidates[
-            [
+        open_candidates = open_candidates.reindex(
+            columns=[
                 "Scan Time",
                 "ticker",
                 "strategy",
@@ -673,8 +673,12 @@ def render_results():
                 "max_risk",
                 "max_profit",
                 "setup_score",
+                "quant_score",
+                "event_adjustment",
+                "event_label",
+                "event_confidence",
             ]
-        ].rename(
+        ).rename(
             columns={
                 "ticker": "Ticker",
                 "strategy": "Strategy",
@@ -686,6 +690,10 @@ def render_results():
                 "max_risk": "Max Risk",
                 "max_profit": "Max Profit",
                 "setup_score": "Setup Score",
+                "quant_score": "Quant Score",
+                "event_adjustment": "Event Adjustment",
+                "event_label": "Event Label",
+                "event_confidence": "Event Confidence",
             }
         )
         st.dataframe(
@@ -748,14 +756,16 @@ def render_results():
 
         st.subheader("Performance Scorecard")
         st.caption("Completed candidates will appear here after they expire or are closed.")
-        score_tab, strategy_tab, entry_type_tab = st.tabs(
-            ["Score Bands", "Strategies", "Debit vs. Credit"]
+        score_tab, strategy_tab, entry_type_tab, event_tab = st.tabs(
+            ["Score Bands", "Strategies", "Debit vs. Credit", "AI Event View"]
         )
         with score_tab:
             st.info("No completed candidates are available yet.")
         with strategy_tab:
             st.info("No completed candidates are available yet.")
         with entry_type_tab:
+            st.info("No completed candidates are available yet.")
+        with event_tab:
             st.info("No completed candidates are available yet.")
 
         st.subheader("Completed Candidates")
@@ -787,6 +797,24 @@ def render_results():
     score_results = outcome_summary(results, "Score Band", "Score Band")
     strategy_results = outcome_summary(results, "strategy", "Strategy")
     entry_type_results = outcome_summary(results, "entry_type", "Entry Type")
+    if "event_adjustment" not in results:
+        results["event_adjustment"] = None
+    results["event_adjustment"] = pd.to_numeric(
+        results["event_adjustment"], errors="coerce"
+    )
+    results["Event Adjustment Group"] = "Neutral (0)"
+    results.loc[results["event_adjustment"].isna(), "Event Adjustment Group"] = (
+        "Not recorded"
+    )
+    results.loc[
+        results["event_adjustment"] < 0, "Event Adjustment Group"
+    ] = "Negative"
+    results.loc[
+        results["event_adjustment"] > 0, "Event Adjustment Group"
+    ] = "Positive"
+    event_results = outcome_summary(
+        results, "Event Adjustment Group", "Event Adjustment"
+    )
     scorecard_config = {
         "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
         "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
@@ -797,8 +825,8 @@ def render_results():
     st.caption(
         f"{completed_count} completed candidates. Treat score patterns as preliminary until each group has a larger sample."
     )
-    score_tab, strategy_tab, entry_type_tab = st.tabs(
-        ["Score Bands", "Strategies", "Debit vs. Credit"]
+    score_tab, strategy_tab, entry_type_tab, event_tab = st.tabs(
+        ["Score Bands", "Strategies", "Debit vs. Credit", "AI Event View"]
     )
     with score_tab:
         st.dataframe(
@@ -817,6 +845,13 @@ def render_results():
     with entry_type_tab:
         st.dataframe(
             entry_type_results,
+            width="stretch",
+            hide_index=True,
+            column_config=scorecard_config,
+        )
+    with event_tab:
+        st.dataframe(
+            event_results,
             width="stretch",
             hide_index=True,
             column_config=scorecard_config,
@@ -943,7 +978,7 @@ if scan_button:
     st.session_state["latest_event_analyses"] = event_analyses
     errors = history_errors + errors
     history_candidates = select_history_candidates(scored_trades)
-    save_history(history_candidates)
+    save_history(history_candidates, event_analyses)
 
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
