@@ -248,6 +248,8 @@ class ScoredTrade:
     trade: Trade
     risk_level: str
     category_scores: dict[str, int]
+    quant_score: int
+    event_adjustment: int
     total_score: int
     reasons: list[str]
     explanation: str
@@ -545,13 +547,17 @@ def score_trade(trade: Trade, preferences: ScanPreferences) -> ScoredTrade:
         "Strategy Fit": strategy_fit_score(trade, preferences),
     }
     raw_total_score = sum(category_scores.values())
-    total_score = max(0, min(100, round(raw_total_score / MAX_SETUP_SCORE * 100)))
+    quant_score = max(0, min(100, round(raw_total_score / MAX_SETUP_SCORE * 100)))
+    event_adjustment = 0
+    total_score = max(0, min(100, quant_score + event_adjustment))
     reasons = passing_reasons(trade)
 
     return ScoredTrade(
         trade=trade,
         risk_level=risk_level(trade),
         category_scores=category_scores,
+        quant_score=quant_score,
+        event_adjustment=event_adjustment,
         total_score=total_score,
         reasons=reasons,
         explanation=beginner_explanation(trade, category_scores),

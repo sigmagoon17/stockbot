@@ -418,6 +418,8 @@ def candidate_row(scored):
             else None
         ),
         "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
+        "Quant Score": scored.quant_score,
+        "Event Adjustment": scored.event_adjustment,
         "Setup Score": scored.total_score,
         "Risk Level": scored.risk_level,
         "Volatility Rank": round(trade.volatility_rank, 1),
@@ -444,8 +446,18 @@ def candidate_column_config():
         ),
         "Setup Score": st.column_config.NumberColumn(
             "Setup Score",
-            help="How closely the candidate matches the scanner's current rules.",
+            help="Final score after quant rules and any event adjustment.",
             format="%d / 100",
+        ),
+        "Quant Score": st.column_config.NumberColumn(
+            "Quant Score",
+            help="Score from the scanner's mathematical filters before event analysis.",
+            format="%d / 100",
+        ),
+        "Event Adjustment": st.column_config.NumberColumn(
+            "Event Adjustment",
+            help="Score change from the event-analysis layer. It is zero until event analysis is connected.",
+            format="%d",
         ),
         "Volatility Rank": st.column_config.NumberColumn(
             "Volatility Rank",
@@ -472,6 +484,8 @@ def debit_candidate_rows(scored_trades):
                 "Short Strike": trade.short_strike,
                 "Debit": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "Max Profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
+                "Quant Score": scored.quant_score,
+                "Event Adjustment": scored.event_adjustment,
                 "Setup Score": scored.total_score,
                 "Risk Level": scored.risk_level,
                 "Volatility Rank": round(trade.volatility_rank, 1),
@@ -498,6 +512,8 @@ def credit_candidate_rows(scored_trades):
                 "Long Strike": trade.long_strike,
                 "Credit": round(trade.credit * CONTRACT_MULTIPLIER, 2),
                 "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
+                "Quant Score": scored.quant_score,
+                "Event Adjustment": scored.event_adjustment,
                 "Setup Score": scored.total_score,
                 "Risk Level": scored.risk_level,
                 "Volatility Rank": round(trade.volatility_rank, 1),
