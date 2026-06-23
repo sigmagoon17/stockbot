@@ -212,12 +212,12 @@ def update_expired_history(include_today: bool = False) -> list[str]:
     return errors
 
 
-def fetch_expired_history() -> tuple[list[dict], list[str]]:
+def fetch_completed_history() -> tuple[list[dict], list[str]]:
     try:
         response = (
             supabase.table("scan_history")
             .select("*")
-            .eq("expiration_status", "expired")
+            .in_("expiration_status", ["expired", "closed early"])
             .order("expiration", desc=True)
             .execute()
         )
@@ -239,3 +239,28 @@ def fetch_open_history() -> tuple[list[dict], list[str]]:
         return response.data, []
     except Exception as error:
         return [], [f"Could not load open candidates from Supabase: {error}"]
+
+
+def close_candidate(
+    record_id: int,
+    close_date: date,
+    realized_pnl: float,
+    note: str,
+) -> list[str]:
+    try:
+        (
+            supabase.table("scan_history")
+            .update(
+                {
+                    "expiration_status": "closed early",
+                    "actual_close_date": close_date.isoformat(),
+                    "actual_realized_pnl": round(realized_pnl, 2),
+                    "close_note": note.strip() or None,
+                }
+            )
+            .eq("id", record_id)
+            .execute()
+        )
+        return []
+    except Exception as error:
+        return [f"Could not close candidate: {error}"]

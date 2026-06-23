@@ -10,7 +10,8 @@ import yfinance as yf
 
 from history_tracker import (
     append_scan_history as save_history,
-    fetch_expired_history,
+    close_candidate,
+    fetch_completed_history,
     fetch_open_history,
     update_expired_history as update_history,
 )
@@ -517,11 +518,45 @@ def render_results():
                 "Max Profit": st.column_config.NumberColumn(format="$%.2f"),
             },
         )
+
+        close_options = {
+            (
+                f"#{row['id']} | {row['ticker']} {row['strategy']} | "
+                f"{row['expiration']} | Score {row['setup_score']}"
+            ): row
+            for row in open_rows
+        }
+        with st.expander("Close Candidate"):
+            with st.form("close_candidate_form"):
+                selected_label = st.selectbox("Candidate", list(close_options))
+                actual_close_date = st.date_input("Close Date", value=date.today())
+                actual_realized_pnl = st.number_input(
+                    "Realized P/L Per Contract",
+                    value=0.0,
+                    step=1.0,
+                    format="%.2f",
+                )
+                close_note = st.text_input("Close Note")
+                save_close = st.form_submit_button("Save Close")
+
+            if save_close:
+                selected_row = close_options[selected_label]
+                close_errors = close_candidate(
+                    selected_row["id"],
+                    actual_close_date,
+                    actual_realized_pnl,
+                    close_note,
+                )
+                if close_errors:
+                    for error in close_errors:
+                        st.error(error)
+                else:
+                    st.rerun()
     else:
         st.info("No open candidates are being tracked.")
 
     st.subheader("Results")
-    result_rows, result_errors = fetch_expired_history()
+    result_rows, result_errors = fetch_completed_history()
     for error in result_errors:
         st.warning(error)
     if not result_rows:
@@ -530,11 +565,15 @@ def render_results():
 
     results = pd.DataFrame(result_rows)
     results["expiration_pnl"] = pd.to_numeric(results["expiration_pnl"])
+    results["actual_realized_pnl"] = pd.to_numeric(results["actual_realized_pnl"])
+    results["Outcome P/L"] = results["actual_realized_pnl"].fillna(
+        results["expiration_pnl"]
+    )
 
     expired_count = len(results)
-    win_rate = (results["expiration_pnl"] > 0).mean() * 100
-    average_pnl = results["expiration_pnl"].mean()
-    total_pnl = results["expiration_pnl"].sum()
+    win_rate = (results["Outcome P/L"] > 0).mean() * 100
+    average_pnl = results["Outcome P/L"].mean()
+    total_pnl = results["Outcome P/L"].sum()
     metric_columns = st.columns(4)
     metric_columns[0].metric("Expired Candidates", expired_count)
     metric_columns[1].metric("Win Rate", f"{win_rate:.1f}%")
@@ -545,9 +584,9 @@ def render_results():
         results.groupby("strategy", as_index=False)
         .agg(
             Candidates=("id", "count"),
-            Win_Rate=("expiration_pnl", lambda pnl: (pnl > 0).mean() * 100),
-            Average_PnL=("expiration_pnl", "mean"),
-            Total_PnL=("expiration_pnl", "sum"),
+            Win_Rate=("Outcome P/L", lambda pnl: (pnl > 0).mean() * 100),
+            Average_PnL=("Outcome P/L", "mean"),
+            Total_PnL=("Outcome P/L", "sum"),
         )
         .rename(
             columns={
@@ -581,9 +620,9 @@ def render_results():
         results.groupby("Score Band", observed=True, as_index=False)
         .agg(
             Candidates=("id", "count"),
-            Win_Rate=("expiration_pnl", lambda pnl: (pnl > 0).mean() * 100),
-            Average_PnL=("expiration_pnl", "mean"),
-            Total_PnL=("expiration_pnl", "sum"),
+            Win_Rate=("Outcome P/L", lambda pnl: (pnl > 0).mean() * 100),
+            Average_PnL=("Outcome P/L", "mean"),
+            Total_PnL=("Outcome P/L", "sum"),
         )
         .rename(
             columns={
@@ -613,8 +652,9 @@ def render_results():
             "strategy",
             "expiration",
             "setup_score",
+            "expiration_status",
             "expiration_close",
-            "expiration_pnl",
+            "Outcome P/L",
         ]
     ].rename(
         columns={
@@ -622,8 +662,9 @@ def render_results():
             "strategy": "Strategy",
             "expiration": "Expiration",
             "setup_score": "Setup Score",
+            "expiration_status": "Outcome Status",
             "expiration_close": "Expiration Close",
-            "expiration_pnl": "Expiration P/L",
+            "Outcome P/L": "Outcome P/L",
         }
     )
     st.dataframe(
@@ -632,7 +673,7 @@ def render_results():
         hide_index=True,
         column_config={
             "Expiration Close": st.column_config.NumberColumn(format="$%.2f"),
-            "Expiration P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Outcome P/L": st.column_config.NumberColumn(format="$%.2f"),
         },
     )
 
