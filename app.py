@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 import datetime
 import supabase
+import time
 import yfinance as yf
 
 from history_tracker import (
@@ -33,9 +34,26 @@ from event_analysis import get_event_analysis
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_resource
+def event_analysis_cache():
+    return {}
+
+
 def get_cached_event_analysis(ticker: str, outlook: str):
-    return get_event_analysis(ticker, outlook)
+    cache = event_analysis_cache()
+    cache_key = (ticker, outlook)
+    now = time.monotonic()
+    cached = cache.get(cache_key)
+    if cached and now - cached["created_at"] < cached["ttl"]:
+        return cached["analysis"]
+
+    analysis = get_event_analysis(ticker, outlook)
+    cache[cache_key] = {
+        "analysis": analysis,
+        "created_at": now,
+        "ttl": 3600 if analysis.available else 300,
+    }
+    return analysis
 
 st.markdown(
     """

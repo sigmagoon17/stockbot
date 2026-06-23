@@ -16,15 +16,17 @@ class EventAnalysis:
     label: str
     summary: str
     headlines_used: list[str]
+    available: bool = True
 
 
-def neutral_event_analysis(ticker, headlines, summary):
+def neutral_event_analysis(ticker, headlines, summary, available=True):
     return EventAnalysis(
         adjustment=0,
         confidence="low",
         label="neutral",
         summary=summary.format(ticker=ticker),
         headlines_used=headlines,
+        available=available,
     )
 
 
@@ -175,6 +177,7 @@ def analyze_events(ticker, scanner_outlook, headlines):
             ticker,
             headlines,
             "AI could not analyze the available headlines for {ticker}.",
+            available=False,
         )
     return analysis
 
@@ -188,6 +191,7 @@ def get_event_analysis(ticker, scanner_outlook):
             ticker,
             [],
             "Event analysis was unavailable for {ticker}.",
+            available=False,
         )
 
 if __name__ == "__main__":
