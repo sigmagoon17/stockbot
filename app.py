@@ -33,6 +33,9 @@ from event_analysis import get_event_analysis
 
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
+EVENT_ANALYSIS_SUCCESS_TTL_SECONDS = 6 * 60 * 60
+EVENT_ANALYSIS_FAILURE_TTL_SECONDS = 5 * 60
+
 
 @st.cache_resource
 def event_analysis_cache():
@@ -51,7 +54,11 @@ def get_cached_event_analysis(ticker: str, outlook: str):
     cache[cache_key] = {
         "analysis": analysis,
         "created_at": now,
-        "ttl": 3600 if analysis.available else 300,
+        "ttl": (
+            EVENT_ANALYSIS_SUCCESS_TTL_SECONDS
+            if analysis.available
+            else EVENT_ANALYSIS_FAILURE_TTL_SECONDS
+        ),
     }
     return analysis
 
@@ -920,6 +927,14 @@ def render_private_results():
 
     if st.session_state.get("results_unlocked"):
         with st.sidebar:
+            if st.button(
+                "Refresh AI Event Data",
+                help="Clears cached AI event analysis so the next scan fetches fresh headlines.",
+                width="stretch",
+            ):
+                event_analysis_cache().clear()
+                st.session_state.pop("latest_event_analyses", None)
+                st.toast("AI event cache cleared. Run a new scan for fresh analysis.")
             if st.button("Lock Results", width="stretch"):
                 st.session_state["results_unlocked"] = False
                 st.session_state["admin_clicks"] = 0
