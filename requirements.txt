@@ -4,3 +4,5 @@ yfinance
 supabase
 python-dotenv
 lxml
+openai
+requests
