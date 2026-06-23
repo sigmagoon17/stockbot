@@ -224,3 +224,18 @@ def fetch_expired_history() -> tuple[list[dict], list[str]]:
         return response.data, []
     except Exception as error:
         return [], [f"Could not load results from Supabase: {error}"]
+
+
+def fetch_open_history() -> tuple[list[dict], list[str]]:
+    try:
+        response = (
+            supabase.table("scan_history")
+            .select("*")
+            .eq("expiration_status", "open")
+            .order("scan_time", desc=True)
+            .limit(100)
+            .execute()
+        )
+        return response.data, []
+    except Exception as error:
+        return [], [f"Could not load open candidates from Supabase: {error}"]

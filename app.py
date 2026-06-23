@@ -11,6 +11,7 @@ import yfinance as yf
 from history_tracker import (
     append_scan_history as save_history,
     fetch_expired_history,
+    fetch_open_history,
     update_expired_history as update_history,
 )
 
@@ -469,6 +470,56 @@ def ticker_rejection_rows(trades, rejected_trades, scored_trades):
 
 
 def render_results():
+    st.subheader("Open Candidates")
+    open_rows, open_errors = fetch_open_history()
+    for error in open_errors:
+        st.warning(error)
+    if open_rows:
+        open_candidates = pd.DataFrame(open_rows)
+        open_candidates["Scan Time"] = open_candidates["scan_time_est"].fillna(
+            open_candidates["scan_time"]
+        )
+        open_candidates = open_candidates[
+            [
+                "Scan Time",
+                "ticker",
+                "strategy",
+                "expiration",
+                "long_strike",
+                "short_strike",
+                "entry_type",
+                "credit",
+                "max_risk",
+                "max_profit",
+                "setup_score",
+            ]
+        ].rename(
+            columns={
+                "ticker": "Ticker",
+                "strategy": "Strategy",
+                "expiration": "Expiration",
+                "long_strike": "Long Strike",
+                "short_strike": "Short Strike",
+                "entry_type": "Entry Type",
+                "credit": "Credit",
+                "max_risk": "Max Risk",
+                "max_profit": "Max Profit",
+                "setup_score": "Setup Score",
+            }
+        )
+        st.dataframe(
+            open_candidates,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Credit": st.column_config.NumberColumn(format="$%.2f"),
+                "Max Risk": st.column_config.NumberColumn(format="$%.2f"),
+                "Max Profit": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+    else:
+        st.info("No open candidates are being tracked.")
+
     st.subheader("Results")
     result_rows, result_errors = fetch_expired_history()
     for error in result_errors:
