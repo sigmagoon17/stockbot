@@ -555,6 +555,30 @@ def ticker_rejection_rows(trades, rejected_trades, scored_trades):
     return rows
 
 
+def outcome_summary(results, group_column: str, label: str):
+    summary = (
+        results.groupby(group_column, observed=True, as_index=False)
+        .agg(
+            Candidates=("id", "count"),
+            Win_Rate=("Outcome P/L", lambda pnl: (pnl > 0).mean() * 100),
+            Average_PnL=("Outcome P/L", "mean"),
+            Total_PnL=("Outcome P/L", "sum"),
+        )
+        .rename(
+            columns={
+                group_column: label,
+                "Win_Rate": "Win Rate",
+                "Average_PnL": "Average P/L",
+                "Total_PnL": "Total P/L",
+            }
+        )
+    )
+    summary["Win Rate"] = summary["Win Rate"].round(1)
+    summary["Average P/L"] = summary["Average P/L"].round(2)
+    summary["Total P/L"] = summary["Total P/L"].round(2)
+    return summary
+
+
 def render_results():
     st.subheader("Open Candidates")
     open_rows, open_errors = fetch_open_history()
@@ -655,82 +679,60 @@ def render_results():
         results["expiration_pnl"]
     )
 
-    expired_count = len(results)
+    completed_count = len(results)
     win_rate = (results["Outcome P/L"] > 0).mean() * 100
     average_pnl = results["Outcome P/L"].mean()
     total_pnl = results["Outcome P/L"].sum()
     metric_columns = st.columns(4)
-    metric_columns[0].metric("Expired Candidates", expired_count)
+    metric_columns[0].metric("Completed Candidates", completed_count)
     metric_columns[1].metric("Win Rate", f"{win_rate:.1f}%")
-    metric_columns[2].metric("Average Expiration P/L", f"${average_pnl:.2f}")
-    metric_columns[3].metric("Total Expiration P/L", f"${total_pnl:.2f}")
-
-    strategy_results = (
-        results.groupby("strategy", as_index=False)
-        .agg(
-            Candidates=("id", "count"),
-            Win_Rate=("Outcome P/L", lambda pnl: (pnl > 0).mean() * 100),
-            Average_PnL=("Outcome P/L", "mean"),
-            Total_PnL=("Outcome P/L", "sum"),
-        )
-        .rename(
-            columns={
-                "strategy": "Strategy",
-                "Win_Rate": "Win Rate",
-                "Average_PnL": "Average P/L",
-                "Total_PnL": "Total P/L",
-            }
-        )
-    )
-    strategy_results["Win Rate"] = strategy_results["Win Rate"].round(1)
-    strategy_results["Average P/L"] = strategy_results["Average P/L"].round(2)
-    strategy_results["Total P/L"] = strategy_results["Total P/L"].round(2)
-    st.dataframe(
-        strategy_results,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
-            "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
-            "Total P/L": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
+    metric_columns[2].metric("Average Outcome P/L", f"${average_pnl:.2f}")
+    metric_columns[3].metric("Total Outcome P/L", f"${total_pnl:.2f}")
 
     results["Score Band"] = pd.cut(
         results["setup_score"],
         bins=[-1, 59, 69, 79, 89, 100],
         labels=["Below 60", "60-69", "70-79", "80-89", "90-100"],
     )
-    score_results = (
-        results.groupby("Score Band", observed=True, as_index=False)
-        .agg(
-            Candidates=("id", "count"),
-            Win_Rate=("Outcome P/L", lambda pnl: (pnl > 0).mean() * 100),
-            Average_PnL=("Outcome P/L", "mean"),
-            Total_PnL=("Outcome P/L", "sum"),
-        )
-        .rename(
-            columns={
-                "Win_Rate": "Win Rate",
-                "Average_PnL": "Average P/L",
-                "Total_PnL": "Total P/L",
-            }
-        )
-    )
-    score_results["Win Rate"] = score_results["Win Rate"].round(1)
-    score_results["Average P/L"] = score_results["Average P/L"].round(2)
-    score_results["Total P/L"] = score_results["Total P/L"].round(2)
-    st.dataframe(
-        score_results,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
-            "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
-            "Total P/L": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
+    score_results = outcome_summary(results, "Score Band", "Score Band")
+    strategy_results = outcome_summary(results, "strategy", "Strategy")
+    entry_type_results = outcome_summary(results, "entry_type", "Entry Type")
+    scorecard_config = {
+        "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
+        "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
+        "Total P/L": st.column_config.NumberColumn(format="$%.2f"),
+    }
 
+    st.subheader("Performance Scorecard")
+    st.caption(
+        f"{completed_count} completed candidates. Treat score patterns as preliminary until each group has a larger sample."
+    )
+    score_tab, strategy_tab, entry_type_tab = st.tabs(
+        ["Score Bands", "Strategies", "Debit vs. Credit"]
+    )
+    with score_tab:
+        st.dataframe(
+            score_results,
+            width="stretch",
+            hide_index=True,
+            column_config=scorecard_config,
+        )
+    with strategy_tab:
+        st.dataframe(
+            strategy_results,
+            width="stretch",
+            hide_index=True,
+            column_config=scorecard_config,
+        )
+    with entry_type_tab:
+        st.dataframe(
+            entry_type_results,
+            width="stretch",
+            hide_index=True,
+            column_config=scorecard_config,
+        )
+
+    st.subheader("Completed Candidates")
     recent_results = results[
         [
             "ticker",
