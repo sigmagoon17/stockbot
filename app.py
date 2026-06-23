@@ -147,6 +147,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
     ticker_data = []
     errors = []
     event_adjustments = {}
+    event_analyses = {}
     progress = st.progress(0, text="Preparing scan")
 
     for index, ticker in enumerate(tickers, start=1):
@@ -178,7 +179,14 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                 }
             )
             event_analysis = get_event_analysis(ticker, preferences.outlook)
+            event_analyses[ticker] = event_analysis
             event_adjustments[ticker] = event_analysis.adjustment
+            ticker_data[-1].update(
+                {
+                    "Event Label": event_analysis.label.title(),
+                    "Event Adjustment": event_analysis.adjustment,
+                }
+            )
             trades.extend(
                 build_iron_condor(
                     option_chain, price, earnings_date, volatility_rank, preferences
@@ -210,7 +218,14 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
 
     progress.empty()
     scored_trades, rejected_trades = scan_trades(trades, preferences, event_adjustments)
-    return scored_trades, rejected_trades, trades, ticker_data, errors
+    return (
+        scored_trades,
+        rejected_trades,
+        trades,
+        ticker_data,
+        errors,
+        event_analyses,
+    )
 def append_scan_history(scored_trades):
     rows = []
     current_time = datetime.datetime.now().isoformat()
@@ -621,6 +636,21 @@ def outcome_summary(results, group_column: str, label: str):
 
 
 def render_results():
+    latest_event_analyses = st.session_state.get("latest_event_analyses", {})
+    if latest_event_analyses:
+        st.subheader("Latest Event Evidence")
+        for ticker, event_analysis in sorted(latest_event_analyses.items()):
+            with st.expander(
+                f"{ticker} | {event_analysis.label.title()} | "
+                f"{event_analysis.adjustment:+d} adjustment"
+            ):
+                st.write(event_analysis.summary)
+                if event_analysis.headlines_used:
+                    for headline in event_analysis.headlines_used:
+                        st.write(f"- {headline}")
+                else:
+                    st.caption("No relevant headlines were used for this analysis.")
+
     st.subheader("Open Candidates")
     open_rows, open_errors = fetch_open_history()
     for error in open_errors:
@@ -902,7 +932,15 @@ if scan_button:
         test_expiration=test_expiration,
         nearest_expiration=use_nearest_expiration,
     )
-    scored_trades, rejected_trades, trades, ticker_data, errors = scan_watchlist(tickers, preferences)
+    (
+        scored_trades,
+        rejected_trades,
+        trades,
+        ticker_data,
+        errors,
+        event_analyses,
+    ) = scan_watchlist(tickers, preferences)
+    st.session_state["latest_event_analyses"] = event_analyses
     errors = history_errors + errors
     history_candidates = select_history_candidates(scored_trades)
     save_history(history_candidates)
@@ -951,6 +989,19 @@ if scan_button:
                     f"Score {scored.total_score}/100"
                 ):
                     st.write(scored.explanation)
+                    event_analysis = event_analyses.get(trade.ticker)
+                    if event_analysis:
+                        st.subheader("AI Event View")
+                        event_label, event_adjustment, event_confidence = st.columns(3)
+                        event_label.metric("Event Label", event_analysis.label.title())
+                        event_adjustment.metric(
+                            "Event Adjustment",
+                            f"{event_analysis.adjustment:+d}",
+                        )
+                        event_confidence.metric(
+                            "Confidence", event_analysis.confidence.title()
+                        )
+                        st.write(event_analysis.summary)
                     score_rows = pd.DataFrame(
                         [
                             {"Score Area": area, "Points": points}
