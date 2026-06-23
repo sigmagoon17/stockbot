@@ -32,6 +32,11 @@ from event_analysis import get_event_analysis
 
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cached_event_analysis(ticker: str, outlook: str):
+    return get_event_analysis(ticker, outlook)
+
 st.markdown(
     """
     <style>
@@ -178,7 +183,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     ),
                 }
             )
-            event_analysis = get_event_analysis(ticker, preferences.outlook)
+            event_analysis = get_cached_event_analysis(ticker, preferences.outlook)
             event_analyses[ticker] = event_analysis
             event_adjustments[ticker] = event_analysis.adjustment
             ticker_data[-1].update(
