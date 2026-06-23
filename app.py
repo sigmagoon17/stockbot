@@ -103,19 +103,39 @@ def select_top_candidates(scored_trades, per_ticker: int = 3):
     return selected
 
 
-def select_history_candidates(scored_trades, limit: int = 25, per_ticker: int = 4):
-    selected = select_top_candidates(scored_trades, per_ticker=per_ticker)
-    selected = selected[:limit]
+def select_history_candidates(
+    scored_trades, limit: int = 25, per_ticker: int = 4, per_strategy: int = 1
+):
+    selected = []
+    selected_ids = set()
+    selected_by_strategy = Counter()
 
-    if len(selected) < limit:
-        selected_ids = {id(scored) for scored in selected}
-        for scored in scored_trades:
-            if id(scored) in selected_ids:
-                continue
-            selected.append(scored)
-            selected_ids.add(id(scored))
-            if len(selected) == limit:
-                break
+    # Reserve history slots for each strategy before filling by overall rank.
+    for scored in scored_trades:
+        strategy = scored.trade.strategy
+        if selected_by_strategy[strategy] >= per_strategy:
+            continue
+        selected.append(scored)
+        selected_ids.add(id(scored))
+        selected_by_strategy[strategy] += 1
+        if len(selected) == limit:
+            return selected
+
+    for scored in select_top_candidates(scored_trades, per_ticker=per_ticker):
+        if id(scored) in selected_ids:
+            continue
+        selected.append(scored)
+        selected_ids.add(id(scored))
+        if len(selected) == limit:
+            return selected
+
+    for scored in scored_trades:
+        if id(scored) in selected_ids:
+            continue
+        selected.append(scored)
+        selected_ids.add(id(scored))
+        if len(selected) == limit:
+            break
 
     return selected
 
