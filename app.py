@@ -438,9 +438,9 @@ def candidate_row(scored):
             else None
         ),
         "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
+        "Setup Score": scored.total_score,
         "Quant Score": scored.quant_score,
         "Event Adjustment": scored.event_adjustment,
-        "Setup Score": scored.total_score,
         "Risk Level": scored.risk_level,
         "Volatility Rank": round(trade.volatility_rank, 1),
     }
@@ -504,9 +504,9 @@ def debit_candidate_rows(scored_trades):
                 "Short Strike": trade.short_strike,
                 "Debit": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "Max Profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
+                "Setup Score": scored.total_score,
                 "Quant Score": scored.quant_score,
                 "Event Adjustment": scored.event_adjustment,
-                "Setup Score": scored.total_score,
                 "Risk Level": scored.risk_level,
                 "Volatility Rank": round(trade.volatility_rank, 1),
             }
@@ -532,9 +532,9 @@ def credit_candidate_rows(scored_trades):
                 "Long Strike": trade.long_strike,
                 "Credit": round(trade.credit * CONTRACT_MULTIPLIER, 2),
                 "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
+                "Setup Score": scored.total_score,
                 "Quant Score": scored.quant_score,
                 "Event Adjustment": scored.event_adjustment,
-                "Setup Score": scored.total_score,
                 "Risk Level": scored.risk_level,
                 "Volatility Rank": round(trade.volatility_rank, 1),
             }
