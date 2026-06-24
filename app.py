@@ -185,7 +185,13 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
             index / len(tickers), text=f"Fetching {ticker} option data ({index}/{len(tickers)})"
         )
         try:
-            price, option_chain, earnings_date, volatility_rank = get_option_chain(
+            (
+                price,
+                option_chain,
+                earnings_date,
+                volatility_rank,
+                price_move,
+            ) = get_option_chain(
                 ticker,
                 test_expiration=preferences.test_expiration,
                 nearest_expiration=preferences.nearest_expiration,
@@ -196,6 +202,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     "Price": price,
                     "Contracts": len(option_chain),
                     "Volatility Rank": volatility_rank,
+                    **price_move,
                     "Earnings Date": earnings_date.isoformat() if earnings_date else "None",
                     "Expiration Used": (
                         "5 nearest"
@@ -1114,7 +1121,16 @@ if scan_button:
 
     with market_tab:
         st.subheader("Market Data")
-        st.dataframe(pd.DataFrame(ticker_data), width="stretch", hide_index=True)
+        st.dataframe(
+            pd.DataFrame(ticker_data),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "1D Move %": st.column_config.NumberColumn(format="%.2f%%"),
+                "5D Move %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Move vs 20D Vol": st.column_config.NumberColumn(format="%.1fx"),
+            },
+        )
 
     with diagnostics_tab:
         st.subheader("Strategy Diagnostics")

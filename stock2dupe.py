@@ -80,8 +80,12 @@ def get_underlying_price(stock: yf.Ticker) -> float:
     return float(history["Close"].iloc[-1])
 
 
-def realized_volatility_rank(stock: yf.Ticker) -> float:
+def price_history_metrics(stock: yf.Ticker) -> tuple[float, dict[str, float | str]]:
     history = stock.history(period="1y", auto_adjust=True)
+    if history.empty:
+        raise ValueError("Yahoo Finance did not return price history.")
+
+    closing_prices = history["Close"]
     daily_returns = history["Close"].pct_change().dropna()
     rolling_volatility = (daily_returns.rolling(20).std() * math.sqrt(252)).dropna()
 
@@ -93,21 +97,42 @@ def realized_volatility_rank(stock: yf.Ticker) -> float:
     highest_volatility = rolling_volatility.max()
 
     if highest_volatility == lowest_volatility:
-        return 50.0
+        volatility_rank = 50.0
+    else:
+        volatility_rank = round(
+            (current_volatility - lowest_volatility)
+            / (highest_volatility - lowest_volatility)
+            * 100,
+            1,
+        )
 
-    return round(
-        (current_volatility - lowest_volatility)
-        / (highest_volatility - lowest_volatility)
-        * 100,
-        1,
+    latest_daily_return = float(daily_returns.iloc[-1])
+    baseline_daily_volatility = float(daily_returns.iloc[-21:-1].std())
+    move_multiple = (
+        abs(latest_daily_return) / baseline_daily_volatility
+        if baseline_daily_volatility > 0
+        else 0.0
     )
+    five_day_return = float(closing_prices.iloc[-1] / closing_prices.iloc[-6] - 1)
+    price_move = {
+        "1D Move %": round(latest_daily_return * 100, 2),
+        "5D Move %": round(five_day_return * 100, 2),
+        "Move vs 20D Vol": round(move_multiple, 1),
+        "Unusual Move": "Yes" if move_multiple >= 2 else "No",
+    }
+    return volatility_rank, price_move
+
+
+def realized_volatility_rank(stock: yf.Ticker) -> float:
+    volatility_rank, _ = price_history_metrics(stock)
+    return volatility_rank
 
 
 def get_option_chain(
     ticker: str,
     test_expiration: date | None = None,
     nearest_expiration: bool = False,
-) -> tuple[float, list[OptionContract], date | None, float]:
+) -> tuple[float, list[OptionContract], date | None, float, dict[str, float | str]]:
     stock = yf.Ticker(ticker)
     earnings_date = None
     etf_tickers = ["SPY", "QQQ"]
@@ -125,7 +150,7 @@ def get_option_chain(
             earnings_date = None
 
     underlying_price = get_underlying_price(stock)
-    volatility_rank = realized_volatility_rank(stock)
+    volatility_rank, price_move = price_history_metrics(stock)
     contracts = []
 
     available_expirations = [
@@ -198,7 +223,7 @@ def get_option_chain(
             f"Yahoo Finance returned no usable option contracts for {expiration_range}."
         )
 
-    return underlying_price, contracts, earnings_date, volatility_rank
+    return underlying_price, contracts, earnings_date, volatility_rank, price_move
 
 
 def days_to_expiration(expiration: str) -> int:
@@ -1194,10 +1219,17 @@ def main() -> None:
     )
     for ticker in ticker_list:
         
-        underlying_price, option_chain, earnings_date, volatility_rank = get_option_chain(ticker)
+        (
+            underlying_price,
+            option_chain,
+            earnings_date,
+            volatility_rank,
+            price_move,
+        ) = get_option_chain(ticker)
         print(f"{ticker} reference price: ${underlying_price:.2f}")
         print(f"{ticker} usable option contracts fetched: {len(option_chain)}")
         print(f"{ticker} realized volatility rank: {volatility_rank:.1f}")
+        print(f"{ticker} latest daily move: {price_move['1D Move %']:+.2f}%")
 
         
         trades.extend(build_iron_condor(option_chain, underlying_price, earnings_date, volatility_rank, preferences))
