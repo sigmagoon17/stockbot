@@ -178,6 +178,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
     errors = []
     event_adjustments = {}
     event_analyses = {}
+    price_moves = {}
     progress = st.progress(0, text="Preparing scan")
 
     for index, ticker in enumerate(tickers, start=1):
@@ -196,6 +197,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                 test_expiration=preferences.test_expiration,
                 nearest_expiration=preferences.nearest_expiration,
             )
+            price_moves[ticker] = price_move
             ticker_data.append(
                 {
                     "Ticker": ticker,
@@ -262,6 +264,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
         ticker_data,
         errors,
         event_analyses,
+        price_moves,
     )
 def append_scan_history(scored_trades):
     rows = []
@@ -793,8 +796,14 @@ def render_results():
 
         st.subheader("Performance Scorecard")
         st.caption("Completed candidates will appear here after they expire or are closed.")
-        score_tab, strategy_tab, entry_type_tab, event_tab = st.tabs(
-            ["Score Bands", "Strategies", "Debit vs. Credit", "AI Event View"]
+        score_tab, strategy_tab, entry_type_tab, event_tab, price_move_tab = st.tabs(
+            [
+                "Score Bands",
+                "Strategies",
+                "Debit vs. Credit",
+                "AI Event View",
+                "Price Move",
+            ]
         )
         with score_tab:
             st.info("No completed candidates are available yet.")
@@ -803,6 +812,8 @@ def render_results():
         with entry_type_tab:
             st.info("No completed candidates are available yet.")
         with event_tab:
+            st.info("No completed candidates are available yet.")
+        with price_move_tab:
             st.info("No completed candidates are available yet.")
 
         st.subheader("Completed Candidates")
@@ -852,6 +863,12 @@ def render_results():
     event_results = outcome_summary(
         results, "Event Adjustment Group", "Event Adjustment"
     )
+    if "unusual_move" not in results:
+        results["unusual_move"] = None
+    results["Price Move Group"] = results["unusual_move"].fillna("Not recorded")
+    price_move_results = outcome_summary(
+        results, "Price Move Group", "Price Move"
+    )
     scorecard_config = {
         "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
         "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
@@ -862,8 +879,14 @@ def render_results():
     st.caption(
         f"{completed_count} completed candidates. Treat score patterns as preliminary until each group has a larger sample."
     )
-    score_tab, strategy_tab, entry_type_tab, event_tab = st.tabs(
-        ["Score Bands", "Strategies", "Debit vs. Credit", "AI Event View"]
+    score_tab, strategy_tab, entry_type_tab, event_tab, price_move_tab = st.tabs(
+        [
+            "Score Bands",
+            "Strategies",
+            "Debit vs. Credit",
+            "AI Event View",
+            "Price Move",
+        ]
     )
     with score_tab:
         st.dataframe(
@@ -889,6 +912,13 @@ def render_results():
     with event_tab:
         st.dataframe(
             event_results,
+            width="stretch",
+            hide_index=True,
+            column_config=scorecard_config,
+        )
+    with price_move_tab:
+        st.dataframe(
+            price_move_results,
             width="stretch",
             hide_index=True,
             column_config=scorecard_config,
@@ -1019,10 +1049,13 @@ if scan_button:
         ticker_data,
         errors,
         event_analyses,
+        price_moves,
     ) = scan_watchlist(tickers, preferences)
     st.session_state["latest_event_analyses"] = event_analyses
     history_candidates = select_history_candidates(scored_trades)
-    history_save_errors = save_history(history_candidates, event_analyses)
+    history_save_errors = save_history(
+        history_candidates, event_analyses, price_moves
+    )
     errors = history_errors + errors + history_save_errors
 
     top_score = scored_trades[0].total_score if scored_trades else None

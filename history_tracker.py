@@ -19,8 +19,9 @@ if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
-def append_scan_history(scored_trades, event_analyses=None):
+def append_scan_history(scored_trades, event_analyses=None, price_moves=None):
     event_analyses = event_analyses or {}
+    price_moves = price_moves or {}
     rows = []
     scan_timestamp = datetime.now(timezone.utc)
     current_time = scan_timestamp.isoformat()
@@ -30,6 +31,7 @@ def append_scan_history(scored_trades, event_analyses=None):
     for scored in scored_trades:
         trade = scored.trade
         event_analysis = event_analyses.get(trade.ticker)
+        price_move = price_moves.get(trade.ticker, {})
         rows.append(
             {
                 "scan_time": current_time,
@@ -75,6 +77,10 @@ def append_scan_history(scored_trades, event_analyses=None):
                 "event_summary": (
                     event_analysis.summary if event_analysis is not None else None
                 ),
+                "daily_move_pct": price_move.get("1D Move %"),
+                "five_day_move_pct": price_move.get("5D Move %"),
+                "move_vs_20d_vol": price_move.get("Move vs 20D Vol"),
+                "unusual_move": price_move.get("Unusual Move"),
                 "setup_score": scored.total_score,
                 "risk_level": scored.risk_level,
                 "dte": trade.dte,

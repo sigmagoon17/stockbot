@@ -1,4 +1,4 @@
-name: Update Expired Option Results
+name: Daily Option Scanner
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  update-history:
+  daily-scan:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -25,3 +25,15 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: python update_history.py
+
+      - name: Scan watchlist and save candidates
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MARKETAUX_API_KEY: ${{ secrets.MARKETAUX_API_KEY }}
+          SCAN_TICKERS: AAPL,SPY,QQQ,NVDA,MSFT,COHR
+          SCAN_OUTLOOK: neutral
+          SCAN_MAX_RISK: "500"
+          SCAN_RISK_TOLERANCE: moderate
+        run: python scheduled_scan.py
