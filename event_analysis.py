@@ -40,42 +40,41 @@ def test_openai_connection():
 
 def get_recent_headlines(ticker):
     headlines = []
-    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+    api_key = os.getenv("MARKETAUX_API_KEY")
     if not api_key:
-        raise ValueError("ALPHA_VANTAGE_API_KEY is missing.")
-    url = "https://www.alphavantage.co/query"
+        raise ValueError("MARKETAUX_API_KEY is missing.")
+
+    url = "https://api.marketaux.com/v1/news/all"
     params = {
-        "function": "NEWS_SENTIMENT",
-        "tickers": ticker,
-        "limit": 5,
-        "apikey": api_key,
+        "api_token": api_key,
+        "symbols": ticker,
+        "limit": 3,
+        "filter_entities": "true",
     }
     response = requests.get(url, params=params, timeout=10)
     response.raise_for_status()
-    data= response.json()
-    if "Note" in data or "Information" in data:
-        raise RuntimeError(data.get("Note") or data.get("Information"))
-    for story in data.get("feed", []):
+    data = response.json()
+    if data.get("error"):
+        raise RuntimeError(data["error"])
 
-        matching_tickers = [
-            sentiment
-            for sentiment in story.get("ticker_sentiment", [])
-            if sentiment.get("ticker") == ticker
-        ]      
-        if not matching_tickers:
+    for story in data.get("data", []):
+        matching_entities = [
+            entity
+            for entity in story.get("entities", [])
+            if entity.get("symbol") == ticker
+        ]
+        if not matching_entities:
             continue
-        relevance = max(
-            float(sentiment.get("relevance_score", 0))
-            for sentiment in matching_tickers
-        )
-        if relevance < 0.25:
-            continue
-        time_published = story.get("time_published", "unknown time")
+
+        time_published = story.get("published_at", "unknown time")
         source = story.get("source", "unknown source")
         title = story.get("title", "untitled")
+        description = story.get("description") or story.get("snippet") or ""
+        if description:
+            description = f" | {description[:350]}"
 
-        headlines.append(f"{time_published} | {source}: {title}")
-    return headlines[:5]
+        headlines.append(f"{time_published} | {source}: {title}{description}")
+    return headlines
     
 
 def analyze_events(ticker, scanner_outlook, headlines):
