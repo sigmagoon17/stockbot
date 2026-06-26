@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from history_tracker import (
     add_manual_position,
     append_scan_history as save_history,
-    append_trade_snapshots as save_trade_snapshots,
     close_candidate,
     close_manual_position,
     delete_manual_position,
@@ -1434,9 +1433,7 @@ if scan_button:
         history_save_errors = save_history(
             history_candidates, event_analyses, price_moves
         )
-        snapshot_errors = save_trade_snapshots()
         errors = history_errors + errors + history_save_errors
-        errors.extend(snapshot_errors)
 
         st.write("Reviewing the top 3 candidates with AI...")
         candidate_analyses = {}
