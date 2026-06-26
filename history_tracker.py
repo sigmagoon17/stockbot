@@ -401,6 +401,192 @@ def append_trade_snapshots() -> list[str]:
     return errors
 
 
+def add_manual_position(
+    ticker: str,
+    strategy: str,
+    expiration: date,
+    long_strike: float,
+    short_strike: float,
+    entry_price: float,
+    quantity: int,
+    note: str,
+) -> list[str]:
+    try:
+        supabase.table("manual_positions").insert(
+            {
+                "ticker": ticker.upper().strip(),
+                "strategy": strategy,
+                "expiration": expiration.isoformat(),
+                "long_strike": round(long_strike, 2),
+                "short_strike": round(short_strike, 2),
+                "entry_price": round(entry_price, 2),
+                "quantity": int(quantity),
+                "note": note.strip() or None,
+            }
+        ).execute()
+        return []
+    except Exception as error:
+        return [f"Could not add manual position: {error}"]
+
+
+def fetch_manual_positions(status: str = "open") -> tuple[list[dict], list[str]]:
+    try:
+        response = (
+            supabase.table("manual_positions")
+            .select("*")
+            .eq("status", status)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return response.data, []
+    except Exception as error:
+        return [], [f"Could not load manual positions: {error}"]
+
+
+def close_manual_position(record_id: int) -> list[str]:
+    try:
+        (
+            supabase.table("manual_positions")
+            .update({"status": "closed"})
+            .eq("id", record_id)
+            .execute()
+        )
+        return []
+    except Exception as error:
+        return [f"Could not close manual position: {error}"]
+
+
+def manual_position_mark_and_pnl(row, chain) -> tuple[float, float] | None:
+    strategy = row["strategy"]
+    long_strike = float(row["long_strike"])
+    short_strike = float(row["short_strike"])
+    entry_price = float(row["entry_price"])
+    quantity = int(row.get("quantity") or 1)
+
+    if strategy == "bull call debit spread":
+        long_quote = option_quote(chain.calls, long_strike)
+        short_quote = option_quote(chain.calls, short_strike)
+        if long_quote is None or short_quote is None:
+            return None
+        long_bid, _ = long_quote
+        _, short_ask = short_quote
+        current_mark = max(0, round(long_bid - short_ask, 2))
+        pnl = round((current_mark - entry_price) * CONTRACT_MULTIPLIER * quantity, 2)
+        return current_mark, pnl
+
+    if strategy == "bear put debit spread":
+        long_quote = option_quote(chain.puts, long_strike)
+        short_quote = option_quote(chain.puts, short_strike)
+        if long_quote is None or short_quote is None:
+            return None
+        long_bid, _ = long_quote
+        _, short_ask = short_quote
+        current_mark = max(0, round(long_bid - short_ask, 2))
+        pnl = round((current_mark - entry_price) * CONTRACT_MULTIPLIER * quantity, 2)
+        return current_mark, pnl
+
+    if strategy == "put credit spread":
+        short_quote = option_quote(chain.puts, short_strike)
+        long_quote = option_quote(chain.puts, long_strike)
+        if short_quote is None or long_quote is None:
+            return None
+        _, short_ask = short_quote
+        long_bid, _ = long_quote
+        current_mark = max(0, round(short_ask - long_bid, 2))
+        pnl = round((entry_price - current_mark) * CONTRACT_MULTIPLIER * quantity, 2)
+        return current_mark, pnl
+
+    if strategy == "call credit spread":
+        short_quote = option_quote(chain.calls, short_strike)
+        long_quote = option_quote(chain.calls, long_strike)
+        if short_quote is None or long_quote is None:
+            return None
+        _, short_ask = short_quote
+        long_bid, _ = long_quote
+        current_mark = max(0, round(short_ask - long_bid, 2))
+        pnl = round((entry_price - current_mark) * CONTRACT_MULTIPLIER * quantity, 2)
+        return current_mark, pnl
+
+    return None
+
+
+def manual_position_recommendation(row, pnl: float | None, dte: int) -> str:
+    if pnl is None:
+        return "Needs quote"
+
+    entry_price = float(row["entry_price"])
+    quantity = int(row.get("quantity") or 1)
+    entry_value = entry_price * CONTRACT_MULTIPLIER * quantity
+
+    if entry_value > 0 and pnl >= entry_value * 0.5:
+        return "Consider taking profit"
+    if entry_value > 0 and pnl <= -entry_value * 0.5:
+        return "Review risk"
+    if dte <= 7:
+        return "Expiration close"
+    return "Hold"
+
+
+def manual_position_rows_with_marks() -> tuple[list[dict], list[str]]:
+    positions, errors = fetch_manual_positions()
+    if errors or not positions:
+        return [], errors
+
+    rows = []
+    stocks = {}
+    chains = {}
+    prices = {}
+
+    for position in positions:
+        ticker = position["ticker"]
+        expiration = position["expiration"]
+        key = (ticker, expiration)
+        try:
+            if ticker not in stocks:
+                stocks[ticker] = yf.Ticker(ticker)
+            stock = stocks[ticker]
+            if ticker not in prices:
+                prices[ticker] = current_underlying_price(stock)
+            if key not in chains:
+                chains[key] = stock.option_chain(expiration)
+            mark_and_pnl = manual_position_mark_and_pnl(position, chains[key])
+        except Exception as error:
+            errors.append(f"Could not price {ticker} manual position: {error}")
+            mark_and_pnl = None
+
+        expiration_date = date.fromisoformat(expiration)
+        dte = (expiration_date - date.today()).days
+        current_mark = None
+        pnl = None
+        if mark_and_pnl is not None:
+            current_mark, pnl = mark_and_pnl
+
+        rows.append(
+            {
+                "id": position["id"],
+                "ticker": ticker,
+                "strategy": position["strategy"],
+                "expiration": expiration,
+                "dte": dte,
+                "long_strike": position["long_strike"],
+                "short_strike": position["short_strike"],
+                "entry_price": position["entry_price"],
+                "quantity": position["quantity"],
+                "underlying_price": prices.get(ticker),
+                "current_mark": (
+                    round(current_mark * CONTRACT_MULTIPLIER, 2)
+                    if current_mark is not None
+                    else None
+                ),
+                "unrealized_pnl": pnl,
+                "recommendation": manual_position_recommendation(position, pnl, dte),
+                "note": position.get("note"),
+            }
+        )
+
+    return rows, errors
+
+
 def expiration_close(ticker: str, expiration: date) -> float | None:
     history = yf.Ticker(ticker).history(
         start=expiration.isoformat(),

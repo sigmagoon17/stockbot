@@ -10,11 +10,14 @@ import time
 import yfinance as yf
 
 from history_tracker import (
+    add_manual_position,
     append_scan_history as save_history,
     append_trade_snapshots as save_trade_snapshots,
     close_candidate,
+    close_manual_position,
     fetch_completed_history,
     fetch_open_history,
+    manual_position_rows_with_marks,
     update_expired_history as update_history,
 )
 
@@ -897,6 +900,135 @@ def render_results():
     )
 
 
+def render_manual_positions():
+    st.subheader("My Positions")
+    st.caption(
+        "Private monitor for real positions you enter manually. Values use current Yahoo bid/ask quotes, so treat them as estimates."
+    )
+
+    with st.expander("Add Position", expanded=False):
+        with st.form("manual_position_form"):
+            form_columns = st.columns(3)
+            ticker = form_columns[0].text_input("Ticker", value="NVDA").upper()
+            strategy = form_columns[1].selectbox(
+                "Strategy",
+                [
+                    "bull call debit spread",
+                    "bear put debit spread",
+                    "put credit spread",
+                    "call credit spread",
+                ],
+            )
+            expiration = form_columns[2].date_input("Expiration", value=date.today())
+
+            strike_columns = st.columns(4)
+            long_strike = strike_columns[0].number_input(
+                "Long Strike", min_value=0.0, value=200.0, step=1.0
+            )
+            short_strike = strike_columns[1].number_input(
+                "Short Strike", min_value=0.0, value=205.0, step=1.0
+            )
+            entry_price = strike_columns[2].number_input(
+                "Debit/Credit Paid", min_value=0.0, value=1.0, step=0.01
+            )
+            quantity = strike_columns[3].number_input(
+                "Quantity", min_value=1, value=1, step=1
+            )
+            note = st.text_input("Note")
+            submitted = st.form_submit_button("Add Position")
+
+        if submitted:
+            add_errors = add_manual_position(
+                ticker,
+                strategy,
+                expiration,
+                long_strike,
+                short_strike,
+                entry_price,
+                quantity,
+                note,
+            )
+            if add_errors:
+                for error in add_errors:
+                    st.error(error)
+            else:
+                st.success("Position added.")
+                st.rerun()
+
+    position_rows, position_errors = manual_position_rows_with_marks()
+    for error in position_errors:
+        st.warning(error)
+
+    if not position_rows:
+        st.info("No open manual positions yet.")
+        return
+
+    positions = pd.DataFrame(position_rows)
+    display_positions = positions[
+        [
+            "ticker",
+            "strategy",
+            "expiration",
+            "dte",
+            "underlying_price",
+            "long_strike",
+            "short_strike",
+            "entry_price",
+            "quantity",
+            "current_mark",
+            "unrealized_pnl",
+            "recommendation",
+            "note",
+        ]
+    ].rename(
+        columns={
+            "ticker": "Ticker",
+            "strategy": "Strategy",
+            "expiration": "Expiration",
+            "dte": "DTE",
+            "underlying_price": "Stock Price",
+            "long_strike": "Long",
+            "short_strike": "Short",
+            "entry_price": "Entry",
+            "quantity": "Qty",
+            "current_mark": "Current Value",
+            "unrealized_pnl": "Unrealized P/L",
+            "recommendation": "Recommendation",
+            "note": "Note",
+        }
+    )
+    st.dataframe(
+        display_positions,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Stock Price": st.column_config.NumberColumn(format="$%.2f"),
+            "Long": st.column_config.NumberColumn(format="%.2f"),
+            "Short": st.column_config.NumberColumn(format="%.2f"),
+            "Entry": st.column_config.NumberColumn(format="$%.2f"),
+            "Current Value": st.column_config.NumberColumn(format="$%.2f"),
+            "Unrealized P/L": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+
+    with st.expander("Close Manual Position"):
+        close_options = {
+            (
+                f"#{row['id']} | {row['ticker']} {row['strategy']} | "
+                f"{row['expiration']}"
+            ): row
+            for row in position_rows
+        }
+        selected = st.selectbox("Position", list(close_options))
+        if st.button("Mark Closed", width="stretch"):
+            close_errors = close_manual_position(close_options[selected]["id"])
+            if close_errors:
+                for error in close_errors:
+                    st.error(error)
+            else:
+                st.rerun()
+
+
 def render_private_results():
     owner_password = os.getenv("OWNER_DASHBOARD_PASSWORD")
     if not owner_password:
@@ -917,7 +1049,13 @@ def render_private_results():
                 st.session_state["admin_clicks"] = 0
                 st.session_state["show_admin_prompt"] = False
                 st.rerun()
-        render_results()
+        positions_tab, scanner_results_tab = st.tabs(
+            ["My Positions", "Scanner Tracking"]
+        )
+        with positions_tab:
+            render_manual_positions()
+        with scanner_results_tab:
+            render_results()
         return
 
     with st.sidebar:
