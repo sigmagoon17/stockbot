@@ -38,6 +38,7 @@ class OptionContract:
     implied_volatility: float
     open_interest: int
     volume: int
+    quote_source: str = "bid/ask"
 
 
 def normal_cdf(value: float) -> float:
@@ -63,6 +64,28 @@ def estimated_delta(
 
 def integer_or_zero(value) -> int:
     return 0 if value is None or math.isnan(float(value)) else int(value)
+
+
+def open_interest_or_volume(row) -> int:
+    open_interest = integer_or_zero(row["openInterest"])
+    volume = integer_or_zero(row["volume"])
+    return open_interest if open_interest > 0 else volume
+
+
+def option_bid_ask_from_row(row) -> tuple[float, float, str] | None:
+    bid = float(row["bid"])
+    ask = float(row["ask"])
+    if bid > 0 and ask > 0:
+        return bid, ask, "bid/ask"
+
+    last_price = float(row["lastPrice"])
+    if last_price <= 0 or math.isnan(last_price):
+        return None
+
+    synthetic_spread = max(0.02, min(0.04, last_price * 0.01))
+    synthetic_bid = max(0.01, last_price - synthetic_spread / 2)
+    synthetic_ask = last_price + synthetic_spread / 2
+    return round(synthetic_bid, 2), round(synthetic_ask, 2), "last price estimate"
 
 
 def get_underlying_price(stock: yf.Ticker) -> float:
@@ -182,11 +205,13 @@ def get_option_chain(
         for option_type, table in (("call", chain.calls), ("put", chain.puts)):
             for _, row in table.iterrows():
                 strike = float(row["strike"])
-                bid = float(row["bid"])
-                ask = float(row["ask"])
+                bid_ask = option_bid_ask_from_row(row)
+                if bid_ask is None:
+                    continue
+                bid, ask, quote_source = bid_ask
                 implied_volatility = float(row["impliedVolatility"])
 
-                if bid <= 0 or ask <= 0 or implied_volatility <= 0:
+                if implied_volatility <= 0:
                     continue
 
                 contracts.append(
@@ -208,8 +233,9 @@ def get_option_chain(
                         theta=0,
                         vega=0,
                         implied_volatility=implied_volatility,
-                        open_interest=integer_or_zero(row["openInterest"]),
+                        open_interest=open_interest_or_volume(row),
                         volume=integer_or_zero(row["volume"]),
+                        quote_source=quote_source,
                     )
                 )
 
@@ -266,6 +292,7 @@ class Trade:
     put_long_strike: float | None = None
     call_short_strike: float | None = None
     call_long_strike: float | None = None
+    quote_source: str = "bid/ask"
 
 
 @dataclass(frozen=True)
@@ -395,6 +422,9 @@ def risk_level(trade: Trade) -> str:
 
 def passes_filters(trade: Trade, preferences: ScanPreferences) -> tuple[bool, list[str]]:
     rejection_reasons = []
+
+    if trade.quote_source != "bid/ask":
+        rejection_reasons.append("quote is estimated from last price")
 
     if trade.earnings_before_exp:
         rejection_reasons.append("earnings occur before expiration")
@@ -872,6 +902,12 @@ def build_put_credit_spreads(
             long_put.ask,
             short_put.delta,
             long_put.delta,
+            quote_source=(
+                "bid/ask"
+                if short_put.quote_source == "bid/ask"
+                and long_put.quote_source == "bid/ask"
+                else "last price estimate"
+            ),
             )
             trades.append(trade)
     return trades
@@ -945,6 +981,12 @@ def build_call_credit_spreads(
             long_call.ask,
             short_call.delta,
             long_call.delta,
+            quote_source=(
+                "bid/ask"
+                if short_call.quote_source == "bid/ask"
+                and long_call.quote_source == "bid/ask"
+                else "last price estimate"
+            ),
             )
             trades.append(trade)
     return trades
@@ -1028,6 +1070,12 @@ def build_iron_condor(
                 put_long_strike=put_spread.long_strike,
                 call_short_strike=call_spread.short_strike,
                 call_long_strike=call_spread.long_strike,
+                quote_source=(
+                    "bid/ask"
+                    if put_spread.quote_source == "bid/ask"
+                    and call_spread.quote_source == "bid/ask"
+                    else "last price estimate"
+                ),
             )      
             trades.append(trade)  
     return trades
@@ -1094,6 +1142,12 @@ def build_bull_call_debit_spread(
                 long_delta=long_call.delta,
                 entry_type="debit",
                 max_profit=max_profit,
+                quote_source=(
+                    "bid/ask"
+                    if long_call.quote_source == "bid/ask"
+                    and short_call.quote_source == "bid/ask"
+                    else "last price estimate"
+                ),
             )
             trades.append(trade)
 
@@ -1161,6 +1215,12 @@ def build_bear_put_debit_spread(
                 long_delta=long_put.delta,
                 entry_type="debit",
                 max_profit=max_profit,
+                quote_source=(
+                    "bid/ask"
+                    if long_put.quote_source == "bid/ask"
+                    and short_put.quote_source == "bid/ask"
+                    else "last price estimate"
+                ),
             )
             trades.append(trade)
 
