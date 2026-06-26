@@ -2,7 +2,11 @@ import os
 from collections import Counter
 
 from event_analysis import get_event_analysis
-from history_tracker import append_scan_history, update_expired_history
+from history_tracker import (
+    append_scan_history,
+    append_trade_snapshots,
+    update_expired_history,
+)
 from stock2dupe import (
     ScanPreferences,
     build_bear_put_debit_spread,
@@ -66,6 +70,7 @@ def main() -> int:
     trades = []
     event_analyses = {}
     event_adjustments = {}
+    event_labels = {}
     price_moves = {}
     errors = update_expired_history(include_today=True)
 
@@ -81,6 +86,7 @@ def main() -> int:
             event_analysis = get_event_analysis(ticker, preferences.outlook)
             event_analyses[ticker] = event_analysis
             event_adjustments[ticker] = event_analysis.adjustment
+            event_labels[ticker] = event_analysis.label
             price_moves[ticker] = price_move
 
             trades.extend(
@@ -112,11 +118,14 @@ def main() -> int:
         except Exception as error:
             errors.append(f"{ticker}: {error}")
 
-    scored_trades, _ = scan_trades(trades, preferences, event_adjustments)
+    scored_trades, _ = scan_trades(
+        trades, preferences, event_adjustments, price_moves, event_labels
+    )
     history_candidates = select_history_candidates(scored_trades)
     errors.extend(
         append_scan_history(history_candidates, event_analyses, price_moves)
     )
+    errors.extend(append_trade_snapshots())
 
     print(f"Saved {len(history_candidates)} candidates from {len(scored_trades)} passing trades.")
     for error in errors:

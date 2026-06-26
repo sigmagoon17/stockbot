@@ -275,6 +275,8 @@ class ScoredTrade:
     category_scores: dict[str, int]
     quant_score: int
     event_adjustment: int
+    price_move_adjustment: int
+    price_move_style: str
     total_score: int
     reasons: list[str]
     explanation: str
@@ -561,7 +563,82 @@ def score_profit_risk(trade: Trade) -> int:
     return 4
 
 
-def score_trade(trade: Trade, preferences: ScanPreferences, event_adjustment: int = 0) -> ScoredTrade:
+def price_move_signal(
+    trade: Trade,
+    price_move: dict[str, float | str] | None,
+    event_label: str = "neutral",
+) -> tuple[int, str]:
+    if not price_move:
+        return 0, "None"
+
+    try:
+        daily_move = float(price_move.get("1D Move %", 0))
+        five_day_move = float(price_move.get("5D Move %", 0))
+        move_multiple = float(price_move.get("Move vs 20D Vol", 0))
+    except (TypeError, ValueError):
+        return 0, "None"
+
+    if move_multiple < 1.5 and abs(five_day_move) < 3:
+        return 0, "Normal Move"
+
+    magnitude = 3
+    if move_multiple >= 2:
+        magnitude = 6
+    if move_multiple >= 3:
+        magnitude = 8
+    if abs(five_day_move) >= 5:
+        magnitude = min(10, magnitude + 2)
+
+    if daily_move > 0:
+        move_direction = "up"
+    elif daily_move < 0:
+        move_direction = "down"
+    elif five_day_move > 0:
+        move_direction = "up"
+    elif five_day_move < 0:
+        move_direction = "down"
+    else:
+        return 0, "Normal Move"
+
+    bullish_strategies = {"put credit spread", "bull call debit spread"}
+    bearish_strategies = {"call credit spread", "bear put debit spread"}
+    clean_reversion_event = event_label.lower() in {"neutral", "supportive"}
+
+    if trade.strategy in bullish_strategies:
+        if move_direction == "up":
+            return magnitude, "Trend Continuation"
+        if clean_reversion_event:
+            return 5, "Mean Reversion"
+        return -magnitude, "Against Setup"
+
+    if trade.strategy in bearish_strategies:
+        if move_direction == "down":
+            return magnitude, "Trend Continuation"
+        if clean_reversion_event:
+            return 5, "Mean Reversion"
+        return -magnitude, "Against Setup"
+
+    if trade.strategy == "iron condor":
+        return -magnitude, "Unusual Move"
+    return 0, "None"
+
+
+def price_move_adjustment(
+    trade: Trade,
+    price_move: dict[str, float | str] | None,
+    event_label: str = "neutral",
+) -> int:
+    adjustment, _ = price_move_signal(trade, price_move, event_label)
+    return adjustment
+
+
+def score_trade(
+    trade: Trade,
+    preferences: ScanPreferences,
+    event_adjustment: int = 0,
+    price_move: dict[str, float | str] | None = None,
+    event_label: str = "neutral",
+) -> ScoredTrade:
     category_scores = {
         "Expected Move": score_expected_move(trade),
         "Volatility Rank": score_volatility_rank(trade),
@@ -573,7 +650,10 @@ def score_trade(trade: Trade, preferences: ScanPreferences, event_adjustment: in
     }
     raw_total_score = sum(category_scores.values())
     quant_score = max(0, min(100, round(raw_total_score / MAX_SETUP_SCORE * 100)))
-    total_score = max(0, min(100, quant_score + event_adjustment))
+    price_adjustment, price_style = price_move_signal(
+        trade, price_move, event_label
+    )
+    total_score = max(0, min(100, quant_score + event_adjustment + price_adjustment))
     reasons = passing_reasons(trade)
 
     return ScoredTrade(
@@ -582,6 +662,8 @@ def score_trade(trade: Trade, preferences: ScanPreferences, event_adjustment: in
         category_scores=category_scores,
         quant_score=quant_score,
         event_adjustment=event_adjustment,
+        price_move_adjustment=price_adjustment,
+        price_move_style=price_style,
         total_score=total_score,
         reasons=reasons,
         explanation=beginner_explanation(trade, category_scores),
@@ -686,17 +768,37 @@ def spread_summary(trade: Trade) -> str:
     )
 
 
-def scan_trades(trades: list[Trade], preferences: ScanPreferences, event_adjustments: dict[str, int] | None= None) -> tuple[list[ScoredTrade], list[tuple[Trade, list[str]]]]:
+def scan_trades(
+    trades: list[Trade],
+    preferences: ScanPreferences,
+    event_adjustments: dict[str, int] | None = None,
+    price_moves: dict[str, dict[str, float | str]] | None = None,
+    event_labels: dict[str, str] | None = None,
+) -> tuple[list[ScoredTrade], list[tuple[Trade, list[str]]]]:
     passing = []
     rejected = []
     if event_adjustments is None:
         event_adjustments = {}
+    if price_moves is None:
+        price_moves = {}
+    if event_labels is None:
+        event_labels = {}
     for trade in trades:
         passed, reasons = passes_filters(trade, preferences)
 
         if passed:
             event_adjustment = event_adjustments.get(trade.ticker, 0)
-            passing.append(score_trade(trade, preferences, event_adjustment))
+            price_move = price_moves.get(trade.ticker)
+            event_label = event_labels.get(trade.ticker, "neutral")
+            passing.append(
+                score_trade(
+                    trade,
+                    preferences,
+                    event_adjustment,
+                    price_move,
+                    event_label,
+                )
+            )
         else:
             rejected.append((trade, reasons))
 

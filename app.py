@@ -11,6 +11,7 @@ import yfinance as yf
 
 from history_tracker import (
     append_scan_history as save_history,
+    append_trade_snapshots as save_trade_snapshots,
     close_candidate,
     fetch_completed_history,
     fetch_open_history,
@@ -177,6 +178,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
     ticker_data = []
     errors = []
     event_adjustments = {}
+    event_labels = {}
     event_analyses = {}
     price_moves = {}
     progress = st.progress(0, text="Preparing scan")
@@ -220,6 +222,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
             event_analysis = get_cached_event_analysis(ticker, preferences.outlook)
             event_analyses[ticker] = event_analysis
             event_adjustments[ticker] = event_analysis.adjustment
+            event_labels[ticker] = event_analysis.label
             ticker_data[-1].update(
                 {
                     "Event Label": event_analysis.label.title(),
@@ -256,7 +259,9 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
             errors.append(f"{ticker}: {error}")
 
     progress.empty()
-    scored_trades, rejected_trades = scan_trades(trades, preferences, event_adjustments)
+    scored_trades, rejected_trades = scan_trades(
+        trades, preferences, event_adjustments, price_moves, event_labels
+    )
     return (
         scored_trades,
         rejected_trades,
@@ -401,6 +406,8 @@ def candidate_row(scored):
         "Setup Score": scored.total_score,
         "Quant Score": scored.quant_score,
         "Event Adjustment": scored.event_adjustment,
+        "Price Move Adjustment": scored.price_move_adjustment,
+        "Move Setup": scored.price_move_style,
         "Risk Level": scored.risk_level,
         "Volatility Rank": round(trade.volatility_rank, 1),
     }
@@ -426,7 +433,7 @@ def candidate_column_config():
         ),
         "Setup Score": st.column_config.NumberColumn(
             "Setup Score",
-            help="Final score after quant rules and any event adjustment.",
+            help="Final score after quant rules, event analysis, and recent price movement.",
             format="%d / 100",
         ),
         "Quant Score": st.column_config.NumberColumn(
@@ -438,6 +445,15 @@ def candidate_column_config():
             "Event Adjustment",
             help="Score change from the event-analysis layer. It is zero until event analysis is connected.",
             format="%d",
+        ),
+        "Price Move Adjustment": st.column_config.NumberColumn(
+            "Price Move Adjustment",
+            help="Score change from recent stock movement. Directional strategies get credit when the move agrees with them and lose points when it does not.",
+            format="%d",
+        ),
+        "Move Setup": st.column_config.TextColumn(
+            "Move Setup",
+            help="Whether recent price movement is being treated as trend continuation, mean reversion, or normal movement.",
         ),
         "Volatility Rank": st.column_config.NumberColumn(
             "Volatility Rank",
@@ -467,6 +483,8 @@ def debit_candidate_rows(scored_trades):
                 "Setup Score": scored.total_score,
                 "Quant Score": scored.quant_score,
                 "Event Adjustment": scored.event_adjustment,
+                "Price Move Adjustment": scored.price_move_adjustment,
+                "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
                 "Volatility Rank": round(trade.volatility_rank, 1),
             }
@@ -495,6 +513,8 @@ def credit_candidate_rows(scored_trades):
                 "Setup Score": scored.total_score,
                 "Quant Score": scored.quant_score,
                 "Event Adjustment": scored.event_adjustment,
+                "Price Move Adjustment": scored.price_move_adjustment,
+                "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
                 "Volatility Rank": round(trade.volatility_rank, 1),
             }
@@ -976,7 +996,9 @@ if scan_button:
     history_save_errors = save_history(
         history_candidates, event_analyses, price_moves
     )
+    snapshot_errors = save_trade_snapshots()
     errors = history_errors + errors + history_save_errors
+    errors.extend(snapshot_errors)
 
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
