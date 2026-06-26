@@ -8,6 +8,7 @@ import datetime
 import supabase
 import time
 import yfinance as yf
+from types import SimpleNamespace
 
 from history_tracker import (
     add_manual_position,
@@ -34,7 +35,12 @@ from stock2dupe import (
     scan_trades,
 )
 
-from event_analysis import analyze_candidate_setup, get_event_analysis
+try:
+    from event_analysis import analyze_candidate_setup, get_event_analysis
+except ImportError:
+    from event_analysis import get_event_analysis
+
+    analyze_candidate_setup = None
 
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
@@ -93,9 +99,20 @@ def get_cached_candidate_analysis(scored, event_analysis, price_move):
     cache = candidate_analysis_cache()
     cache_key = candidate_analysis_key(scored)
     if cache_key not in cache:
-        cache[cache_key] = analyze_candidate_setup(
-            scored, event_analysis, price_move
-        )
+        if analyze_candidate_setup is None:
+            cache[cache_key] = SimpleNamespace(
+                verdict="watch",
+                confidence="low",
+                summary="AI candidate review is temporarily unavailable while the app finishes redeploying.",
+                strengths=[],
+                risks=[],
+                action="Run the scan again after Streamlit finishes updating the app.",
+                available=False,
+            )
+        else:
+            cache[cache_key] = analyze_candidate_setup(
+                scored, event_analysis, price_move
+            )
     return cache[cache_key]
 
 st.markdown(
