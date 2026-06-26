@@ -902,7 +902,10 @@ def render_results():
 
 
 def render_manual_positions():
-    st.subheader("My Positions")
+    title_column, refresh_column = st.columns([4, 1])
+    title_column.subheader("My Positions")
+    if refresh_column.button("Refresh Quotes", width="stretch"):
+        st.rerun()
     st.caption(
         "Private monitor for real positions you enter manually. Values use current Yahoo bid/ask quotes, so treat them as estimates."
     )
