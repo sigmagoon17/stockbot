@@ -15,6 +15,7 @@ from history_tracker import (
     append_trade_snapshots as save_trade_snapshots,
     close_candidate,
     close_manual_position,
+    delete_manual_position,
     fetch_completed_history,
     fetch_open_history,
     manual_position_rows_with_marks,
@@ -1011,19 +1012,29 @@ def render_manual_positions():
         },
     )
 
-    with st.expander("Close Manual Position"):
-        close_options = {
+    with st.expander("Manage Manual Position"):
+        position_options = {
             (
                 f"#{row['id']} | {row['ticker']} {row['strategy']} | "
                 f"{row['expiration']}"
             ): row
             for row in position_rows
         }
-        selected = st.selectbox("Position", list(close_options))
-        if st.button("Mark Closed", width="stretch"):
-            close_errors = close_manual_position(close_options[selected]["id"])
-            if close_errors:
-                for error in close_errors:
+        selected = st.selectbox("Position", list(position_options))
+        action_columns = st.columns(2)
+        if action_columns[0].button("Mark Closed", width="stretch"):
+            selected_id = position_options[selected]["id"]
+            errors = close_manual_position(selected_id)
+            if errors:
+                for error in errors:
+                    st.error(error)
+            else:
+                st.rerun()
+        if action_columns[1].button("Delete Entry", width="stretch"):
+            selected_id = position_options[selected]["id"]
+            errors = delete_manual_position(selected_id)
+            if errors:
+                for error in errors:
                     st.error(error)
             else:
                 st.rerun()

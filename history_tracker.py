@@ -456,6 +456,19 @@ def close_manual_position(record_id: int) -> list[str]:
         return [f"Could not close manual position: {error}"]
 
 
+def delete_manual_position(record_id: int) -> list[str]:
+    try:
+        (
+            supabase.table("manual_positions")
+            .delete()
+            .eq("id", record_id)
+            .execute()
+        )
+        return []
+    except Exception as error:
+        return [f"Could not delete manual position: {error}"]
+
+
 def manual_position_mark_and_pnl(row, chain) -> tuple[float, float] | None:
     strategy = row["strategy"]
     long_strike = float(row["long_strike"])
