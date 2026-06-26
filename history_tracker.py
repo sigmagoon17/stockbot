@@ -269,6 +269,23 @@ def snapshot_exit_signal(row, unrealized_pnl: float) -> str:
     return "hold"
 
 
+def updated_pnl_extremes(row, unrealized_pnl: float) -> tuple[float, float]:
+    previous_high = numeric_value(row.get("highest_unrealized_pnl"))
+    previous_low = numeric_value(row.get("lowest_unrealized_pnl"))
+
+    highest = (
+        unrealized_pnl
+        if previous_high is None
+        else max(previous_high, unrealized_pnl)
+    )
+    lowest = (
+        unrealized_pnl
+        if previous_low is None
+        else min(previous_low, unrealized_pnl)
+    )
+    return round(highest, 2), round(lowest, 2)
+
+
 def append_trade_snapshots() -> list[str]:
     errors = []
     open_rows, open_errors = fetch_open_history(limit=1000)
@@ -287,6 +304,7 @@ def append_trade_snapshots() -> list[str]:
     chains = {}
     prices = {}
     snapshot_rows = []
+    pnl_extreme_updates = []
 
     for row in open_rows:
         ticker = row["ticker"]
@@ -316,6 +334,9 @@ def append_trade_snapshots() -> list[str]:
         max_profit = numeric_value(row.get("max_profit")) or numeric_value(row.get("credit")) or 0
         max_risk = numeric_value(row.get("max_risk")) or 0
         expiration_date = date.fromisoformat(expiration)
+        highest_unrealized_pnl, lowest_unrealized_pnl = updated_pnl_extremes(
+            row, unrealized_pnl
+        )
 
         snapshot_rows.append(
             {
@@ -342,6 +363,13 @@ def append_trade_snapshots() -> list[str]:
                 "exit_signal": snapshot_exit_signal(row, unrealized_pnl),
             }
         )
+        pnl_extreme_updates.append(
+            {
+                "id": row["id"],
+                "highest_unrealized_pnl": highest_unrealized_pnl,
+                "lowest_unrealized_pnl": lowest_unrealized_pnl,
+            }
+        )
 
     if not snapshot_rows:
         return errors
@@ -350,6 +378,25 @@ def append_trade_snapshots() -> list[str]:
         supabase.table("trade_snapshots").insert(snapshot_rows).execute()
     except Exception as error:
         errors.append(f"Could not save trade snapshots: {error}")
+
+    for update in pnl_extreme_updates:
+        try:
+            (
+                supabase.table("scan_history")
+                .update(
+                    {
+                        "highest_unrealized_pnl": update["highest_unrealized_pnl"],
+                        "lowest_unrealized_pnl": update["lowest_unrealized_pnl"],
+                    }
+                )
+                .eq("id", update["id"])
+                .execute()
+            )
+        except Exception as error:
+            errors.append(
+                f"Could not update P/L extremes for scan_history "
+                f"{update['id']}: {error}"
+            )
 
     return errors
 

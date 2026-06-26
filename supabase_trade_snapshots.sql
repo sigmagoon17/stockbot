@@ -24,3 +24,7 @@ create index if not exists trade_snapshots_snapshot_time_idx
 
 create index if not exists trade_snapshots_ticker_expiration_idx
     on public.trade_snapshots(ticker, expiration);
+
+alter table public.scan_history
+    add column if not exists highest_unrealized_pnl numeric,
+    add column if not exists lowest_unrealized_pnl numeric;
