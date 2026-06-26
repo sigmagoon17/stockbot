@@ -34,7 +34,7 @@ from stock2dupe import (
     scan_trades,
 )
 
-from event_analysis import get_event_analysis
+from event_analysis import analyze_candidate_setup, get_event_analysis
 
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
@@ -44,6 +44,11 @@ EVENT_ANALYSIS_FAILURE_TTL_SECONDS = 5 * 60
 
 @st.cache_resource
 def event_analysis_cache():
+    return {}
+
+
+@st.cache_resource
+def candidate_analysis_cache():
     return {}
 
 
@@ -66,6 +71,32 @@ def get_cached_event_analysis(ticker: str, outlook: str):
         ),
     }
     return analysis
+
+
+def candidate_analysis_key(scored):
+    trade = scored.trade
+    return (
+        trade.ticker,
+        trade.strategy,
+        trade.expiration,
+        trade.long_strike,
+        trade.short_strike,
+        trade.entry_type,
+        scored.total_score,
+        scored.quant_score,
+        scored.event_adjustment,
+        scored.price_move_adjustment,
+    )
+
+
+def get_cached_candidate_analysis(scored, event_analysis, price_move):
+    cache = candidate_analysis_cache()
+    cache_key = candidate_analysis_key(scored)
+    if cache_key not in cache:
+        cache[cache_key] = analyze_candidate_setup(
+            scored, event_analysis, price_move
+        )
+    return cache[cache_key]
 
 st.markdown(
     """
@@ -546,6 +577,31 @@ def render_scan_output(scan_output):
     if errors:
         for error in errors:
             st.warning(error)
+
+    candidate_analyses = scan_output.get("candidate_analyses", {})
+    if candidate_analyses:
+        st.subheader("AI Review Of Top Candidates")
+        for index, scored in enumerate(scored_trades[:3], start=1):
+            trade = scored.trade
+            analysis = candidate_analyses.get(candidate_analysis_key(scored))
+            if analysis is None:
+                continue
+            with st.expander(
+                f"{index}. {trade.ticker} {trade.strategy.title()} | "
+                f"{analysis.verdict.title()} | {analysis.confidence.title()} confidence",
+                expanded=index == 1,
+            ):
+                st.write(analysis.summary)
+                strength_column, risk_column = st.columns(2)
+                with strength_column:
+                    st.markdown("**Strengths**")
+                    for strength in analysis.strengths:
+                        st.write(f"- {strength}")
+                with risk_column:
+                    st.markdown("**Risks**")
+                    for risk in analysis.risks:
+                        st.write(f"- {risk}")
+                st.caption(analysis.action)
 
     candidates_tab, market_tab, diagnostics_tab = st.tabs(
         ["Candidates", "Market Data", "Diagnostics"]
@@ -1238,7 +1294,9 @@ def render_private_results():
                 width="stretch",
             ):
                 event_analysis_cache().clear()
+                candidate_analysis_cache().clear()
                 st.session_state.pop("latest_event_analyses", None)
+                st.session_state.pop("last_scan_output", None)
                 st.toast("AI event cache cleared. Run a new scan for fresh analysis.")
             if st.button("Lock Results", width="stretch"):
                 st.session_state["results_unlocked"] = False
@@ -1333,6 +1391,16 @@ if scan_button:
     snapshot_errors = save_trade_snapshots()
     errors = history_errors + errors + history_save_errors
     errors.extend(snapshot_errors)
+    candidate_analyses = {}
+    for scored in scored_trades[:3]:
+        trade = scored.trade
+        candidate_analyses[candidate_analysis_key(scored)] = (
+            get_cached_candidate_analysis(
+                scored,
+                event_analyses.get(trade.ticker),
+                price_moves.get(trade.ticker),
+            )
+        )
     st.session_state["last_scan_output"] = {
         "scored_trades": scored_trades,
         "rejected_trades": rejected_trades,
@@ -1340,6 +1408,7 @@ if scan_button:
         "ticker_data": ticker_data,
         "errors": errors,
         "event_analyses": event_analyses,
+        "candidate_analyses": candidate_analyses,
         "history_candidates": history_candidates,
     }
 

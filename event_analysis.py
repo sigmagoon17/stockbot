@@ -19,6 +19,17 @@ class EventAnalysis:
     available: bool = True
 
 
+@dataclass(frozen=True)
+class CandidateAnalysis:
+    verdict: str
+    confidence: str
+    summary: str
+    strengths: list[str]
+    risks: list[str]
+    action: str
+    available: bool = True
+
+
 def neutral_event_analysis(ticker, headlines, summary, available=True):
     return EventAnalysis(
         adjustment=0,
@@ -27,6 +38,18 @@ def neutral_event_analysis(ticker, headlines, summary, available=True):
         summary=summary.format(ticker=ticker),
         headlines_used=headlines,
         available=available,
+    )
+
+
+def unavailable_candidate_analysis(summary):
+    return CandidateAnalysis(
+        verdict="watch",
+        confidence="low",
+        summary=summary,
+        strengths=[],
+        risks=[],
+        action="Review the scanner numbers manually before acting.",
+        available=False,
     )
 
 
@@ -192,6 +215,92 @@ def get_event_analysis(ticker, scanner_outlook):
             "Event analysis was unavailable for {ticker}.",
             available=False,
         )
+
+
+def analyze_candidate_setup(scored_trade, event_analysis=None, price_move=None):
+    trade = scored_trade.trade
+    price_move = price_move or {}
+    event_summary = (
+        event_analysis.summary
+        if event_analysis is not None
+        else "No event analysis was available."
+    )
+    prompt = f"""
+    You are reviewing an options scanner candidate for a beginner-friendly trading dashboard.
+
+    Use only these scanner facts. Do not invent live prices, news, or probabilities.
+
+    Ticker: {trade.ticker}
+    Strategy: {trade.strategy}
+    Entry type: {trade.entry_type}
+    Expiration: {trade.expiration}
+    DTE: {trade.dte}
+    Underlying price: {trade.underlying_price:.2f}
+    Short strike: {trade.short_strike}
+    Long strike: {trade.long_strike}
+    Credit: {trade.credit * 100:.2f}
+    Max risk: {trade.max_risk * 100:.2f}
+    Max profit: {trade.max_profit * 100:.2f}
+    Delta: {trade.delta:.2f}
+    Volatility rank: {trade.volatility_rank:.1f}
+    Quant score: {scored_trade.quant_score}
+    Event adjustment: {scored_trade.event_adjustment}
+    Price move adjustment: {scored_trade.price_move_adjustment}
+    Final setup score: {scored_trade.total_score}
+    Risk level: {scored_trade.risk_level}
+    Recent 1D move percent: {price_move.get("1D Move %", "unknown")}
+    Recent 5D move percent: {price_move.get("5D Move %", "unknown")}
+    Move setup: {scored_trade.price_move_style}
+    Event summary: {event_summary}
+
+    Return only valid JSON with these fields:
+    - verdict: one of strong, good, watch, avoid
+    - confidence: low, medium, or high
+    - summary: one beginner-friendly sentence
+    - strengths: list of 2 short strings
+    - risks: list of 2 short strings
+    - action: one short sentence explaining what a user should double-check next
+    """
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+        )
+        raw_output = response.output_text.strip()
+        raw_output = (
+            raw_output
+            .removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
+        data = json.loads(raw_output)
+
+        verdict = data["verdict"].lower()
+        confidence = data["confidence"].lower()
+        strengths = data["strengths"]
+        risks = data["risks"]
+
+        if verdict not in ["strong", "good", "watch", "avoid"]:
+            raise ValueError("Candidate verdict is invalid.")
+        if confidence not in ["low", "medium", "high"]:
+            raise ValueError("Candidate confidence is invalid.")
+        if not isinstance(strengths, list) or not isinstance(risks, list):
+            raise ValueError("Candidate strengths and risks must be lists.")
+
+        return CandidateAnalysis(
+            verdict=verdict,
+            confidence=confidence,
+            summary=data["summary"],
+            strengths=[str(item) for item in strengths[:2]],
+            risks=[str(item) for item in risks[:2]],
+            action=data["action"],
+        )
+    except (APIError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return unavailable_candidate_analysis(
+            f"AI candidate review was unavailable for {trade.ticker}."
+        )
+
 
 if __name__ == "__main__":
     analysis = get_event_analysis("AAPL", "bullish")
