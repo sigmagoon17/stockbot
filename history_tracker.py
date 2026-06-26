@@ -154,6 +154,41 @@ def option_quote(option_table, strike: float) -> tuple[float, float] | None:
     return bid, ask
 
 
+def manual_option_quote(option_table, strike: float) -> dict[str, float] | None:
+    matches = option_table[option_table["strike"].astype(float) == float(strike)]
+    if matches.empty:
+        return None
+
+    row = matches.iloc[0]
+    bid = numeric_value(row.get("bid"))
+    ask = numeric_value(row.get("ask"))
+    last_price = numeric_value(row.get("lastPrice"))
+
+    has_bid_ask = (
+        bid is not None
+        and ask is not None
+        and bid > 0
+        and ask > 0
+    )
+    if has_bid_ask:
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": (bid + ask) / 2,
+            "quote_source": "bid/ask",
+        }
+
+    if last_price is not None and last_price > 0:
+        return {
+            "bid": last_price,
+            "ask": last_price,
+            "mid": last_price,
+            "quote_source": "last price",
+        }
+
+    return None
+
+
 def current_underlying_price(stock: yf.Ticker) -> float | None:
     try:
         fast_info = stock.fast_info
@@ -482,16 +517,14 @@ def manual_position_mark_and_pnl(row, chain) -> dict[str, float] | None:
     quantity = int(row.get("quantity") or 1)
 
     if strategy == "bull call debit spread":
-        long_quote = option_quote(chain.calls, long_strike)
-        short_quote = option_quote(chain.calls, short_strike)
+        long_quote = manual_option_quote(chain.calls, long_strike)
+        short_quote = manual_option_quote(chain.calls, short_strike)
         if long_quote is None or short_quote is None:
             return None
-        long_bid, _ = long_quote
-        _, short_ask = short_quote
-        conservative_mark = max(0, round(long_bid - short_ask, 2))
+        conservative_mark = max(0, round(long_quote["bid"] - short_quote["ask"], 2))
         midpoint_mark = max(
             0,
-            round(quote_midpoint(long_quote) - quote_midpoint(short_quote), 2),
+            round(long_quote["mid"] - short_quote["mid"], 2),
         )
         return {
             "conservative_mark": conservative_mark,
@@ -503,20 +536,23 @@ def manual_position_mark_and_pnl(row, chain) -> dict[str, float] | None:
             "midpoint_pnl": round(
                 (midpoint_mark - entry_price) * CONTRACT_MULTIPLIER * quantity,
                 2,
+            ),
+            "quote_source": (
+                "last price"
+                if "last price" in {long_quote["quote_source"], short_quote["quote_source"]}
+                else "bid/ask"
             ),
         }
 
     if strategy == "bear put debit spread":
-        long_quote = option_quote(chain.puts, long_strike)
-        short_quote = option_quote(chain.puts, short_strike)
+        long_quote = manual_option_quote(chain.puts, long_strike)
+        short_quote = manual_option_quote(chain.puts, short_strike)
         if long_quote is None or short_quote is None:
             return None
-        long_bid, _ = long_quote
-        _, short_ask = short_quote
-        conservative_mark = max(0, round(long_bid - short_ask, 2))
+        conservative_mark = max(0, round(long_quote["bid"] - short_quote["ask"], 2))
         midpoint_mark = max(
             0,
-            round(quote_midpoint(long_quote) - quote_midpoint(short_quote), 2),
+            round(long_quote["mid"] - short_quote["mid"], 2),
         )
         return {
             "conservative_mark": conservative_mark,
@@ -529,19 +565,22 @@ def manual_position_mark_and_pnl(row, chain) -> dict[str, float] | None:
                 (midpoint_mark - entry_price) * CONTRACT_MULTIPLIER * quantity,
                 2,
             ),
+            "quote_source": (
+                "last price"
+                if "last price" in {long_quote["quote_source"], short_quote["quote_source"]}
+                else "bid/ask"
+            ),
         }
 
     if strategy == "put credit spread":
-        short_quote = option_quote(chain.puts, short_strike)
-        long_quote = option_quote(chain.puts, long_strike)
+        short_quote = manual_option_quote(chain.puts, short_strike)
+        long_quote = manual_option_quote(chain.puts, long_strike)
         if short_quote is None or long_quote is None:
             return None
-        _, short_ask = short_quote
-        long_bid, _ = long_quote
-        conservative_mark = max(0, round(short_ask - long_bid, 2))
+        conservative_mark = max(0, round(short_quote["ask"] - long_quote["bid"], 2))
         midpoint_mark = max(
             0,
-            round(quote_midpoint(short_quote) - quote_midpoint(long_quote), 2),
+            round(short_quote["mid"] - long_quote["mid"], 2),
         )
         return {
             "conservative_mark": conservative_mark,
@@ -553,20 +592,23 @@ def manual_position_mark_and_pnl(row, chain) -> dict[str, float] | None:
             "midpoint_pnl": round(
                 (entry_price - midpoint_mark) * CONTRACT_MULTIPLIER * quantity,
                 2,
+            ),
+            "quote_source": (
+                "last price"
+                if "last price" in {long_quote["quote_source"], short_quote["quote_source"]}
+                else "bid/ask"
             ),
         }
 
     if strategy == "call credit spread":
-        short_quote = option_quote(chain.calls, short_strike)
-        long_quote = option_quote(chain.calls, long_strike)
+        short_quote = manual_option_quote(chain.calls, short_strike)
+        long_quote = manual_option_quote(chain.calls, long_strike)
         if short_quote is None or long_quote is None:
             return None
-        _, short_ask = short_quote
-        long_bid, _ = long_quote
-        conservative_mark = max(0, round(short_ask - long_bid, 2))
+        conservative_mark = max(0, round(short_quote["ask"] - long_quote["bid"], 2))
         midpoint_mark = max(
             0,
-            round(quote_midpoint(short_quote) - quote_midpoint(long_quote), 2),
+            round(short_quote["mid"] - long_quote["mid"], 2),
         )
         return {
             "conservative_mark": conservative_mark,
@@ -578,6 +620,11 @@ def manual_position_mark_and_pnl(row, chain) -> dict[str, float] | None:
             "midpoint_pnl": round(
                 (entry_price - midpoint_mark) * CONTRACT_MULTIPLIER * quantity,
                 2,
+            ),
+            "quote_source": (
+                "last price"
+                if "last price" in {long_quote["quote_source"], short_quote["quote_source"]}
+                else "bid/ask"
             ),
         }
 
@@ -634,11 +681,13 @@ def manual_position_rows_with_marks() -> tuple[list[dict], list[str]]:
         midpoint_pnl = None
         conservative_mark = None
         conservative_pnl = None
+        quote_source = None
         if mark_and_pnl is not None:
             midpoint_mark = mark_and_pnl["midpoint_mark"]
             midpoint_pnl = mark_and_pnl["midpoint_pnl"]
             conservative_mark = mark_and_pnl["conservative_mark"]
             conservative_pnl = mark_and_pnl["conservative_pnl"]
+            quote_source = mark_and_pnl["quote_source"]
 
         rows.append(
             {
@@ -664,6 +713,7 @@ def manual_position_rows_with_marks() -> tuple[list[dict], list[str]]:
                     else None
                 ),
                 "conservative_pnl": conservative_pnl,
+                "quote_source": quote_source,
                 "recommendation": manual_position_recommendation(
                     position, midpoint_pnl, dte
                 ),

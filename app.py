@@ -983,6 +983,7 @@ def render_manual_positions():
             "unrealized_pnl",
             "conservative_value",
             "conservative_pnl",
+            "quote_source",
             "recommendation",
             "note",
         ]
@@ -1001,6 +1002,7 @@ def render_manual_positions():
             "unrealized_pnl": "Unrealized P/L",
             "conservative_value": "Close Value",
             "conservative_pnl": "Close P/L",
+            "quote_source": "Quote Source",
             "recommendation": "Recommendation",
             "note": "Note",
         }
