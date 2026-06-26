@@ -1353,6 +1353,31 @@ def render_private_results():
                 st.rerun()
 
 
+def render_ready_state():
+    st.markdown("### Ready To Scan")
+    st.info(
+        "Choose your tickers and press Scan Watchlist. The scan may take a minute "
+        "because it pulls option chains, checks news, scores setups, and reviews "
+        "the top candidates with AI."
+    )
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("Default Watchlist", "6 tickers")
+    metric_columns[1].metric("Strategies", "5 types")
+    metric_columns[2].metric("AI Reviews", "Top 3")
+
+    st.markdown("### What You Will See")
+    preview_columns = st.columns(3)
+    with preview_columns[0]:
+        st.markdown("**Candidates**")
+        st.caption("Ranked spreads with setup, quant, event, and price-move scores.")
+    with preview_columns[1]:
+        st.markdown("**Market Data**")
+        st.caption("Underlying price, volatility rank, recent move, and event label.")
+    with preview_columns[2]:
+        st.markdown("**Diagnostics**")
+        st.caption("Why tickers or strategies were rejected by the filters.")
+
+
 st.title("Options Scanner")
 st.caption(
     "Yahoo Finance data may be delayed. Volatility Rank uses historical price movement."
@@ -1391,33 +1416,40 @@ if scan_button:
         test_expiration=test_expiration,
         nearest_expiration=use_nearest_expiration,
     )
-    (
-        scored_trades,
-        rejected_trades,
-        trades,
-        ticker_data,
-        errors,
-        event_analyses,
-        price_moves,
-    ) = scan_watchlist(tickers, preferences)
-    st.session_state["latest_event_analyses"] = event_analyses
-    history_candidates = select_history_candidates(scored_trades)
-    history_save_errors = save_history(
-        history_candidates, event_analyses, price_moves
-    )
-    snapshot_errors = save_trade_snapshots()
-    errors = history_errors + errors + history_save_errors
-    errors.extend(snapshot_errors)
-    candidate_analyses = {}
-    for scored in scored_trades[:3]:
-        trade = scored.trade
-        candidate_analyses[candidate_analysis_key(scored)] = (
-            get_cached_candidate_analysis(
-                scored,
-                event_analyses.get(trade.ticker),
-                price_moves.get(trade.ticker),
-            )
+    with st.status("Scanning watchlist...", expanded=True) as scan_status:
+        st.write("Pulling option chains and market data...")
+        (
+            scored_trades,
+            rejected_trades,
+            trades,
+            ticker_data,
+            errors,
+            event_analyses,
+            price_moves,
+        ) = scan_watchlist(tickers, preferences)
+        st.session_state["latest_event_analyses"] = event_analyses
+
+        st.write("Saving tracked candidates and updating snapshots...")
+        history_candidates = select_history_candidates(scored_trades)
+        history_save_errors = save_history(
+            history_candidates, event_analyses, price_moves
         )
+        snapshot_errors = save_trade_snapshots()
+        errors = history_errors + errors + history_save_errors
+        errors.extend(snapshot_errors)
+
+        st.write("Reviewing the top 3 candidates with AI...")
+        candidate_analyses = {}
+        for scored in scored_trades[:3]:
+            trade = scored.trade
+            candidate_analyses[candidate_analysis_key(scored)] = (
+                get_cached_candidate_analysis(
+                    scored,
+                    event_analyses.get(trade.ticker),
+                    price_moves.get(trade.ticker),
+                )
+            )
+        scan_status.update(label="Scan complete", state="complete", expanded=False)
     st.session_state["last_scan_output"] = {
         "scored_trades": scored_trades,
         "rejected_trades": rejected_trades,
@@ -1431,6 +1463,8 @@ if scan_button:
 
 if st.session_state.get("last_scan_output"):
     render_scan_output(st.session_state["last_scan_output"])
+else:
+    render_ready_state()
 
 
 render_private_results()
