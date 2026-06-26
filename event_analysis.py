@@ -1,13 +1,81 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from openai import APIError, OpenAI
 import json
 import os
+import re
 import requests
 
 
 load_dotenv()
 client = OpenAI()
+
+COMPANY_NAMES = {
+    "AAPL": ["Apple"],
+    "MSFT": ["Microsoft"],
+    "NVDA": ["Nvidia", "NVIDIA"],
+    "COHR": ["Coherent"],
+    "SNDK": ["SanDisk"],
+    "SPY": ["S&P 500", "stock market", "Fed", "Treasury yields"],
+    "QQQ": ["Nasdaq", "mega-cap tech", "technology stocks", "Fed"],
+}
+
+SECTOR_TERMS = {
+    "AAPL": ["iPhone", "consumer tech", "App Store"],
+    "MSFT": ["cloud", "Azure", "AI software"],
+    "NVDA": ["semiconductors", "chips", "AI chips", "SMH"],
+    "COHR": ["optical networking", "semiconductors", "AI data centers"],
+    "SNDK": ["memory chips", "NAND", "semiconductors"],
+    "SPY": ["S&P 500", "Federal Reserve", "inflation", "Treasury yields"],
+    "QQQ": ["Nasdaq", "mega-cap tech", "AI stocks", "Treasury yields"],
+}
+
+REPUTABLE_SOURCE_HINTS = [
+    "reuters",
+    "bloomberg",
+    "associated press",
+    "ap news",
+    "cnbc",
+    "wall street journal",
+    "wsj",
+    "marketwatch",
+    "investing.com",
+    "yahoo finance",
+    "barron's",
+    "the fly",
+    "seeking alpha",
+]
+
+MATERIAL_EVENT_WORDS = [
+    "earnings",
+    "guidance",
+    "outlook",
+    "lawsuit",
+    "investigation",
+    "antitrust",
+    "upgrade",
+    "downgrade",
+    "target",
+    "tariff",
+    "export",
+    "ban",
+    "regulator",
+    "recall",
+    "layoffs",
+    "acquisition",
+    "merger",
+    "selloff",
+    "rally",
+    "surge",
+    "plunge",
+    "fed",
+    "inflation",
+    "yields",
+    "rates",
+]
+
+RECENT_NEWS_DAYS = 7
 
 @dataclass(frozen=True)
 class EventAnalysis:
@@ -61,43 +129,210 @@ def test_openai_connection():
     )
     print(response.output_text)
 
-def get_recent_headlines(ticker):
-    headlines = []
+def normalized_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def story_source_name(story):
+    source = story.get("source", "unknown source")
+    if isinstance(source, dict):
+        return source.get("name") or source.get("domain") or "unknown source"
+    return str(source)
+
+
+def source_quality_score(source):
+    source_text = normalized_text(source)
+    if any(source_hint in source_text for source_hint in REPUTABLE_SOURCE_HINTS):
+        return 3
+    return 1
+
+
+def important_word_score(text):
+    text = normalized_text(text)
+    return min(
+        sum(1 for word in MATERIAL_EVENT_WORDS if word in text),
+        4,
+    )
+
+
+def relevance_score(ticker, story, bucket, repeated_theme_count):
+    title = story.get("title", "")
+    description = story.get("description") or story.get("snippet") or ""
+    source = story_source_name(story)
+    text = normalized_text(f"{title} {description}")
+    ticker_text = ticker.lower()
+    company_terms = [term.lower() for term in COMPANY_NAMES.get(ticker, [])]
+    sector_terms = [term.lower() for term in SECTOR_TERMS.get(ticker, [])]
+
+    score = 0
+    score += source_quality_score(source)
+    score += important_word_score(text)
+    score += min(repeated_theme_count, 3)
+
+    if ticker_text in text:
+        score += 5
+    if any(term and term.lower() in text for term in company_terms):
+        score += 4
+    if any(term and term.lower() in text for term in sector_terms):
+        score += 2
+    if bucket == "ticker":
+        score += 2
+    if bucket in ["sector", "market"]:
+        score += 1
+
+    return score
+
+
+def story_signature(story):
+    title = normalized_text(story.get("title", ""))
+    return re.sub(r"[^a-z0-9 ]", "", title)[:100]
+
+
+def parsed_published_at(story):
+    published_at = story.get("published_at")
+    if not published_at:
+        return None
+    try:
+        return datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def is_recent_story(story):
+    published_at = parsed_published_at(story)
+    if published_at is None:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RECENT_NEWS_DAYS)
+    return published_at >= cutoff
+
+
+def theme_key(story):
+    title = normalized_text(story.get("title", ""))
+    words = [
+        word
+        for word in re.findall(r"[a-z0-9]+", title)
+        if len(word) > 4
+    ]
+    return " ".join(words[:4])
+
+
+def format_story(story, bucket, score):
+    time_published = story.get("published_at", "unknown time")
+    source = story_source_name(story)
+    title = story.get("title", "untitled")
+    description = story.get("description") or story.get("snippet") or ""
+    if description:
+        description = f" | {description[:350]}"
+
+    return f"[{bucket}; relevance {score}] {time_published} | {source}: {title}{description}"
+
+
+def marketaux_request(params):
     api_key = os.getenv("MARKETAUX_API_KEY")
     if not api_key:
         raise ValueError("MARKETAUX_API_KEY is missing.")
 
     url = "https://api.marketaux.com/v1/news/all"
-    params = {
+    request_params = {
         "api_token": api_key,
-        "symbols": ticker,
-        "limit": 3,
-        "filter_entities": "true",
+        "language": "en",
+        "published_after": (
+            datetime.now(timezone.utc) - timedelta(days=RECENT_NEWS_DAYS)
+        ).date().isoformat(),
+        **params,
     }
-    response = requests.get(url, params=params, timeout=10)
+    response = requests.get(url, params=request_params, timeout=10)
     response.raise_for_status()
     data = response.json()
     if data.get("error"):
         raise RuntimeError(data["error"])
+    return data.get("data", [])
 
-    for story in data.get("data", []):
-        matching_entities = [
-            entity
-            for entity in story.get("entities", [])
-            if entity.get("symbol") == ticker
-        ]
-        if not matching_entities:
+
+def news_buckets_for_ticker(ticker):
+    buckets = [
+        (
+            "ticker",
+            {
+                "symbols": ticker,
+                "limit": 5,
+                "filter_entities": "true",
+            },
+        )
+    ]
+
+    company_terms = COMPANY_NAMES.get(ticker, [])
+    if company_terms:
+        buckets.append(
+            (
+                "company",
+                {
+                    "search": " OR ".join(company_terms[:2]),
+                    "limit": 5,
+                },
+            )
+        )
+
+    sector_terms = SECTOR_TERMS.get(ticker, [])
+    if sector_terms:
+        bucket_name = "market" if ticker in ["SPY", "QQQ"] else "sector"
+        buckets.append(
+            (
+                bucket_name,
+                {
+                    "search": " OR ".join(sector_terms[:3]),
+                    "limit": 5,
+                },
+            )
+        )
+
+    return buckets
+
+
+def get_recent_headlines(ticker):
+    stories = []
+    seen_story_keys = set()
+
+    for bucket, params in news_buckets_for_ticker(ticker):
+        try:
+            bucket_stories = marketaux_request(params)
+        except (requests.RequestException, RuntimeError, ValueError):
             continue
 
-        time_published = story.get("published_at", "unknown time")
-        source = story.get("source", "unknown source")
-        title = story.get("title", "untitled")
-        description = story.get("description") or story.get("snippet") or ""
-        if description:
-            description = f" | {description[:350]}"
+        for story in bucket_stories:
+            if not is_recent_story(story):
+                continue
+            signature = story_signature(story)
+            if not signature or signature in seen_story_keys:
+                continue
+            seen_story_keys.add(signature)
+            stories.append((bucket, story))
 
-        headlines.append(f"{time_published} | {source}: {title}{description}")
-    return headlines
+    if not stories:
+        return []
+
+    theme_counts = {}
+    for _, story in stories:
+        key = theme_key(story)
+        if key:
+            theme_counts[key] = theme_counts.get(key, 0) + 1
+
+    ranked_stories = []
+    for bucket, story in stories:
+        score = relevance_score(
+            ticker,
+            story,
+            bucket,
+            theme_counts.get(theme_key(story), 1),
+        )
+        ranked_stories.append((score, bucket, story))
+
+    ranked_stories.sort(key=lambda item: item[0], reverse=True)
+    return [
+        format_story(story, bucket, score)
+        for score, bucket, story in ranked_stories[:8]
+        if score >= 6
+    ]
     
 
 def analyze_events(ticker, scanner_outlook, headlines):
@@ -124,15 +359,19 @@ def analyze_events(ticker, scanner_outlook, headlines):
         {headline_text}
 
         use only the headlines provided.
+        The headlines are pre-ranked by source quality, ticker relevance, repeated themes, and material event keywords.
 
         Do not treat the absence of negative news as supportive evidence.
+        Do not use broad sector or market headlines unless they plausibly affect this ticker or ETF within the option trade timeframe.
+        Prefer direct ticker/company headlines over sector headlines.
+        Treat repeated themes from reputable sources as stronger evidence than one isolated weak headline.
 
         If headlines are mixed, weakly related, duplicated, or do not clearly support or conflict with the scanner outlook, use:
         - adjustment: 0
         - label: neutral
         - confidence: low
 
-        Only use a non-zero adjustment when a supplied headline gives concrete, ticker-relevant evidence.
+        Only use a non-zero adjustment when a supplied headline gives concrete, ticker-relevant, trade-timeframe evidence.
 
         headline_numbers must only contain numbers from the supplied headline list.
 
@@ -149,7 +388,6 @@ def analyze_events(ticker, scanner_outlook, headlines):
             model="gpt-4.1-mini",
             input=prompt,
         )
-        print(response.output_text)
         raw_output = response.output_text.strip()
         raw_output = (
             raw_output
