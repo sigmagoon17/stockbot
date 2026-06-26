@@ -527,6 +527,155 @@ def credit_candidate_rows(scored_trades):
     return rows
 
 
+def render_scan_output(scan_output):
+    scored_trades = scan_output["scored_trades"]
+    rejected_trades = scan_output["rejected_trades"]
+    trades = scan_output["trades"]
+    ticker_data = scan_output["ticker_data"]
+    errors = scan_output["errors"]
+    event_analyses = scan_output["event_analyses"]
+    history_candidates = scan_output["history_candidates"]
+
+    top_score = scored_trades[0].total_score if scored_trades else None
+    metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
+    metric_candidates.metric("Passing Candidates", len(scored_trades))
+    metric_score.metric("Highest Score", f"{top_score}/100" if top_score else "None")
+    metric_tracked.metric("Saved to History", len(history_candidates))
+    metric_tickers.metric("Tickers Scanned", len(ticker_data))
+
+    if errors:
+        for error in errors:
+            st.warning(error)
+
+    candidates_tab, market_tab, diagnostics_tab = st.tabs(
+        ["Candidates", "Market Data", "Diagnostics"]
+    )
+
+    with candidates_tab:
+        st.subheader("Top Candidates")
+        candidates = candidate_rows(scored_trades)
+        if candidates:
+            st.dataframe(
+                pd.DataFrame(candidates),
+                width="stretch",
+                hide_index=True,
+                column_config=candidate_column_config(),
+            )
+            top_25_csv = pd.DataFrame(
+                [candidate_row(scored) for scored in history_candidates]
+            ).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Tracked Candidates CSV",
+                data=top_25_csv,
+                file_name="top_25_options_candidates.csv",
+                mime="text/csv",
+                width="content",
+            )
+
+            st.subheader("Candidate Details")
+            for scored in select_top_candidates(scored_trades):
+                trade = scored.trade
+                with st.expander(
+                    f"{trade.ticker} | {trade.strategy.title()} | "
+                    f"Score {scored.total_score}/100"
+                ):
+                    st.write(scored.explanation)
+                    event_analysis = event_analyses.get(trade.ticker)
+                    if event_analysis:
+                        st.subheader("AI Event View")
+                        event_label, event_adjustment, event_confidence = st.columns(3)
+                        event_label.metric("Event Label", event_analysis.label.title())
+                        event_adjustment.metric(
+                            "Event Adjustment",
+                            f"{event_analysis.adjustment:+d}",
+                        )
+                        event_confidence.metric(
+                            "Confidence", event_analysis.confidence.title()
+                        )
+                        st.write(event_analysis.summary)
+                    score_rows = pd.DataFrame(
+                        [
+                            {"Score Area": area, "Points": points}
+                            for area, points in scored.category_scores.items()
+                        ]
+                    )
+                    st.dataframe(score_rows, width="content", hide_index=True)
+        else:
+            st.info("No candidates passed the current filters.")
+
+        debit_column, credit_column = st.columns(2)
+        with debit_column:
+            st.subheader("Best Debit Spreads")
+            debit_candidates = debit_candidate_rows(scored_trades)
+            if debit_candidates:
+                st.dataframe(
+                    pd.DataFrame(debit_candidates),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=candidate_column_config(),
+                )
+            else:
+                st.info("No debit spreads passed.")
+
+        with credit_column:
+            st.subheader("Best Credit Spreads")
+            credit_candidates = credit_candidate_rows(scored_trades)
+            if credit_candidates:
+                st.dataframe(
+                    pd.DataFrame(credit_candidates),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=candidate_column_config(),
+                )
+            else:
+                st.info("No credit spreads passed.")
+
+    with market_tab:
+        st.subheader("Market Data")
+        st.dataframe(
+            pd.DataFrame(ticker_data),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "1D Move %": st.column_config.NumberColumn(format="%.2f%%"),
+                "5D Move %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Move vs 20D Vol": st.column_config.NumberColumn(format="%.1fx"),
+            },
+        )
+
+    with diagnostics_tab:
+        st.subheader("Strategy Diagnostics")
+        strategy_df = pd.DataFrame(
+            strategy_rejection_rows(trades, rejected_trades, scored_trades)
+        )
+        if not strategy_df.empty:
+            for ticker in sorted(strategy_df["Ticker"].unique()):
+                ticker_strategies = strategy_df[strategy_df["Ticker"] == ticker].drop(
+                    columns="Ticker"
+                )
+                with st.expander(f"{ticker} strategy diagnostics"):
+                    st.dataframe(
+                        ticker_strategies,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "Rejected %": st.column_config.NumberColumn(format="%.0f%%")
+                        },
+                    )
+
+        st.subheader("Ticker Status")
+        st.dataframe(
+            pd.DataFrame(
+                ticker_rejection_rows(trades, rejected_trades, scored_trades)
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Rejected %": st.column_config.NumberColumn(format="%.0f%%")
+            },
+        )
+
+
 def strategy_rejection_rows(trades, rejected_trades, scored_trades):
     totals = Counter(
         (trade.ticker, trade.strategy) for trade in trades
@@ -1184,145 +1333,18 @@ if scan_button:
     snapshot_errors = save_trade_snapshots()
     errors = history_errors + errors + history_save_errors
     errors.extend(snapshot_errors)
+    st.session_state["last_scan_output"] = {
+        "scored_trades": scored_trades,
+        "rejected_trades": rejected_trades,
+        "trades": trades,
+        "ticker_data": ticker_data,
+        "errors": errors,
+        "event_analyses": event_analyses,
+        "history_candidates": history_candidates,
+    }
 
-    top_score = scored_trades[0].total_score if scored_trades else None
-    metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
-    metric_candidates.metric("Passing Candidates", len(scored_trades))
-    metric_score.metric("Highest Score", f"{top_score}/100" if top_score else "None")
-    metric_tracked.metric("Saved to History", len(history_candidates))
-    metric_tickers.metric("Tickers Scanned", len(ticker_data))
-
-    if errors:
-        for error in errors:
-            st.warning(error)
-
-    candidates_tab, market_tab, diagnostics_tab = st.tabs(
-        ["Candidates", "Market Data", "Diagnostics"]
-    )
-
-    with candidates_tab:
-        st.subheader("Top Candidates")
-        candidates = candidate_rows(scored_trades)
-        if candidates:
-            st.dataframe(
-                pd.DataFrame(candidates),
-                width="stretch",
-                hide_index=True,
-                column_config=candidate_column_config(),
-            )
-            top_25_csv = pd.DataFrame(
-                [candidate_row(scored) for scored in history_candidates]
-            ).to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download Tracked Candidates CSV",
-                data=top_25_csv,
-                file_name="top_25_options_candidates.csv",
-                mime="text/csv",
-                width="content",
-            )
-
-            st.subheader("Candidate Details")
-            for scored in select_top_candidates(scored_trades):
-                trade = scored.trade
-                with st.expander(
-                    f"{trade.ticker} | {trade.strategy.title()} | "
-                    f"Score {scored.total_score}/100"
-                ):
-                    st.write(scored.explanation)
-                    event_analysis = event_analyses.get(trade.ticker)
-                    if event_analysis:
-                        st.subheader("AI Event View")
-                        event_label, event_adjustment, event_confidence = st.columns(3)
-                        event_label.metric("Event Label", event_analysis.label.title())
-                        event_adjustment.metric(
-                            "Event Adjustment",
-                            f"{event_analysis.adjustment:+d}",
-                        )
-                        event_confidence.metric(
-                            "Confidence", event_analysis.confidence.title()
-                        )
-                        st.write(event_analysis.summary)
-                    score_rows = pd.DataFrame(
-                        [
-                            {"Score Area": area, "Points": points}
-                            for area, points in scored.category_scores.items()
-                        ]
-                    )
-                    st.dataframe(score_rows, width="content", hide_index=True)
-        else:
-            st.info("No candidates passed the current filters.")
-
-        debit_column, credit_column = st.columns(2)
-        with debit_column:
-            st.subheader("Best Debit Spreads")
-            debit_candidates = debit_candidate_rows(scored_trades)
-            if debit_candidates:
-                st.dataframe(
-                    pd.DataFrame(debit_candidates),
-                    width="stretch",
-                    hide_index=True,
-                    column_config=candidate_column_config(),
-                )
-            else:
-                st.info("No debit spreads passed.")
-
-        with credit_column:
-            st.subheader("Best Credit Spreads")
-            credit_candidates = credit_candidate_rows(scored_trades)
-            if credit_candidates:
-                st.dataframe(
-                    pd.DataFrame(credit_candidates),
-                    width="stretch",
-                    hide_index=True,
-                    column_config=candidate_column_config(),
-                )
-            else:
-                st.info("No credit spreads passed.")
-
-    with market_tab:
-        st.subheader("Market Data")
-        st.dataframe(
-            pd.DataFrame(ticker_data),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "1D Move %": st.column_config.NumberColumn(format="%.2f%%"),
-                "5D Move %": st.column_config.NumberColumn(format="%.2f%%"),
-                "Move vs 20D Vol": st.column_config.NumberColumn(format="%.1fx"),
-            },
-        )
-
-    with diagnostics_tab:
-        st.subheader("Strategy Diagnostics")
-        strategy_df = pd.DataFrame(
-            strategy_rejection_rows(trades, rejected_trades, scored_trades)
-        )
-        if not strategy_df.empty:
-            for ticker in sorted(strategy_df["Ticker"].unique()):
-                ticker_strategies = strategy_df[strategy_df["Ticker"] == ticker].drop(
-                    columns="Ticker"
-                )
-                with st.expander(f"{ticker} strategy diagnostics"):
-                    st.dataframe(
-                        ticker_strategies,
-                        width="stretch",
-                        hide_index=True,
-                        column_config={
-                            "Rejected %": st.column_config.NumberColumn(format="%.0f%%")
-                        },
-                    )
-
-        st.subheader("Ticker Status")
-        st.dataframe(
-            pd.DataFrame(
-                ticker_rejection_rows(trades, rejected_trades, scored_trades)
-            ),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Rejected %": st.column_config.NumberColumn(format="%.0f%%")
-            },
-        )
+if st.session_state.get("last_scan_output"):
+    render_scan_output(st.session_state["last_scan_output"])
 
 
 render_private_results()
