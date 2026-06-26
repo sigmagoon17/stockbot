@@ -978,6 +978,8 @@ def render_manual_positions():
             "quantity",
             "current_mark",
             "unrealized_pnl",
+            "conservative_value",
+            "conservative_pnl",
             "recommendation",
             "note",
         ]
@@ -992,8 +994,10 @@ def render_manual_positions():
             "short_strike": "Short",
             "entry_price": "Entry",
             "quantity": "Qty",
-            "current_mark": "Current Value",
+            "current_mark": "Mid Value",
             "unrealized_pnl": "Unrealized P/L",
+            "conservative_value": "Close Value",
+            "conservative_pnl": "Close P/L",
             "recommendation": "Recommendation",
             "note": "Note",
         }
@@ -1007,8 +1011,16 @@ def render_manual_positions():
             "Long": st.column_config.NumberColumn(format="%.2f"),
             "Short": st.column_config.NumberColumn(format="%.2f"),
             "Entry": st.column_config.NumberColumn(format="$%.2f"),
-            "Current Value": st.column_config.NumberColumn(format="$%.2f"),
+            "Mid Value": st.column_config.NumberColumn(
+                help="Broker-like midpoint value using bid/ask mid prices.",
+                format="$%.2f",
+            ),
             "Unrealized P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Close Value": st.column_config.NumberColumn(
+                help="Conservative estimated value if closing through bid/ask.",
+                format="$%.2f",
+            ),
+            "Close P/L": st.column_config.NumberColumn(format="$%.2f"),
         },
     )
 
