@@ -644,6 +644,16 @@ def render_results():
         open_candidates["Scan Time"] = open_candidates["scan_time_est"].fillna(
             open_candidates["scan_time"]
         )
+        if "price_move_adjustment" not in open_candidates:
+            open_candidates["price_move_adjustment"] = None
+        if "move_setup" not in open_candidates:
+            open_candidates["move_setup"] = None
+        open_candidates["Entry Cost"] = open_candidates.apply(
+            lambda row: row["max_risk"]
+            if row["entry_type"] == "debit"
+            else row["credit"],
+            axis=1,
+        )
         open_candidates = open_candidates.reindex(
             columns=[
                 "Scan Time",
@@ -654,11 +664,14 @@ def render_results():
                 "short_strike",
                 "entry_type",
                 "credit",
+                "Entry Cost",
                 "max_risk",
                 "max_profit",
                 "setup_score",
                 "quant_score",
                 "event_adjustment",
+                "price_move_adjustment",
+                "move_setup",
                 "event_label",
                 "event_confidence",
             ]
@@ -676,6 +689,8 @@ def render_results():
                 "setup_score": "Setup Score",
                 "quant_score": "Quant Score",
                 "event_adjustment": "Event Adjustment",
+                "price_move_adjustment": "Price Move Adjustment",
+                "move_setup": "Move Setup",
                 "event_label": "Event Label",
                 "event_confidence": "Event Confidence",
             }
@@ -686,6 +701,10 @@ def render_results():
             hide_index=True,
             column_config={
                 "Credit": st.column_config.NumberColumn(format="$%.2f"),
+                "Entry Cost": st.column_config.NumberColumn(
+                    help="Debit paid for debit trades, credit received for credit trades.",
+                    format="$%.2f",
+                ),
                 "Max Risk": st.column_config.NumberColumn(format="$%.2f"),
                 "Max Profit": st.column_config.NumberColumn(format="$%.2f"),
             },

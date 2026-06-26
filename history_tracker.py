@@ -77,6 +77,8 @@ def append_scan_history(scored_trades, event_analyses=None, price_moves=None):
                 "max_profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
                 "quant_score": scored.quant_score,
                 "event_adjustment": scored.event_adjustment,
+                "price_move_adjustment": scored.price_move_adjustment,
+                "move_setup": scored.price_move_style,
                 "event_label": (
                     event_analysis.label if event_analysis is not None else None
                 ),
