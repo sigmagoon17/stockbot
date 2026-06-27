@@ -35,11 +35,16 @@ from stock2dupe import (
 )
 
 try:
-    from event_analysis import analyze_candidate_setup, get_event_analysis
+    from event_analysis import (
+        analyze_candidate_setup,
+        get_deep_event_analysis,
+        get_event_analysis,
+    )
 except ImportError:
     from event_analysis import get_event_analysis
 
     analyze_candidate_setup = None
+    get_deep_event_analysis = None
 
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
@@ -57,6 +62,11 @@ def candidate_analysis_cache():
     return {}
 
 
+@st.cache_resource
+def deep_event_analysis_cache():
+    return {}
+
+
 def get_cached_event_analysis(ticker: str, outlook: str):
     cache = event_analysis_cache()
     cache_key = (ticker, outlook)
@@ -66,6 +76,30 @@ def get_cached_event_analysis(ticker: str, outlook: str):
         return cached["analysis"]
 
     analysis = get_event_analysis(ticker, outlook)
+    cache[cache_key] = {
+        "analysis": analysis,
+        "created_at": now,
+        "ttl": (
+            EVENT_ANALYSIS_SUCCESS_TTL_SECONDS
+            if analysis.available
+            else EVENT_ANALYSIS_FAILURE_TTL_SECONDS
+        ),
+    }
+    return analysis
+
+
+def get_cached_deep_event_analysis(ticker: str, outlook: str):
+    if get_deep_event_analysis is None:
+        return get_cached_event_analysis(ticker, outlook)
+
+    cache = deep_event_analysis_cache()
+    cache_key = (ticker, outlook)
+    now = time.monotonic()
+    cached = cache.get(cache_key)
+    if cached and now - cached["created_at"] < cached["ttl"]:
+        return cached["analysis"]
+
+    analysis = get_deep_event_analysis(ticker, outlook)
     cache[cache_key] = {
         "analysis": analysis,
         "created_at": now,
@@ -113,6 +147,65 @@ def get_cached_candidate_analysis(scored, event_analysis, price_move):
                 scored, event_analysis, price_move
             )
     return cache[cache_key]
+
+
+def selected_deep_analysis_tickers(
+    scored_trades,
+    price_moves,
+    max_tickers: int = 5,
+    top_trade_count: int = 10,
+):
+    selected = []
+
+    for scored in scored_trades[:top_trade_count]:
+        ticker = scored.trade.ticker
+        if scored.total_score >= 70 and ticker not in selected:
+            selected.append(ticker)
+
+    unusual_movers = sorted(
+        price_moves.items(),
+        key=lambda item: abs(float(item[1].get("Move vs 20D Vol", 0) or 0)),
+        reverse=True,
+    )
+    for ticker, move in unusual_movers:
+        move_multiple = abs(float(move.get("Move vs 20D Vol", 0) or 0))
+        if move_multiple >= 1.5 and ticker not in selected:
+            selected.append(ticker)
+        if len(selected) >= max_tickers:
+            break
+
+    return selected[:max_tickers]
+
+
+def apply_deep_event_analysis(
+    scored_trades,
+    trades,
+    preferences,
+    event_analyses,
+    event_adjustments,
+    event_labels,
+    price_moves,
+):
+    deep_tickers = selected_deep_analysis_tickers(scored_trades, price_moves)
+    if not deep_tickers:
+        return scored_trades, event_analyses, event_adjustments, event_labels, []
+
+    messages = []
+    for ticker in deep_tickers:
+        deep_analysis = get_cached_deep_event_analysis(ticker, preferences.outlook)
+        event_analyses[ticker] = deep_analysis
+        event_adjustments[ticker] = deep_analysis.adjustment
+        event_labels[ticker] = deep_analysis.label
+        messages.append(
+            f"{ticker}: deep news analysis {deep_analysis.label} "
+            f"({deep_analysis.adjustment:+d})"
+        )
+
+    rescored_trades, _ = scan_trades(
+        trades, preferences, event_adjustments, price_moves, event_labels
+    )
+    return rescored_trades, event_analyses, event_adjustments, event_labels, messages
+
 
 st.markdown(
     """
@@ -313,6 +406,40 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
     scored_trades, rejected_trades = scan_trades(
         trades, preferences, event_adjustments, price_moves, event_labels
     )
+    deep_messages = []
+    (
+        scored_trades,
+        event_analyses,
+        event_adjustments,
+        event_labels,
+        deep_messages,
+    ) = apply_deep_event_analysis(
+        scored_trades,
+        trades,
+        preferences,
+        event_analyses,
+        event_adjustments,
+        event_labels,
+        price_moves,
+    )
+    if deep_messages:
+        scored_trades, rejected_trades = scan_trades(
+            trades, preferences, event_adjustments, price_moves, event_labels
+        )
+        for row in ticker_data:
+            event_analysis = event_analyses.get(row["Ticker"])
+            if event_analysis is not None:
+                row["Event Label"] = event_analysis.label.title()
+                row["Event Adjustment"] = event_analysis.adjustment
+                row["News Depth"] = (
+                    "Deep"
+                    if row["Ticker"] in {
+                        message.split(":", 1)[0] for message in deep_messages
+                    }
+                    else row.get("News Depth", "Basic")
+                )
+    for row in ticker_data:
+        row.setdefault("News Depth", "Basic")
     return (
         scored_trades,
         rejected_trades,
@@ -1310,6 +1437,7 @@ def render_private_results():
                 width="stretch",
             ):
                 event_analysis_cache().clear()
+                deep_event_analysis_cache().clear()
                 candidate_analysis_cache().clear()
                 st.session_state.pop("latest_event_analyses", None)
                 st.session_state.pop("last_scan_output", None)

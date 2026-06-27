@@ -31,6 +31,24 @@ SECTOR_TERMS = {
     "QQQ": ["Nasdaq", "mega-cap tech", "AI stocks", "Treasury yields"],
 }
 
+COMPETITOR_TERMS = {
+    "AAPL": ["Samsung smartphone", "Google Pixel", "Huawei phone", "Apple competition"],
+    "MSFT": ["Amazon AWS", "Google Cloud", "Microsoft cloud competition"],
+    "NVDA": [
+        "AMD AI chips",
+        "Broadcom AI chips",
+        "Qualcomm AI chips",
+        "Google TPU",
+        "Amazon AI chips",
+        "Nvidia competition",
+        "AI chip competition",
+    ],
+    "COHR": ["Lumentum", "Applied Optoelectronics", "optical components competition"],
+    "SNDK": ["Micron NAND", "Samsung memory chips", "memory chip competition"],
+    "SPY": ["S&P 500 selloff", "Federal Reserve rates", "inflation stocks"],
+    "QQQ": ["Nasdaq selloff", "mega-cap tech selloff", "AI stock competition"],
+}
+
 REPUTABLE_SOURCE_HINTS = [
     "reuters",
     "bloomberg",
@@ -177,8 +195,13 @@ def relevance_score(ticker, story, bucket, repeated_theme_count):
         score += 2
     if bucket == "ticker":
         score += 2
-    if bucket in ["sector", "market"]:
+    if bucket in ["sector", "market", "competitor"]:
         score += 1
+    if bucket == "competitor" and any(
+        term.lower() in text
+        for term in COMPETITOR_TERMS.get(ticker, [])
+    ):
+        score += 3
 
     return score
 
@@ -249,17 +272,20 @@ def marketaux_request(params):
     return data.get("data", [])
 
 
-def news_buckets_for_ticker(ticker):
+def news_buckets_for_ticker(ticker, deep=False):
     buckets = [
         (
             "ticker",
             {
                 "symbols": ticker,
-                "limit": 5,
+                "limit": 4 if not deep else 5,
                 "filter_entities": "true",
             },
         )
     ]
+
+    if not deep:
+        return buckets
 
     company_terms = COMPANY_NAMES.get(ticker, [])
     if company_terms:
@@ -268,7 +294,7 @@ def news_buckets_for_ticker(ticker):
                 "company",
                 {
                     "search": " OR ".join(company_terms[:2]),
-                    "limit": 5,
+                    "limit": 3 if not deep else 5,
                 },
             )
         )
@@ -286,14 +312,26 @@ def news_buckets_for_ticker(ticker):
             )
         )
 
+    competitor_terms = COMPETITOR_TERMS.get(ticker, [])
+    if competitor_terms:
+        buckets.append(
+            (
+                "competitor",
+                {
+                    "search": " OR ".join(competitor_terms[:4]),
+                    "limit": 5,
+                },
+            )
+        )
+
     return buckets
 
 
-def get_recent_headlines(ticker):
+def get_recent_headlines(ticker, deep=False):
     stories = []
     seen_story_keys = set()
 
-    for bucket, params in news_buckets_for_ticker(ticker):
+    for bucket, params in news_buckets_for_ticker(ticker, deep=deep):
         try:
             bucket_stories = marketaux_request(params)
         except (requests.RequestException, RuntimeError, ValueError):
@@ -328,9 +366,10 @@ def get_recent_headlines(ticker):
         ranked_stories.append((score, bucket, story))
 
     ranked_stories.sort(key=lambda item: item[0], reverse=True)
+    limit = 10 if deep else 8
     return [
         format_story(story, bucket, score)
-        for score, bucket, story in ranked_stories[:8]
+        for score, bucket, story in ranked_stories[:limit]
         if score >= 6
     ]
     
@@ -364,6 +403,7 @@ def analyze_events(ticker, scanner_outlook, headlines):
         Do not treat the absence of negative news as supportive evidence.
         Do not use broad sector or market headlines unless they plausibly affect this ticker or ETF within the option trade timeframe.
         Prefer direct ticker/company headlines over sector headlines.
+        Competitor headlines can be cautionary if they show pressure on the ticker's pricing power, growth story, or market share.
         Treat repeated themes from reputable sources as stronger evidence than one isolated weak headline.
 
         If headlines are mixed, weakly related, duplicated, or do not clearly support or conflict with the scanner outlook, use:
@@ -451,6 +491,25 @@ def get_event_analysis(ticker, scanner_outlook):
             ticker,
             [],
             "Event analysis was unavailable for {ticker}.",
+            available=False,
+        )
+
+
+def get_deep_event_analysis(ticker, scanner_outlook):
+    try:
+        headlines = get_recent_headlines(ticker, deep=True)
+        if not headlines:
+            return neutral_event_analysis(
+                ticker,
+                [],
+                "Deep event analysis found no recent material headlines for {ticker}.",
+            )
+        return analyze_events(ticker, scanner_outlook, headlines)
+    except (APIError, requests.RequestException, RuntimeError, ValueError):
+        return neutral_event_analysis(
+            ticker,
+            [],
+            "Deep event analysis was unavailable for {ticker}.",
             available=False,
         )
 
