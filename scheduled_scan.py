@@ -14,6 +14,7 @@ from stock2dupe import (
     build_call_credit_spreads,
     build_iron_condor,
     build_put_credit_spreads,
+    condor_diagnostics,
     get_option_chain,
     scan_trades,
 )
@@ -116,6 +117,9 @@ def main() -> int:
             event_adjustments[ticker] = event_analysis.adjustment
             event_labels[ticker] = event_analysis.label
             price_moves[ticker] = price_move
+            condor_diag = condor_diagnostics(
+                option_chain, price, earnings_date, volatility_rank, preferences
+            )
 
             trades.extend(
                 build_iron_condor(
@@ -142,7 +146,11 @@ def main() -> int:
                     option_chain, price, earnings_date, volatility_rank, preferences
                 )
             )
-            print(f"{ticker}: fetched {len(option_chain)} contracts")
+            print(
+                f"{ticker}: fetched {len(option_chain)} contracts; "
+                f"condors built {condor_diag.built_condors}; "
+                f"blocker: {condor_diag.top_reason}"
+            )
         except Exception as error:
             errors.append(f"{ticker}: {error}")
 

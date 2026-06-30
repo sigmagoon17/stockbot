@@ -308,6 +308,20 @@ class ScoredTrade:
     reasons: list[str]
     explanation: str
 
+
+@dataclass(frozen=True)
+class CondorDiagnostics:
+    ticker: str
+    put_spreads_built: int
+    call_spreads_built: int
+    qualified_puts: int
+    qualified_calls: int
+    pairs_checked: int
+    matching_expiration_pairs: int
+    valid_order_pairs: int
+    built_condors: int
+    top_reason: str
+
 def strategy_fit_score(trade: Trade, preferences: ScanPreferences) -> int:
     if preferences.outlook == "bullish":
         if trade.strategy == "put credit spread":
@@ -1079,6 +1093,113 @@ def build_iron_condor(
             )      
             trades.append(trade)  
     return trades
+
+
+def condor_diagnostics(
+    option_chain,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    preferences,
+) -> CondorDiagnostics:
+    put_spreads = build_put_credit_spreads(
+        option_chain, underlying_price, earnings_date, volatility_rank, preferences
+    )
+    call_spreads = build_call_credit_spreads(
+        option_chain, underlying_price, earnings_date, volatility_rank, preferences
+    )
+    qualified_puts = [
+        trade for trade in put_spreads
+        if passes_filters(trade, preferences)[0]
+    ]
+    qualified_calls = [
+        trade for trade in call_spreads
+        if passes_filters(trade, preferences)[0]
+    ]
+
+    top_puts = sorted(
+        qualified_puts,
+        key=lambda trade: score_trade(trade, preferences).total_score,
+        reverse=True,
+    )[:5]
+    top_calls = sorted(
+        qualified_calls,
+        key=lambda trade: score_trade(trade, preferences).total_score,
+        reverse=True,
+    )[:5]
+
+    pairs_checked = 0
+    matching_expiration_pairs = 0
+    valid_order_pairs = 0
+    nonpositive_credit_pairs = 0
+    nonpositive_risk_pairs = 0
+    built_condors = 0
+
+    for call_spread in top_calls:
+        for put_spread in top_puts:
+            pairs_checked += 1
+            if call_spread.expiration != put_spread.expiration:
+                continue
+            if call_spread.ticker != put_spread.ticker:
+                continue
+            matching_expiration_pairs += 1
+            if call_spread.short_strike <= put_spread.short_strike:
+                continue
+            valid_order_pairs += 1
+
+            total_credit = round(call_spread.credit + put_spread.credit, 2)
+            put_width = put_spread.short_strike - put_spread.long_strike
+            call_width = call_spread.long_strike - call_spread.short_strike
+            max_width = max(put_width, call_width)
+            max_risk = round(max_width - total_credit, 2)
+
+            if total_credit <= 0:
+                nonpositive_credit_pairs += 1
+                continue
+            if max_risk <= 0:
+                nonpositive_risk_pairs += 1
+                continue
+            built_condors += 1
+
+    if not put_spreads:
+        top_reason = "no put credit spreads built"
+    elif not call_spreads:
+        top_reason = "no call credit spreads built"
+    elif not qualified_puts and not qualified_calls:
+        top_reason = "no put or call side passed filters"
+    elif not qualified_puts:
+        top_reason = "no put side passed filters"
+    elif not qualified_calls:
+        top_reason = "no call side passed filters"
+    elif pairs_checked == 0:
+        top_reason = "no qualified put/call pairs to combine"
+    elif matching_expiration_pairs == 0:
+        top_reason = "no matching expiration between qualified sides"
+    elif valid_order_pairs == 0:
+        top_reason = "put/call short strikes overlap or are reversed"
+    elif nonpositive_credit_pairs:
+        top_reason = "combined credit was not positive"
+    elif nonpositive_risk_pairs:
+        top_reason = "combined max risk was not positive"
+    elif built_condors == 0:
+        top_reason = "no condors survived builder checks"
+    else:
+        top_reason = "condors built"
+
+    ticker = option_chain[0].ticker if option_chain else "Unknown"
+    return CondorDiagnostics(
+        ticker=ticker,
+        put_spreads_built=len(put_spreads),
+        call_spreads_built=len(call_spreads),
+        qualified_puts=len(qualified_puts),
+        qualified_calls=len(qualified_calls),
+        pairs_checked=pairs_checked,
+        matching_expiration_pairs=matching_expiration_pairs,
+        valid_order_pairs=valid_order_pairs,
+        built_condors=built_condors,
+        top_reason=top_reason,
+    )
+
 
 def build_bull_call_debit_spread(
         option_chain, underlying_price: float, earnings_date, volatility_rank: float, preferences

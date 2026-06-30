@@ -30,6 +30,7 @@ from stock2dupe import (
     build_put_credit_spreads,
     build_bull_call_debit_spread,
     build_bear_put_debit_spread,
+    condor_diagnostics,
     get_option_chain,
     scan_trades,
 )
@@ -320,6 +321,7 @@ def select_history_candidates(
 def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
     trades = []
     ticker_data = []
+    condor_diagnostic_rows = []
     errors = []
     event_adjustments = {}
     event_labels = {}
@@ -372,6 +374,11 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     "Event Label": event_analysis.label.title(),
                     "Event Adjustment": event_analysis.adjustment,
                 }
+            )
+            condor_diagnostic_rows.append(
+                condor_diagnostics(
+                    option_chain, price, earnings_date, volatility_rank, preferences
+                )
             )
             trades.extend(
                 build_iron_condor(
@@ -445,6 +452,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
         rejected_trades,
         trades,
         ticker_data,
+        condor_diagnostic_rows,
         errors,
         event_analyses,
         price_moves,
@@ -706,6 +714,7 @@ def render_scan_output(scan_output):
     rejected_trades = scan_output["rejected_trades"]
     trades = scan_output["trades"]
     ticker_data = scan_output["ticker_data"]
+    condor_diagnostic_rows = scan_output.get("condor_diagnostics", [])
     errors = scan_output["errors"]
     event_analyses = scan_output["event_analyses"]
     history_candidates = scan_output["history_candidates"]
@@ -843,6 +852,32 @@ def render_scan_output(scan_output):
         )
 
     with diagnostics_tab:
+        st.subheader("Condor Diagnostics")
+        if condor_diagnostic_rows:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Ticker": row.ticker,
+                            "Put Spreads Built": row.put_spreads_built,
+                            "Call Spreads Built": row.call_spreads_built,
+                            "Qualified Puts": row.qualified_puts,
+                            "Qualified Calls": row.qualified_calls,
+                            "Pairs Checked": row.pairs_checked,
+                            "Matching Expirations": row.matching_expiration_pairs,
+                            "Valid Strike Order": row.valid_order_pairs,
+                            "Condors Built": row.built_condors,
+                            "Main Blocker": row.top_reason,
+                        }
+                        for row in condor_diagnostic_rows
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("No condor diagnostics were captured for this scan.")
+
         st.subheader("Strategy Diagnostics")
         strategy_df = pd.DataFrame(
             strategy_rejection_rows(trades, rejected_trades, scored_trades)
@@ -1550,6 +1585,7 @@ if scan_button:
             rejected_trades,
             trades,
             ticker_data,
+            condor_diagnostic_rows,
             errors,
             event_analyses,
             price_moves,
@@ -1580,6 +1616,7 @@ if scan_button:
         "rejected_trades": rejected_trades,
         "trades": trades,
         "ticker_data": ticker_data,
+        "condor_diagnostics": condor_diagnostic_rows,
         "errors": errors,
         "event_analyses": event_analyses,
         "candidate_analyses": candidate_analyses,
