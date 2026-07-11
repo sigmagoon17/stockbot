@@ -10,6 +10,13 @@ import time
 import yfinance as yf
 from types import SimpleNamespace
 
+from alpaca_client import (
+    get_alpaca_account,
+    get_alpaca_positions,
+    get_recent_alpaca_orders,
+    option_symbol,
+    submit_option_order,
+)
 from history_tracker import (
     add_manual_position,
     append_scan_history as save_history,
@@ -1459,6 +1466,218 @@ def render_manual_positions():
                 st.rerun()
 
 
+def render_alpaca_account_status():
+    st.subheader("Alpaca Paper Account")
+    st.caption(
+        "Read-only connection check. This does not place trades; it only confirms "
+        "your paper account keys work."
+    )
+
+    account, errors = get_alpaca_account()
+    for error in errors:
+        st.warning(error)
+
+    if account is None:
+        st.info(
+            "Use ALPACA_API_KEY and ALPACA_SECRET_KEY in .env. For paper trading, "
+            "leave ALPACA_BASE_URL blank or set it to https://paper-api.alpaca.markets."
+        )
+        return
+
+    if not account.get("_is_paper"):
+        st.error(
+            "This is not using the paper endpoint. Set ALPACA_BASE_URL to "
+            "https://paper-api.alpaca.markets before adding any trading features."
+        )
+    else:
+        st.success("Connected to Alpaca paper trading.")
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Status", str(account.get("status", "unknown")).title())
+    metric_columns[1].metric("Portfolio", f"${float(account.get('portfolio_value', 0)):,.2f}")
+    metric_columns[2].metric("Buying Power", f"${float(account.get('buying_power', 0)):,.2f}")
+    metric_columns[3].metric("Cash", f"${float(account.get('cash', 0)):,.2f}")
+
+    detail_columns = st.columns(3)
+    detail_columns[0].caption(f"Endpoint: {account.get('_base_url')}")
+    detail_columns[1].caption(f"Key var: {account.get('_api_key_name')}")
+    detail_columns[2].caption(f"Secret var: {account.get('_secret_key_name')}")
+
+    st.divider()
+    st.subheader("Paper Positions")
+    positions, position_errors = get_alpaca_positions()
+    for error in position_errors:
+        st.warning(error)
+    if positions:
+        positions_df = pd.DataFrame(positions)
+        st.dataframe(
+            positions_df.reindex(
+                columns=[
+                    "symbol",
+                    "asset_class",
+                    "qty",
+                    "side",
+                    "avg_entry_price",
+                    "current_price",
+                    "market_value",
+                    "unrealized_pl",
+                    "unrealized_plpc",
+                ]
+            ).rename(
+                columns={
+                    "symbol": "Symbol",
+                    "asset_class": "Asset Class",
+                    "qty": "Qty",
+                    "side": "Side",
+                    "avg_entry_price": "Avg Entry",
+                    "current_price": "Current",
+                    "market_value": "Market Value",
+                    "unrealized_pl": "Unrealized P/L",
+                    "unrealized_plpc": "Unrealized P/L %",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("No Alpaca paper positions are open.")
+
+    st.subheader("Recent Paper Orders")
+    orders, order_errors = get_recent_alpaca_orders()
+    for error in order_errors:
+        st.warning(error)
+    if orders:
+        orders_df = pd.DataFrame(orders)
+        st.dataframe(
+            orders_df.reindex(
+                columns=[
+                    "submitted_at",
+                    "symbol",
+                    "asset_class",
+                    "side",
+                    "qty",
+                    "type",
+                    "limit_price",
+                    "filled_avg_price",
+                    "status",
+                ]
+            ).rename(
+                columns={
+                    "submitted_at": "Submitted",
+                    "symbol": "Symbol",
+                    "asset_class": "Asset Class",
+                    "side": "Side",
+                    "qty": "Qty",
+                    "type": "Type",
+                    "limit_price": "Limit",
+                    "filled_avg_price": "Fill Price",
+                    "status": "Status",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("No recent Alpaca paper orders.")
+
+    st.divider()
+    st.subheader("Paper Trade A Scan Candidate")
+    st.caption(
+        "Alpaca's documented options flow supports single-leg option orders. "
+        "This submits only the long call/put leg from a debit-spread candidate, "
+        "not the full spread."
+    )
+    scan_output = st.session_state.get("last_scan_output")
+    if not scan_output or not scan_output.get("scored_trades"):
+        st.info("Run a scan first, then come back here to paper trade a candidate.")
+        return
+
+    debit_candidates = [
+        scored
+        for scored in select_top_candidates(scan_output["scored_trades"], per_ticker=2)
+        if scored.trade.entry_type == "debit"
+    ][:10]
+    if not debit_candidates:
+        st.info("The latest scan did not produce debit-spread candidates.")
+        return
+
+    candidate_options = {
+        (
+            f"{scored.trade.ticker} | {scored.trade.strategy} | "
+            f"{scored.trade.expiration} | long {scored.trade.long_strike:g} "
+            f"{scored.trade.option_type} | score {scored.total_score}"
+        ): scored
+        for scored in debit_candidates
+    }
+    selected_label = st.selectbox("Candidate", list(candidate_options))
+    selected_scored = candidate_options[selected_label]
+    selected_trade = selected_scored.trade
+    long_leg_symbol = option_symbol(
+        selected_trade.ticker,
+        selected_trade.expiration,
+        selected_trade.option_type,
+        selected_trade.long_strike,
+    )
+
+    preview_columns = st.columns(4)
+    preview_columns[0].metric("Option Symbol", long_leg_symbol)
+    preview_columns[1].metric("Side", "Buy")
+    preview_columns[2].metric("Long Ask", f"${selected_trade.long_ask:.2f}")
+    preview_columns[3].metric("Full Spread Score", selected_scored.total_score)
+    st.warning(
+        "This is a paper test of the long leg only. It will not match the exact "
+        "risk/reward of the scanner's full debit spread."
+    )
+
+    with st.form("paper_option_order_form"):
+        order_columns = st.columns(3)
+        quantity = order_columns[0].number_input(
+            "Contracts", min_value=1, max_value=10, value=1, step=1
+        )
+        order_type = order_columns[1].selectbox("Order Type", ["market", "limit"])
+        limit_price = order_columns[2].number_input(
+            "Limit Price",
+            min_value=0.01,
+            value=max(round(float(selected_trade.long_ask), 2), 0.01),
+            step=0.01,
+            disabled=order_type == "market",
+        )
+        confirmation = st.text_input("Type PAPER to submit this paper order")
+        submitted = st.form_submit_button("Submit Paper Long-Leg Order")
+
+    if submitted:
+        if confirmation.strip().upper() != "PAPER":
+            st.error("Type PAPER before submitting the paper order.")
+            return
+        order, submit_errors = submit_option_order(
+            long_leg_symbol,
+            side="buy",
+            quantity=int(quantity),
+            order_type=order_type,
+            limit_price=float(limit_price) if order_type == "limit" else None,
+        )
+        if submit_errors:
+            for error in submit_errors:
+                st.error(error)
+        else:
+            st.success(
+                f"Paper order submitted: {order.get('symbol')} "
+                f"{order.get('side')} {order.get('qty')} "
+                f"status {order.get('status')}"
+            )
+            st.json(
+                {
+                    "id": order.get("id"),
+                    "symbol": order.get("symbol"),
+                    "side": order.get("side"),
+                    "qty": order.get("qty"),
+                    "type": order.get("type"),
+                    "limit_price": order.get("limit_price"),
+                    "status": order.get("status"),
+                }
+            )
+
+
 def render_private_results():
     owner_password = os.getenv("OWNER_DASHBOARD_PASSWORD")
     if not owner_password:
@@ -1482,11 +1701,13 @@ def render_private_results():
                 st.session_state["admin_clicks"] = 0
                 st.session_state["show_admin_prompt"] = False
                 st.rerun()
-        positions_tab, scanner_results_tab = st.tabs(
-            ["My Positions", "Scanner Tracking"]
+        positions_tab, paper_account_tab, scanner_results_tab = st.tabs(
+            ["My Positions", "Paper Account", "Scanner Tracking"]
         )
         with positions_tab:
             render_manual_positions()
+        with paper_account_tab:
+            render_alpaca_account_status()
         with scanner_results_tab:
             render_results()
         return
