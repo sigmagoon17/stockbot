@@ -5,7 +5,11 @@ from pathlib import Path
 import yfinance as yf
 from collections import Counter
 
-from alpaca_client import get_stock_daily_bars
+try:
+    from alpaca_client import get_stock_daily_bars
+except ImportError:
+    def get_stock_daily_bars(ticker: str, lookback_days: int = 430):
+        return [], ["Alpaca stock bars helper is unavailable."]
 
 
 CONTRACT_MULTIPLIER = 100

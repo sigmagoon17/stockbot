@@ -15,9 +15,13 @@ from alpaca_client import (
     get_alpaca_positions,
     get_recent_alpaca_orders,
     option_symbol,
-    submit_scored_debit_long_leg_orders,
     submit_option_order,
 )
+
+try:
+    from alpaca_client import submit_scored_debit_long_leg_orders
+except ImportError:
+    submit_scored_debit_long_leg_orders = None
 from history_tracker import (
     add_manual_position,
     append_scan_history as save_history,
@@ -702,11 +706,54 @@ def paper_trade_scan_candidates(
         fresh_candidates.append(scored)
         paper_traded_keys.add(key)
 
-    return skipped_results + submit_scored_debit_long_leg_orders(
-        fresh_candidates,
-        quantity=quantity,
-        limit=limit,
-    )
+    if submit_scored_debit_long_leg_orders is not None:
+        return skipped_results + submit_scored_debit_long_leg_orders(
+            fresh_candidates,
+            quantity=quantity,
+            limit=limit,
+        )
+
+    fallback_results = []
+    for scored in fresh_candidates[:limit]:
+        trade = scored.trade
+        symbol = option_symbol(
+            trade.ticker,
+            trade.expiration,
+            trade.option_type,
+            trade.long_strike,
+        )
+        candidate_label = (
+            f"{trade.ticker} {trade.strategy} {trade.expiration} "
+            f"{trade.long_strike:g} {trade.option_type}"
+        )
+        order, errors = submit_option_order(
+            symbol,
+            side="buy",
+            quantity=quantity,
+            order_type="limit",
+            limit_price=float(trade.long_ask),
+            client_order_id=f"scan-{paper_trade_key(scored)}",
+        )
+        fallback_results.append(
+            {
+                "Candidate": candidate_label,
+                "Symbol": symbol,
+                "Status": "Error" if errors else order.get("status", "submitted"),
+                "Message": "; ".join(errors) if errors else f"Order {order.get('id')}",
+            }
+        )
+
+    if not fresh_candidates and not skipped_results:
+        fallback_results.append(
+            {
+                "Candidate": "Latest Scan",
+                "Symbol": "",
+                "Status": "Skipped",
+                "Message": "No debit candidates were available for paper trading.",
+            }
+        )
+
+    return skipped_results + fallback_results
 
 
 def debit_candidate_rows(scored_trades):
