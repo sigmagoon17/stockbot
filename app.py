@@ -1896,6 +1896,7 @@ with st.sidebar:
             st.checkbox(
                 "Paper trade new scan debit candidates",
                 key="auto_paper_trade_scans",
+                value=True,
                 help=(
                     "After a manual scan, submit limit-buy paper orders for the "
                     "long leg of tracked debit-spread candidates."
@@ -1966,6 +1967,24 @@ if scan_button:
                 quantity=int(st.session_state.get("auto_paper_trade_quantity", 1)),
                 limit=int(st.session_state.get("auto_paper_trade_limit", 3)),
             )
+        elif st.session_state.get("results_unlocked"):
+            paper_order_results = [
+                {
+                    "Candidate": "Latest Scan",
+                    "Symbol": "",
+                    "Status": "Skipped",
+                    "Message": "Alpaca paper auto trading is turned off.",
+                }
+            ]
+        else:
+            paper_order_results = [
+                {
+                    "Candidate": "Latest Scan",
+                    "Symbol": "",
+                    "Status": "Skipped",
+                    "Message": "Unlock the owner panel before scanning to enable Alpaca paper trading.",
+                }
+            ]
 
         st.write("Reviewing the top 3 candidates with AI...")
         candidate_analyses = {}
