@@ -1,6 +1,7 @@
 import os
 from collections import Counter
 
+from alpaca_client import submit_scored_debit_long_leg_orders
 from event_analysis import get_deep_event_analysis, get_event_analysis
 from history_tracker import (
     append_scan_history,
@@ -81,6 +82,14 @@ def selected_deep_analysis_tickers(
             break
 
     return selected[:max_tickers]
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        value = os.getenv(name)
+        return int(value) if value else default
+    except ValueError:
+        return default
 
 
 def main() -> int:
@@ -177,6 +186,17 @@ def main() -> int:
     errors.extend(
         append_scan_history(history_candidates, event_analyses, price_moves)
     )
+    if os.getenv("ALPACA_AUTO_PAPER_TRADE", "").lower() in {"1", "true", "yes"}:
+        paper_results = submit_scored_debit_long_leg_orders(
+            history_candidates,
+            quantity=env_int("ALPACA_PAPER_TRADE_QUANTITY", 1),
+            limit=env_int("ALPACA_PAPER_TRADE_LIMIT", 3),
+        )
+        for result in paper_results:
+            print(
+                "Alpaca paper trade: "
+                f"{result['Status']} | {result['Symbol']} | {result['Message']}"
+            )
     errors.extend(append_trade_snapshots())
 
     print(f"Saved {len(history_candidates)} candidates from {len(scored_trades)} passing trades.")

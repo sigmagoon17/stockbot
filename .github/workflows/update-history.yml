@@ -34,6 +34,13 @@ jobs:
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MARKETAUX_API_KEY: ${{ secrets.MARKETAUX_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL: https://paper-api.alpaca.markets
+          ALPACA_DATA_FEED: iex
+          ALPACA_AUTO_PAPER_TRADE: ${{ secrets.ALPACA_AUTO_PAPER_TRADE }}
+          ALPACA_PAPER_TRADE_LIMIT: ${{ secrets.ALPACA_PAPER_TRADE_LIMIT }}
+          ALPACA_PAPER_TRADE_QUANTITY: ${{ secrets.ALPACA_PAPER_TRADE_QUANTITY }}
           SCAN_TICKERS: AAPL,SPY,QQQ,NVDA,MSFT,COHR
           SCAN_OUTLOOK: neutral
           SCAN_MAX_RISK: "500"

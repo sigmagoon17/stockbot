@@ -15,6 +15,7 @@ from alpaca_client import (
     get_alpaca_positions,
     get_recent_alpaca_orders,
     option_symbol,
+    submit_scored_debit_long_leg_orders,
     submit_option_order,
 )
 from history_tracker import (
@@ -670,94 +671,42 @@ def paper_trade_scan_candidates(
     quantity: int,
     limit: int,
 ) -> list[dict]:
-    recent_orders, recent_errors = get_recent_alpaca_orders(limit=100)
-    recent_symbols = {
-        order.get("symbol")
-        for order in recent_orders
-        if order.get("side") == "buy"
-    }
-
-    results = [
-        {
-            "Candidate": "Recent Orders",
-            "Symbol": "",
-            "Status": "Error",
-            "Message": error,
-        }
-        for error in recent_errors
-    ]
     paper_traded_keys = st.session_state.setdefault("paper_traded_scan_keys", set())
-    debit_candidates = [
+    fresh_candidates = []
+    skipped_results = []
+    for scored in [
         scored
         for scored in scored_candidates
         if scored.trade.entry_type == "debit"
-    ][:limit]
-
-    for scored in debit_candidates:
-        trade = scored.trade
-        symbol = option_symbol(
-            trade.ticker,
-            trade.expiration,
-            trade.option_type,
-            trade.long_strike,
-        )
-        candidate_label = (
-            f"{trade.ticker} {trade.strategy} {trade.expiration} "
-            f"{trade.long_strike:g} {trade.option_type}"
-        )
+    ][:limit]:
         key = paper_trade_key(scored)
-        if key in paper_traded_keys or symbol in recent_symbols:
-            results.append(
+        if key in paper_traded_keys:
+            trade = scored.trade
+            skipped_results.append(
                 {
-                    "Candidate": candidate_label,
-                    "Symbol": symbol,
+                    "Candidate": (
+                        f"{trade.ticker} {trade.strategy} {trade.expiration} "
+                        f"{trade.long_strike:g} {trade.option_type}"
+                    ),
+                    "Symbol": option_symbol(
+                        trade.ticker,
+                        trade.expiration,
+                        trade.option_type,
+                        trade.long_strike,
+                    ),
                     "Status": "Skipped",
-                    "Message": "Already submitted recently.",
+                    "Message": "Already submitted during this app session.",
                 }
             )
             continue
-
-        order, errors = submit_option_order(
-            symbol,
-            side="buy",
-            quantity=quantity,
-            order_type="limit",
-            limit_price=float(trade.long_ask),
-            client_order_id=f"scan-{key}",
-        )
-        if errors:
-            results.append(
-                {
-                    "Candidate": candidate_label,
-                    "Symbol": symbol,
-                    "Status": "Error",
-                    "Message": "; ".join(errors),
-                }
-            )
-            continue
-
+        fresh_candidates.append(scored)
         paper_traded_keys.add(key)
-        recent_symbols.add(symbol)
-        results.append(
-            {
-                "Candidate": candidate_label,
-                "Symbol": symbol,
-                "Status": order.get("status", "submitted"),
-                "Message": f"Order {order.get('id')}",
-            }
-        )
 
-    if not debit_candidates:
-        results.append(
-            {
-                "Candidate": "Latest Scan",
-                "Symbol": "",
-                "Status": "Skipped",
-                "Message": "No debit candidates were available for paper trading.",
-            }
-        )
-
-    return results
+    return skipped_results + submit_scored_debit_long_leg_orders(
+        fresh_candidates,
+        quantity=quantity,
+        limit=limit,
+    )
 
 
 def debit_candidate_rows(scored_trades):

@@ -1,4 +1,5 @@
 import os
+from datetime import date, timedelta
 
 import requests
 from dotenv import load_dotenv
@@ -7,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+DATA_BASE_URL = "https://data.alpaca.markets"
 
 
 def _first_env_value(*names: str) -> tuple[str | None, str | None]:
@@ -91,6 +93,61 @@ def alpaca_request(method: str, path: str, **kwargs) -> tuple[dict | list | None
         return None, [f"Could not reach Alpaca: {error}"]
 
 
+def alpaca_data_request(
+    method: str,
+    path: str,
+    **kwargs,
+) -> tuple[dict | list | None, list[str]]:
+    headers, errors = alpaca_headers()
+    if errors:
+        return None, errors
+
+    try:
+        response = requests.request(
+            method,
+            f"{DATA_BASE_URL}{path}",
+            headers=headers,
+            timeout=20,
+            **kwargs,
+        )
+        response.raise_for_status()
+        if response.text:
+            return response.json(), []
+        return {}, []
+    except requests.HTTPError as error:
+        detail = ""
+        try:
+            detail = f" {response.json()}"
+        except Exception:
+            detail = f" {response.text[:200]}"
+        return None, [f"Alpaca market data rejected the request: {error}.{detail}"]
+    except requests.RequestException as error:
+        return None, [f"Could not reach Alpaca market data: {error}"]
+
+
+def get_stock_daily_bars(
+    ticker: str,
+    lookback_days: int = 430,
+) -> tuple[list[dict], list[str]]:
+    start = date.today() - timedelta(days=lookback_days)
+    payload, errors = alpaca_data_request(
+        "GET",
+        "/v2/stocks/bars",
+        params={
+            "symbols": ticker.upper(),
+            "timeframe": "1Day",
+            "start": start.isoformat(),
+            "adjustment": "all",
+            "feed": os.getenv("ALPACA_DATA_FEED", "iex"),
+            "limit": 10000,
+            "sort": "asc",
+        },
+    )
+    if errors:
+        return [], errors
+    return (payload or {}).get("bars", {}).get(ticker.upper(), []), []
+
+
 def get_alpaca_account() -> tuple[dict | None, list[str]]:
     config = alpaca_config_status()
     account, errors = alpaca_request("GET", "/v2/account")
@@ -114,6 +171,16 @@ def option_symbol(
     type_code = "C" if option_type.lower() == "call" else "P"
     strike_code = f"{int(round(float(strike) * 1000)):08d}"
     return f"{ticker.upper()}{expiration_code}{type_code}{strike_code}"
+
+
+def scored_trade_paper_key(scored, trading_day: date | None = None) -> str:
+    trade = scored.trade
+    trading_day = trading_day or date.today()
+    strike_key = f"{float(trade.long_strike):.3f}".replace(".", "p")
+    return (
+        f"{trade.ticker}-{trade.expiration}-{trade.option_type}-"
+        f"{strike_key}-{trading_day.isoformat()}"
+    )
 
 
 def get_alpaca_positions() -> tuple[list[dict], list[str]]:
@@ -171,3 +238,96 @@ def submit_option_order(
     if errors:
         return None, errors
     return order, []
+
+
+def submit_scored_debit_long_leg_orders(
+    scored_candidates,
+    quantity: int = 1,
+    limit: int = 3,
+) -> list[dict]:
+    recent_orders, recent_errors = get_recent_alpaca_orders(limit=100)
+    recent_symbols = {
+        order.get("symbol")
+        for order in recent_orders
+        if order.get("side") == "buy"
+    }
+
+    results = [
+        {
+            "Candidate": "Recent Orders",
+            "Symbol": "",
+            "Status": "Error",
+            "Message": error,
+        }
+        for error in recent_errors
+    ]
+
+    debit_candidates = [
+        scored
+        for scored in scored_candidates
+        if scored.trade.entry_type == "debit"
+    ][:limit]
+
+    for scored in debit_candidates:
+        trade = scored.trade
+        symbol = option_symbol(
+            trade.ticker,
+            trade.expiration,
+            trade.option_type,
+            trade.long_strike,
+        )
+        candidate_label = (
+            f"{trade.ticker} {trade.strategy} {trade.expiration} "
+            f"{trade.long_strike:g} {trade.option_type}"
+        )
+        if symbol in recent_symbols:
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Skipped",
+                    "Message": "Already submitted recently.",
+                }
+            )
+            continue
+
+        order, errors = submit_option_order(
+            symbol,
+            side="buy",
+            quantity=quantity,
+            order_type="limit",
+            limit_price=float(trade.long_ask),
+            client_order_id=f"scan-{scored_trade_paper_key(scored)}",
+        )
+        if errors:
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Error",
+                    "Message": "; ".join(errors),
+                }
+            )
+            continue
+
+        recent_symbols.add(symbol)
+        results.append(
+            {
+                "Candidate": candidate_label,
+                "Symbol": symbol,
+                "Status": order.get("status", "submitted"),
+                "Message": f"Order {order.get('id')}",
+            }
+        )
+
+    if not debit_candidates:
+        results.append(
+            {
+                "Candidate": "Latest Scan",
+                "Symbol": "",
+                "Status": "Skipped",
+                "Message": "No debit candidates were available for paper trading.",
+            }
+        )
+
+    return results

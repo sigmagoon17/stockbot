@@ -5,6 +5,8 @@ from pathlib import Path
 import yfinance as yf
 from collections import Counter
 
+from alpaca_client import get_stock_daily_bars
+
 
 CONTRACT_MULTIPLIER = 100
 MAX_SETUP_SCORE = 125
@@ -103,6 +105,80 @@ def get_underlying_price(stock: yf.Ticker) -> float:
     return float(history["Close"].iloc[-1])
 
 
+def alpaca_price_history_metrics(ticker: str) -> tuple[float, float, dict[str, float | str]]:
+    bars, errors = get_stock_daily_bars(ticker)
+    if errors or len(bars) < 80:
+        raise ValueError(
+            "Alpaca did not return enough daily stock bars for price metrics."
+        )
+
+    closing_prices = [float(bar["c"]) for bar in bars if bar.get("c") is not None]
+    if len(closing_prices) < 80:
+        raise ValueError(
+            "Alpaca did not return enough closing prices for price metrics."
+        )
+
+    daily_returns = [
+        closing_prices[index] / closing_prices[index - 1] - 1
+        for index in range(1, len(closing_prices))
+        if closing_prices[index - 1] > 0
+    ]
+    if len(daily_returns) < 60:
+        raise ValueError(
+            "Alpaca did not return enough daily returns for volatility ranking."
+        )
+
+    rolling_volatility = []
+    for index in range(20, len(daily_returns) + 1):
+        window = daily_returns[index - 20:index]
+        average_return = sum(window) / len(window)
+        variance = sum((value - average_return) ** 2 for value in window) / (
+            len(window) - 1
+        )
+        rolling_volatility.append(math.sqrt(variance) * math.sqrt(252))
+
+    if len(rolling_volatility) < 60:
+        raise ValueError(
+            "Alpaca did not return enough volatility history for ranking."
+        )
+
+    current_volatility = rolling_volatility[-1]
+    lowest_volatility = min(rolling_volatility)
+    highest_volatility = max(rolling_volatility)
+
+    if highest_volatility == lowest_volatility:
+        volatility_rank = 50.0
+    else:
+        volatility_rank = round(
+            (current_volatility - lowest_volatility)
+            / (highest_volatility - lowest_volatility)
+            * 100,
+            1,
+        )
+
+    latest_daily_return = daily_returns[-1]
+    baseline_returns = daily_returns[-21:-1]
+    average_baseline_return = sum(baseline_returns) / len(baseline_returns)
+    baseline_variance = sum(
+        (value - average_baseline_return) ** 2 for value in baseline_returns
+    ) / (len(baseline_returns) - 1)
+    baseline_daily_volatility = math.sqrt(baseline_variance)
+    move_multiple = (
+        abs(latest_daily_return) / baseline_daily_volatility
+        if baseline_daily_volatility > 0
+        else 0.0
+    )
+    five_day_return = closing_prices[-1] / closing_prices[-6] - 1
+    price_move = {
+        "1D Move %": round(latest_daily_return * 100, 2),
+        "5D Move %": round(five_day_return * 100, 2),
+        "Move vs 20D Vol": round(move_multiple, 1),
+        "Unusual Move": "Yes" if move_multiple >= 2 else "No",
+        "Price Source": "Alpaca",
+    }
+    return closing_prices[-1], volatility_rank, price_move
+
+
 def price_history_metrics(stock: yf.Ticker) -> tuple[float, dict[str, float | str]]:
     history = stock.history(period="1y", auto_adjust=True)
     if history.empty:
@@ -142,6 +218,7 @@ def price_history_metrics(stock: yf.Ticker) -> tuple[float, dict[str, float | st
         "5D Move %": round(five_day_return * 100, 2),
         "Move vs 20D Vol": round(move_multiple, 1),
         "Unusual Move": "Yes" if move_multiple >= 2 else "No",
+        "Price Source": "Yahoo Finance",
     }
     return volatility_rank, price_move
 
@@ -172,8 +249,13 @@ def get_option_chain(
         except Exception:
             earnings_date = None
 
-    underlying_price = get_underlying_price(stock)
-    volatility_rank, price_move = price_history_metrics(stock)
+    try:
+        underlying_price, volatility_rank, price_move = alpaca_price_history_metrics(
+            ticker
+        )
+    except Exception:
+        underlying_price = get_underlying_price(stock)
+        volatility_rank, price_move = price_history_metrics(stock)
     contracts = []
 
     available_expirations = [
