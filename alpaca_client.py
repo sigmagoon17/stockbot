@@ -145,6 +145,7 @@ def submit_option_order(
     quantity: int,
     order_type: str = "market",
     limit_price: float | None = None,
+    client_order_id: str | None = None,
 ) -> tuple[dict | None, list[str]]:
     config = alpaca_config_status()
     if not config["is_paper"]:
@@ -159,6 +160,8 @@ def submit_option_order(
         "type": order_type,
         "time_in_force": "day",
     }
+    if client_order_id:
+        payload["client_order_id"] = client_order_id[:48]
     if order_type == "limit":
         if limit_price is None or limit_price <= 0:
             return None, ["Limit orders require a limit price greater than 0."]

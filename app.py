@@ -656,6 +656,110 @@ def candidate_column_config():
     }
 
 
+def paper_trade_key(scored) -> str:
+    trade = scored.trade
+    strike_key = f"{float(trade.long_strike):.3f}".replace(".", "p")
+    return (
+        f"{trade.ticker}-{trade.expiration}-{trade.option_type}-"
+        f"{strike_key}-{date.today().isoformat()}"
+    )
+
+
+def paper_trade_scan_candidates(
+    scored_candidates,
+    quantity: int,
+    limit: int,
+) -> list[dict]:
+    recent_orders, recent_errors = get_recent_alpaca_orders(limit=100)
+    recent_symbols = {
+        order.get("symbol")
+        for order in recent_orders
+        if order.get("side") == "buy"
+    }
+
+    results = [
+        {
+            "Candidate": "Recent Orders",
+            "Symbol": "",
+            "Status": "Error",
+            "Message": error,
+        }
+        for error in recent_errors
+    ]
+    paper_traded_keys = st.session_state.setdefault("paper_traded_scan_keys", set())
+    debit_candidates = [
+        scored
+        for scored in scored_candidates
+        if scored.trade.entry_type == "debit"
+    ][:limit]
+
+    for scored in debit_candidates:
+        trade = scored.trade
+        symbol = option_symbol(
+            trade.ticker,
+            trade.expiration,
+            trade.option_type,
+            trade.long_strike,
+        )
+        candidate_label = (
+            f"{trade.ticker} {trade.strategy} {trade.expiration} "
+            f"{trade.long_strike:g} {trade.option_type}"
+        )
+        key = paper_trade_key(scored)
+        if key in paper_traded_keys or symbol in recent_symbols:
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Skipped",
+                    "Message": "Already submitted recently.",
+                }
+            )
+            continue
+
+        order, errors = submit_option_order(
+            symbol,
+            side="buy",
+            quantity=quantity,
+            order_type="limit",
+            limit_price=float(trade.long_ask),
+            client_order_id=f"scan-{key}",
+        )
+        if errors:
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Error",
+                    "Message": "; ".join(errors),
+                }
+            )
+            continue
+
+        paper_traded_keys.add(key)
+        recent_symbols.add(symbol)
+        results.append(
+            {
+                "Candidate": candidate_label,
+                "Symbol": symbol,
+                "Status": order.get("status", "submitted"),
+                "Message": f"Order {order.get('id')}",
+            }
+        )
+
+    if not debit_candidates:
+        results.append(
+            {
+                "Candidate": "Latest Scan",
+                "Symbol": "",
+                "Status": "Skipped",
+                "Message": "No debit candidates were available for paper trading.",
+            }
+        )
+
+    return results
+
+
 def debit_candidate_rows(scored_trades):
     rows = []
     debit_trades = [
@@ -725,6 +829,7 @@ def render_scan_output(scan_output):
     errors = scan_output["errors"]
     event_analyses = scan_output["event_analyses"]
     history_candidates = scan_output["history_candidates"]
+    paper_order_results = scan_output.get("paper_order_results", [])
 
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
@@ -736,6 +841,14 @@ def render_scan_output(scan_output):
     if errors:
         for error in errors:
             st.warning(error)
+
+    if paper_order_results:
+        st.subheader("Alpaca Paper Trade Results")
+        st.dataframe(
+            pd.DataFrame(paper_order_results),
+            width="stretch",
+            hide_index=True,
+        )
 
     candidate_analyses = scan_output.get("candidate_analyses", {})
     if candidate_analyses:
@@ -1782,6 +1895,32 @@ with st.sidebar:
             if use_test_expiration
             else None
         )
+    if st.session_state.get("results_unlocked"):
+        with st.expander("Alpaca Paper Auto Trading"):
+            st.checkbox(
+                "Paper trade new scan debit candidates",
+                key="auto_paper_trade_scans",
+                help=(
+                    "After a manual scan, submit limit-buy paper orders for the "
+                    "long leg of tracked debit-spread candidates."
+                ),
+            )
+            st.number_input(
+                "Max Paper Orders Per Scan",
+                min_value=1,
+                max_value=25,
+                value=3,
+                step=1,
+                key="auto_paper_trade_limit",
+            )
+            st.number_input(
+                "Contracts Per Paper Order",
+                min_value=1,
+                max_value=10,
+                value=1,
+                step=1,
+                key="auto_paper_trade_quantity",
+            )
     scan_button = st.button("Scan Watchlist", type="primary", width="stretch")
 
 if scan_button:
@@ -1820,6 +1959,18 @@ if scan_button:
         )
         errors = history_errors + errors + history_save_errors
 
+        paper_order_results = []
+        if (
+            st.session_state.get("results_unlocked")
+            and st.session_state.get("auto_paper_trade_scans")
+        ):
+            st.write("Submitting Alpaca paper orders for new debit candidates...")
+            paper_order_results = paper_trade_scan_candidates(
+                history_candidates,
+                quantity=int(st.session_state.get("auto_paper_trade_quantity", 1)),
+                limit=int(st.session_state.get("auto_paper_trade_limit", 3)),
+            )
+
         st.write("Reviewing the top 3 candidates with AI...")
         candidate_analyses = {}
         for scored in scored_trades[:3]:
@@ -1842,6 +1993,7 @@ if scan_button:
         "event_analyses": event_analyses,
         "candidate_analyses": candidate_analyses,
         "history_candidates": history_candidates,
+        "paper_order_results": paper_order_results,
     }
 
 if st.session_state.get("last_scan_output"):
