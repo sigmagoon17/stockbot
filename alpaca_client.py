@@ -210,7 +210,7 @@ def submit_option_order(
     symbol: str,
     side: str,
     quantity: int,
-    order_type: str = "market",
+    order_type: str = "limit",
     limit_price: float | None = None,
     client_order_id: str | None = None,
 ) -> tuple[dict | None, list[str]]:

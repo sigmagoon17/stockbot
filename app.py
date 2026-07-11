@@ -1739,18 +1739,17 @@ def render_alpaca_account_status():
     )
 
     with st.form("paper_option_order_form"):
-        order_columns = st.columns(3)
+        order_columns = st.columns(2)
         quantity = order_columns[0].number_input(
             "Contracts", min_value=1, max_value=10, value=1, step=1
         )
-        order_type = order_columns[1].selectbox("Order Type", ["market", "limit"])
-        limit_price = order_columns[2].number_input(
+        limit_price = order_columns[1].number_input(
             "Limit Price",
             min_value=0.01,
             value=max(round(float(selected_trade.long_ask), 2), 0.01),
             step=0.01,
-            disabled=order_type == "market",
         )
+        st.caption("Option paper orders use limit orders only.")
         confirmation = st.text_input("Type PAPER to submit this paper order")
         submitted = st.form_submit_button("Submit Paper Long-Leg Order")
 
@@ -1762,8 +1761,8 @@ def render_alpaca_account_status():
             long_leg_symbol,
             side="buy",
             quantity=int(quantity),
-            order_type=order_type,
-            limit_price=float(limit_price) if order_type == "limit" else None,
+            order_type="limit",
+            limit_price=float(limit_price),
         )
         if submit_errors:
             for error in submit_errors:
