@@ -818,6 +818,65 @@ def top_unplaced_paper_candidates(scored_trades, limit: int = 3):
     return selected, skipped
 
 
+def symbols_from_leg_key(leg_key: str | None) -> list[str]:
+    if not leg_key:
+        return []
+    return [
+        leg_part.split(":", 1)[0]
+        for leg_part in leg_key.split("|")
+        if leg_part
+    ]
+
+
+def grouped_alpaca_spread_rows(positions: list[dict], paper_history: list[dict]):
+    positions_by_symbol = {
+        position.get("symbol"): position
+        for position in positions
+        if position.get("symbol")
+    }
+    grouped_rows = []
+
+    for order in paper_history:
+        symbols = symbols_from_leg_key(order.get("leg_key"))
+        if not symbols:
+            continue
+
+        matched_positions = [
+            positions_by_symbol[symbol]
+            for symbol in symbols
+            if symbol in positions_by_symbol
+        ]
+        current_value = sum(
+            float(position.get("market_value") or 0)
+            for position in matched_positions
+        )
+        unrealized_pnl = sum(
+            float(position.get("unrealized_pl") or 0)
+            for position in matched_positions
+        )
+        grouped_rows.append(
+            {
+                "Ticker": order.get("ticker"),
+                "Strategy": order.get("strategy"),
+                "Expiration": order.get("expiration"),
+                "Score": order.get("setup_score"),
+                "Entry Type": order.get("entry_type"),
+                "Limit": order.get("limit_price"),
+                "Qty": order.get("quantity"),
+                "Current Value": round(current_value, 2),
+                "Unrealized P/L": round(unrealized_pnl, 2),
+                "Matched Legs": f"{len(matched_positions)}/{len(symbols)}",
+                "Status": (
+                    "Open"
+                    if matched_positions
+                    else order.get("status", "No open legs")
+                ),
+            }
+        )
+
+    return grouped_rows
+
+
 def debit_candidate_rows(scored_trades):
     rows = []
     debit_trades = [
@@ -1674,6 +1733,10 @@ def render_alpaca_account_status():
     detail_columns[1].caption(f"Key var: {account.get('_api_key_name')}")
     detail_columns[2].caption(f"Secret var: {account.get('_secret_key_name')}")
 
+    paper_history, paper_history_errors = fetch_alpaca_paper_orders()
+    for error in paper_history_errors:
+        st.warning(error)
+
     st.divider()
     st.subheader("Paper Positions")
     st.caption(
@@ -1717,6 +1780,34 @@ def render_alpaca_account_status():
     else:
         st.info("No Alpaca paper positions are open.")
 
+    st.subheader("Grouped Paper Spreads")
+    grouped_rows = grouped_alpaca_spread_rows(positions, paper_history)
+    if grouped_rows:
+        st.dataframe(
+            pd.DataFrame(grouped_rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Limit": st.column_config.NumberColumn(format="$%.2f"),
+                "Current Value": st.column_config.NumberColumn(format="$%.2f"),
+                "Unrealized P/L": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+        grouped_total_value = sum(row["Current Value"] for row in grouped_rows)
+        grouped_total_pnl = sum(row["Unrealized P/L"] for row in grouped_rows)
+        spread_metric_columns = st.columns(2)
+        spread_metric_columns[0].metric(
+            "Grouped Spread Value", f"${grouped_total_value:,.2f}"
+        )
+        spread_metric_columns[1].metric(
+            "Grouped Spread P/L", f"${grouped_total_pnl:,.2f}"
+        )
+        st.caption(
+            "Grouped spread totals are built from logged paper-order legs. If the same option leg belongs to multiple spreads, Alpaca's aggregated position can make allocation approximate."
+        )
+    else:
+        st.info("No logged Alpaca paper spreads match current open positions yet.")
+
     st.subheader("Recent Paper Orders")
     orders, order_errors = get_recent_alpaca_orders()
     for error in order_errors:
@@ -1756,9 +1847,6 @@ def render_alpaca_account_status():
         st.info("No recent Alpaca paper orders.")
 
     st.subheader("Paper Order Tracking")
-    paper_history, paper_history_errors = fetch_alpaca_paper_orders()
-    for error in paper_history_errors:
-        st.warning(error)
     if paper_history:
         paper_history_df = pd.DataFrame(paper_history)
         paper_history_df["scan_time"] = pd.to_datetime(paper_history_df["scan_time"])
