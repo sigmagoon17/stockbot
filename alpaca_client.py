@@ -183,6 +183,10 @@ def scored_trade_paper_key(scored, trading_day: date | None = None) -> str:
     )
 
 
+def scan_client_order_id(scored) -> str:
+    return f"scan-{scored_trade_paper_key(scored)}"[:48]
+
+
 def get_alpaca_positions() -> tuple[list[dict], list[str]]:
     positions, errors = alpaca_request("GET", "/v2/positions")
     if errors:
@@ -240,16 +244,143 @@ def submit_option_order(
     return order, []
 
 
-def submit_scored_debit_long_leg_orders(
+def trade_multileg_order_details(scored) -> tuple[list[dict], float, str]:
+    trade = scored.trade
+    quantity_type = "credit" if trade.entry_type == "credit" else "debit"
+
+    if trade.strategy in {"bull call debit spread", "bear put debit spread"}:
+        option_type = "call" if trade.strategy == "bull call debit spread" else "put"
+        legs = [
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, option_type, trade.long_strike
+                ),
+                "ratio_qty": "1",
+                "side": "buy",
+                "position_intent": "buy_to_open",
+            },
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, option_type, trade.short_strike
+                ),
+                "ratio_qty": "1",
+                "side": "sell",
+                "position_intent": "sell_to_open",
+            },
+        ]
+        return legs, round(float(trade.max_risk), 2), quantity_type
+
+    if trade.strategy in {"put credit spread", "call credit spread"}:
+        option_type = "put" if trade.strategy == "put credit spread" else "call"
+        legs = [
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, option_type, trade.long_strike
+                ),
+                "ratio_qty": "1",
+                "side": "buy",
+                "position_intent": "buy_to_open",
+            },
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, option_type, trade.short_strike
+                ),
+                "ratio_qty": "1",
+                "side": "sell",
+                "position_intent": "sell_to_open",
+            },
+        ]
+        return legs, round(float(trade.credit), 2), quantity_type
+
+    if trade.strategy == "iron condor":
+        if (
+            trade.put_long_strike is None
+            or trade.put_short_strike is None
+            or trade.call_short_strike is None
+            or trade.call_long_strike is None
+        ):
+            raise ValueError("Iron condor is missing one or more leg strikes.")
+
+        legs = [
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, "put", trade.put_long_strike
+                ),
+                "ratio_qty": "1",
+                "side": "buy",
+                "position_intent": "buy_to_open",
+            },
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, "put", trade.put_short_strike
+                ),
+                "ratio_qty": "1",
+                "side": "sell",
+                "position_intent": "sell_to_open",
+            },
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, "call", trade.call_short_strike
+                ),
+                "ratio_qty": "1",
+                "side": "sell",
+                "position_intent": "sell_to_open",
+            },
+            {
+                "symbol": option_symbol(
+                    trade.ticker, trade.expiration, "call", trade.call_long_strike
+                ),
+                "ratio_qty": "1",
+                "side": "buy",
+                "position_intent": "buy_to_open",
+            },
+        ]
+        return legs, round(float(trade.credit), 2), quantity_type
+
+    raise ValueError(f"Unsupported multi-leg strategy: {trade.strategy}")
+
+
+def submit_multileg_order(
+    legs: list[dict],
+    quantity: int,
+    limit_price: float,
+    client_order_id: str | None = None,
+) -> tuple[dict | None, list[str]]:
+    config = alpaca_config_status()
+    if not config["is_paper"]:
+        return None, [
+            "Refusing to submit an order because Alpaca is not using the paper endpoint."
+        ]
+    if limit_price <= 0:
+        return None, ["Multi-leg orders require a limit price greater than 0."]
+
+    payload = {
+        "order_class": "mleg",
+        "qty": str(int(quantity)),
+        "type": "limit",
+        "limit_price": f"{limit_price:.2f}",
+        "time_in_force": "day",
+        "legs": legs,
+    }
+    if client_order_id:
+        payload["client_order_id"] = client_order_id[:48]
+
+    order, errors = alpaca_request("POST", "/v2/orders", json=payload)
+    if errors:
+        return None, errors
+    return order, []
+
+
+def submit_scored_multileg_orders(
     scored_candidates,
     quantity: int = 1,
     limit: int = 3,
 ) -> list[dict]:
     recent_orders, recent_errors = get_recent_alpaca_orders(limit=100)
-    recent_symbols = {
-        order.get("symbol")
+    recent_client_order_ids = {
+        order.get("client_order_id")
         for order in recent_orders
-        if order.get("side") == "buy"
+        if order.get("client_order_id")
     }
 
     results = [
@@ -262,65 +393,72 @@ def submit_scored_debit_long_leg_orders(
         for error in recent_errors
     ]
 
-    debit_candidates = [
-        scored
-        for scored in scored_candidates
-        if scored.trade.entry_type == "debit"
-    ][:limit]
+    selected_candidates = list(scored_candidates)[:limit]
 
-    for scored in debit_candidates:
+    for scored in selected_candidates:
         trade = scored.trade
-        symbol = option_symbol(
-            trade.ticker,
-            trade.expiration,
-            trade.option_type,
-            trade.long_strike,
-        )
         candidate_label = (
             f"{trade.ticker} {trade.strategy} {trade.expiration} "
-            f"{trade.long_strike:g} {trade.option_type}"
+            f"score {scored.total_score}"
         )
-        if symbol in recent_symbols:
+        try:
+            legs, limit_price, quantity_type = trade_multileg_order_details(scored)
+        except ValueError as error:
             results.append(
                 {
                     "Candidate": candidate_label,
-                    "Symbol": symbol,
+                    "Symbol": "",
+                    "Status": "Error",
+                    "Message": str(error),
+                }
+            )
+            continue
+
+        client_order_id = scan_client_order_id(scored)
+        if client_order_id in recent_client_order_ids:
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": "2-leg order" if len(legs) == 2 else "4-leg order",
                     "Status": "Skipped",
                     "Message": "Already submitted recently.",
                 }
             )
             continue
 
-        order, errors = submit_option_order(
-            symbol,
-            side="buy",
+        order, errors = submit_multileg_order(
+            legs,
             quantity=quantity,
-            order_type="limit",
-            limit_price=float(trade.long_ask),
-            client_order_id=f"scan-{scored_trade_paper_key(scored)}",
+            limit_price=limit_price,
+            client_order_id=client_order_id,
         )
         if errors:
             results.append(
                 {
                     "Candidate": candidate_label,
-                    "Symbol": symbol,
+                    "Symbol": "2-leg order" if len(legs) == 2 else "4-leg order",
                     "Status": "Error",
                     "Message": "; ".join(errors),
                 }
             )
             continue
 
-        recent_symbols.add(symbol)
+        recent_client_order_ids.add(client_order_id)
         results.append(
             {
                 "Candidate": candidate_label,
-                "Symbol": symbol,
+                "Symbol": order.get("symbol") or (
+                    "2-leg order" if len(legs) == 2 else "4-leg order"
+                ),
                 "Status": order.get("status", "submitted"),
-                "Message": f"Order {order.get('id')}",
+                "Message": (
+                    f"{quantity_type.title()} limit ${limit_price:.2f}; "
+                    f"order {order.get('id')}"
+                ),
             }
         )
 
-    if not debit_candidates:
+    if not selected_candidates:
         results.append(
             {
                 "Candidate": "Latest Scan",
@@ -331,3 +469,11 @@ def submit_scored_debit_long_leg_orders(
         )
 
     return results
+
+
+def submit_scored_debit_long_leg_orders(
+    scored_candidates,
+    quantity: int = 1,
+    limit: int = 3,
+) -> list[dict]:
+    return submit_scored_multileg_orders(scored_candidates, quantity, limit)

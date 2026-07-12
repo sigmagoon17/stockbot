@@ -14,14 +14,14 @@ from alpaca_client import (
     get_alpaca_account,
     get_alpaca_positions,
     get_recent_alpaca_orders,
-    option_symbol,
-    submit_option_order,
+    submit_multileg_order,
+    trade_multileg_order_details,
 )
 
 try:
-    from alpaca_client import submit_scored_debit_long_leg_orders
+    from alpaca_client import submit_scored_multileg_orders
 except ImportError:
-    submit_scored_debit_long_leg_orders = None
+    submit_scored_multileg_orders = None
 from history_tracker import (
     add_manual_position,
     append_scan_history as save_history,
@@ -663,10 +663,12 @@ def candidate_column_config():
 
 def paper_trade_key(scored) -> str:
     trade = scored.trade
-    strike_key = f"{float(trade.long_strike):.3f}".replace(".", "p")
+    long_key = f"{float(trade.long_strike):.3f}".replace(".", "p")
+    short_key = f"{float(trade.short_strike):.3f}".replace(".", "p")
+    strategy_key = trade.strategy.replace(" ", "-")
     return (
-        f"{trade.ticker}-{trade.expiration}-{trade.option_type}-"
-        f"{strike_key}-{date.today().isoformat()}"
+        f"{trade.ticker}-{strategy_key}-{trade.expiration}-"
+        f"{long_key}-{short_key}-{date.today().isoformat()}"
     )
 
 
@@ -678,11 +680,7 @@ def paper_trade_scan_candidates(
     paper_traded_keys = st.session_state.setdefault("paper_traded_scan_keys", set())
     fresh_candidates = []
     skipped_results = []
-    for scored in [
-        scored
-        for scored in scored_candidates
-        if scored.trade.entry_type == "debit"
-    ][:limit]:
+    for scored in scored_candidates[:limit]:
         key = paper_trade_key(scored)
         if key in paper_traded_keys:
             trade = scored.trade
@@ -690,14 +688,9 @@ def paper_trade_scan_candidates(
                 {
                     "Candidate": (
                         f"{trade.ticker} {trade.strategy} {trade.expiration} "
-                        f"{trade.long_strike:g} {trade.option_type}"
+                        f"score {scored.total_score}"
                     ),
-                    "Symbol": option_symbol(
-                        trade.ticker,
-                        trade.expiration,
-                        trade.option_type,
-                        trade.long_strike,
-                    ),
+                    "Symbol": "Multi-leg order",
                     "Status": "Skipped",
                     "Message": "Already submitted during this app session.",
                 }
@@ -706,54 +699,31 @@ def paper_trade_scan_candidates(
         fresh_candidates.append(scored)
         paper_traded_keys.add(key)
 
-    if submit_scored_debit_long_leg_orders is not None:
-        return skipped_results + submit_scored_debit_long_leg_orders(
+    if submit_scored_multileg_orders is not None:
+        return skipped_results + submit_scored_multileg_orders(
             fresh_candidates,
             quantity=quantity,
             limit=limit,
         )
 
-    fallback_results = []
-    for scored in fresh_candidates[:limit]:
-        trade = scored.trade
-        symbol = option_symbol(
-            trade.ticker,
-            trade.expiration,
-            trade.option_type,
-            trade.long_strike,
-        )
-        candidate_label = (
-            f"{trade.ticker} {trade.strategy} {trade.expiration} "
-            f"{trade.long_strike:g} {trade.option_type}"
-        )
-        order, errors = submit_option_order(
-            symbol,
-            side="buy",
-            quantity=quantity,
-            order_type="limit",
-            limit_price=float(trade.long_ask),
-            client_order_id=f"scan-{paper_trade_key(scored)}",
-        )
-        fallback_results.append(
-            {
-                "Candidate": candidate_label,
-                "Symbol": symbol,
-                "Status": "Error" if errors else order.get("status", "submitted"),
-                "Message": "; ".join(errors) if errors else f"Order {order.get('id')}",
-            }
-        )
-
     if not fresh_candidates and not skipped_results:
-        fallback_results.append(
+        return [
             {
                 "Candidate": "Latest Scan",
                 "Symbol": "",
                 "Status": "Skipped",
-                "Message": "No debit candidates were available for paper trading.",
+                "Message": "No candidates were available for paper trading.",
             }
-        )
+        ]
 
-    return skipped_results + fallback_results
+    return skipped_results + [
+        {
+            "Candidate": "Latest Scan",
+            "Symbol": "",
+            "Status": "Error",
+            "Message": "Alpaca multi-leg helper is unavailable.",
+        }
+    ]
 
 
 def debit_candidate_rows(scored_trades):
@@ -1692,51 +1662,43 @@ def render_alpaca_account_status():
     st.divider()
     st.subheader("Paper Trade A Scan Candidate")
     st.caption(
-        "Alpaca's documented options flow supports single-leg option orders. "
-        "This submits only the long call/put leg from a debit-spread candidate, "
-        "not the full spread."
+        "Submits the full spread as an Alpaca multi-leg paper order. The order "
+        "fills together or not at all."
     )
     scan_output = st.session_state.get("last_scan_output")
     if not scan_output or not scan_output.get("scored_trades"):
         st.info("Run a scan first, then come back here to paper trade a candidate.")
         return
 
-    debit_candidates = [
-        scored
-        for scored in select_top_candidates(scan_output["scored_trades"], per_ticker=2)
-        if scored.trade.entry_type == "debit"
-    ][:10]
-    if not debit_candidates:
-        st.info("The latest scan did not produce debit-spread candidates.")
+    paper_candidates = select_history_candidates(scan_output["scored_trades"])[:10]
+    if not paper_candidates:
+        st.info("The latest scan did not produce paper-tradable candidates.")
         return
 
     candidate_options = {
         (
             f"{scored.trade.ticker} | {scored.trade.strategy} | "
-            f"{scored.trade.expiration} | long {scored.trade.long_strike:g} "
-            f"{scored.trade.option_type} | score {scored.total_score}"
+            f"{scored.trade.expiration} | score {scored.total_score}"
         ): scored
-        for scored in debit_candidates
+        for scored in paper_candidates
     }
     selected_label = st.selectbox("Candidate", list(candidate_options))
     selected_scored = candidate_options[selected_label]
     selected_trade = selected_scored.trade
-    long_leg_symbol = option_symbol(
-        selected_trade.ticker,
-        selected_trade.expiration,
-        selected_trade.option_type,
-        selected_trade.long_strike,
-    )
+    try:
+        legs, suggested_limit_price, quantity_type = trade_multileg_order_details(
+            selected_scored
+        )
+    except ValueError as error:
+        st.error(str(error))
+        return
 
     preview_columns = st.columns(4)
-    preview_columns[0].metric("Option Symbol", long_leg_symbol)
-    preview_columns[1].metric("Side", "Buy")
-    preview_columns[2].metric("Long Ask", f"${selected_trade.long_ask:.2f}")
-    preview_columns[3].metric("Full Spread Score", selected_scored.total_score)
-    st.warning(
-        "This is a paper test of the long leg only. It will not match the exact "
-        "risk/reward of the scanner's full debit spread."
-    )
+    preview_columns[0].metric("Order Class", "MLeg")
+    preview_columns[1].metric("Legs", len(legs))
+    preview_columns[2].metric("Limit Type", quantity_type.title())
+    preview_columns[3].metric("Score", selected_scored.total_score)
+    st.dataframe(pd.DataFrame(legs), width="stretch", hide_index=True)
 
     with st.form("paper_option_order_form"):
         order_columns = st.columns(2)
@@ -1746,38 +1708,35 @@ def render_alpaca_account_status():
         limit_price = order_columns[1].number_input(
             "Limit Price",
             min_value=0.01,
-            value=max(round(float(selected_trade.long_ask), 2), 0.01),
+            value=max(round(float(suggested_limit_price), 2), 0.01),
             step=0.01,
         )
-        st.caption("Option paper orders use limit orders only.")
+        st.caption("Multi-leg option paper orders use limit orders only.")
         confirmation = st.text_input("Type PAPER to submit this paper order")
-        submitted = st.form_submit_button("Submit Paper Long-Leg Order")
+        submitted = st.form_submit_button("Submit Paper Multi-Leg Order")
 
     if submitted:
         if confirmation.strip().upper() != "PAPER":
             st.error("Type PAPER before submitting the paper order.")
             return
-        order, submit_errors = submit_option_order(
-            long_leg_symbol,
-            side="buy",
+        order, submit_errors = submit_multileg_order(
+            legs,
             quantity=int(quantity),
-            order_type="limit",
             limit_price=float(limit_price),
+            client_order_id=f"manual-{paper_trade_key(selected_scored)}",
         )
         if submit_errors:
             for error in submit_errors:
                 st.error(error)
         else:
             st.success(
-                f"Paper order submitted: {order.get('symbol')} "
-                f"{order.get('side')} {order.get('qty')} "
-                f"status {order.get('status')}"
+                f"Paper multi-leg order submitted: "
+                f"{order.get('qty')} contract(s), status {order.get('status')}"
             )
             st.json(
                 {
                     "id": order.get("id"),
-                    "symbol": order.get("symbol"),
-                    "side": order.get("side"),
+                    "order_class": order.get("order_class"),
                     "qty": order.get("qty"),
                     "type": order.get("type"),
                     "limit_price": order.get("limit_price"),

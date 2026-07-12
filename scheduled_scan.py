@@ -2,9 +2,9 @@ import os
 from collections import Counter
 
 try:
-    from alpaca_client import submit_scored_debit_long_leg_orders
+    from alpaca_client import submit_scored_multileg_orders
 except ImportError:
-    submit_scored_debit_long_leg_orders = None
+    submit_scored_multileg_orders = None
 from event_analysis import get_deep_event_analysis, get_event_analysis
 from history_tracker import (
     append_scan_history,
@@ -190,10 +190,10 @@ def main() -> int:
         append_scan_history(history_candidates, event_analyses, price_moves)
     )
     if os.getenv("ALPACA_AUTO_PAPER_TRADE", "").lower() in {"1", "true", "yes"}:
-        if submit_scored_debit_long_leg_orders is None:
+        if submit_scored_multileg_orders is None:
             print("Warning: Alpaca paper trading helper is unavailable.")
         else:
-            paper_results = submit_scored_debit_long_leg_orders(
+            paper_results = submit_scored_multileg_orders(
                 history_candidates,
                 quantity=env_int("ALPACA_PAPER_TRADE_QUANTITY", 1),
                 limit=env_int("ALPACA_PAPER_TRADE_LIMIT", 3),
