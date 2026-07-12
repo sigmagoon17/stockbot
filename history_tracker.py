@@ -65,9 +65,14 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
         return []
 
     try:
+        conflict_key = (
+            "client_order_id"
+            if any(row.get("client_order_id") for row in rows)
+            else "leg_key"
+        )
         supabase.table("alpaca_paper_orders").upsert(
             rows,
-            on_conflict="client_order_id",
+            on_conflict=conflict_key,
         ).execute()
         return []
     except Exception as error:

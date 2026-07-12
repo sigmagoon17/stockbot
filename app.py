@@ -1676,6 +1676,10 @@ def render_alpaca_account_status():
 
     st.divider()
     st.subheader("Paper Positions")
+    st.caption(
+        "Alpaca reports multi-leg orders as individual option-leg positions. "
+        "Market value and unrealized P/L below are leg-level values from Alpaca."
+    )
     positions, position_errors = get_alpaca_positions()
     for error in position_errors:
         st.warning(error)
@@ -1858,10 +1862,42 @@ def render_alpaca_account_status():
             for error in submit_errors:
                 st.error(error)
         else:
+            save_errors = append_alpaca_paper_orders(
+                [
+                    {
+                        "Candidate": (
+                            f"{selected_trade.ticker} {selected_trade.strategy} "
+                            f"{selected_trade.expiration} score {selected_scored.total_score}"
+                        ),
+                        "Symbol": order.get("symbol")
+                        or ("2-leg order" if len(legs) == 2 else "4-leg order"),
+                        "Status": order.get("status", "submitted"),
+                        "Message": (
+                            f"{quantity_type.title()} limit ${float(limit_price):.2f}; "
+                            f"order {order.get('id')}"
+                        ),
+                        "Order ID": order.get("id"),
+                        "Client Order ID": order.get("client_order_id"),
+                        "Ticker": selected_trade.ticker,
+                        "Strategy": selected_trade.strategy,
+                        "Expiration": selected_trade.expiration,
+                        "Setup Score": selected_scored.total_score,
+                        "Entry Type": selected_trade.entry_type,
+                        "Limit Price": float(limit_price),
+                        "Quantity": int(quantity),
+                        "Order Class": order.get("order_class") or "mleg",
+                        "Leg Key": leg_key_from_legs(legs)
+                        if leg_key_from_legs is not None
+                        else None,
+                    }
+                ]
+            )
             st.success(
                 f"Paper multi-leg order submitted: "
                 f"{order.get('qty')} contract(s), status {order.get('status')}"
             )
+            for error in save_errors:
+                st.warning(error)
             st.json(
                 {
                     "id": order.get("id"),
