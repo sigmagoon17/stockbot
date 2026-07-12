@@ -7,6 +7,7 @@ except ImportError:
     submit_scored_multileg_orders = None
 from event_analysis import get_deep_event_analysis, get_event_analysis
 from history_tracker import (
+    append_alpaca_paper_orders,
     append_scan_history,
     append_trade_snapshots,
     update_expired_history,
@@ -194,10 +195,11 @@ def main() -> int:
             print("Warning: Alpaca paper trading helper is unavailable.")
         else:
             paper_results = submit_scored_multileg_orders(
-                history_candidates,
+                scored_trades[:3],
                 quantity=env_int("ALPACA_PAPER_TRADE_QUANTITY", 1),
-                limit=env_int("ALPACA_PAPER_TRADE_LIMIT", 3),
+                limit=3,
             )
+            errors.extend(append_alpaca_paper_orders(paper_results))
             for result in paper_results:
                 print(
                     "Alpaca paper trade: "

@@ -28,6 +28,65 @@ def numeric_value(value) -> float | None:
         return None
 
 
+def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
+    rows = []
+    scan_timestamp = datetime.now(timezone.utc)
+    current_time = scan_timestamp.isoformat()
+    current_time_est = scan_timestamp.astimezone(
+        ZoneInfo("America/New_York")
+    ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+    for result in order_results:
+        if result.get("Status") in {"Skipped", "Error"}:
+            continue
+
+        rows.append(
+            {
+                "scan_time": current_time,
+                "scan_time_est": current_time_est,
+                "order_id": result.get("Order ID"),
+                "client_order_id": result.get("Client Order ID"),
+                "ticker": result.get("Ticker"),
+                "strategy": result.get("Strategy"),
+                "expiration": result.get("Expiration"),
+                "setup_score": result.get("Setup Score"),
+                "entry_type": result.get("Entry Type"),
+                "limit_price": result.get("Limit Price"),
+                "quantity": result.get("Quantity"),
+                "order_class": result.get("Order Class"),
+                "symbol": result.get("Symbol"),
+                "status": result.get("Status"),
+                "message": result.get("Message"),
+            }
+        )
+
+    if not rows:
+        return []
+
+    try:
+        supabase.table("alpaca_paper_orders").upsert(
+            rows,
+            on_conflict="client_order_id",
+        ).execute()
+        return []
+    except Exception as error:
+        return [f"Could not save Alpaca paper orders: {error}"]
+
+
+def fetch_alpaca_paper_orders(limit: int = 250) -> tuple[list[dict], list[str]]:
+    try:
+        response = (
+            supabase.table("alpaca_paper_orders")
+            .select("*")
+            .order("scan_time", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return response.data, []
+    except Exception as error:
+        return [], [f"Could not load Alpaca paper order history: {error}"]
+
+
 def append_scan_history(scored_trades, event_analyses=None, price_moves=None):
     event_analyses = event_analyses or {}
     price_moves = price_moves or {}

@@ -455,6 +455,16 @@ def submit_scored_multileg_orders(
                     f"{quantity_type.title()} limit ${limit_price:.2f}; "
                     f"order {order.get('id')}"
                 ),
+                "Order ID": order.get("id"),
+                "Client Order ID": order.get("client_order_id"),
+                "Ticker": trade.ticker,
+                "Strategy": trade.strategy,
+                "Expiration": trade.expiration,
+                "Setup Score": scored.total_score,
+                "Entry Type": trade.entry_type,
+                "Limit Price": limit_price,
+                "Quantity": quantity,
+                "Order Class": order.get("order_class") or "mleg",
             }
         )
 
@@ -464,7 +474,7 @@ def submit_scored_multileg_orders(
                 "Candidate": "Latest Scan",
                 "Symbol": "",
                 "Status": "Skipped",
-                "Message": "No debit candidates were available for paper trading.",
+                "Message": "No candidates were available for paper trading.",
             }
         )
 

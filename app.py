@@ -24,11 +24,13 @@ except ImportError:
     submit_scored_multileg_orders = None
 from history_tracker import (
     add_manual_position,
+    append_alpaca_paper_orders,
     append_scan_history as save_history,
     close_candidate,
     close_manual_position,
     delete_manual_position,
     fetch_completed_history,
+    fetch_alpaca_paper_orders,
     fetch_open_history,
     manual_position_rows_with_marks,
     update_expired_history as update_history,
@@ -1659,6 +1661,38 @@ def render_alpaca_account_status():
     else:
         st.info("No recent Alpaca paper orders.")
 
+    st.subheader("Paper Order Tracking")
+    paper_history, paper_history_errors = fetch_alpaca_paper_orders()
+    for error in paper_history_errors:
+        st.warning(error)
+    if paper_history:
+        paper_history_df = pd.DataFrame(paper_history)
+        paper_history_df["scan_time"] = pd.to_datetime(paper_history_df["scan_time"])
+        orders_by_scan = (
+            paper_history_df.sort_values("scan_time")
+            .groupby("scan_time", as_index=False)
+            .agg(
+                Orders=("id", "count"),
+                Average_Score=("setup_score", "mean"),
+            )
+        )
+        orders_by_scan["Average Score"] = orders_by_scan["Average_Score"].round(1)
+        st.line_chart(
+            orders_by_scan.set_index("scan_time")[["Orders", "Average Score"]],
+            height=260,
+        )
+
+        strategy_counts = (
+            paper_history_df.groupby("strategy", as_index=False)
+            .agg(Orders=("id", "count"))
+            .sort_values("Orders", ascending=False)
+        )
+        st.bar_chart(strategy_counts.set_index("strategy"), height=240)
+    else:
+        st.info(
+            "No Alpaca paper orders have been logged yet. Run the SQL file and then scan with paper auto trading enabled."
+        )
+
     st.divider()
     st.subheader("Paper Trade A Scan Candidate")
     st.caption(
@@ -1852,21 +1886,13 @@ with st.sidebar:
     if st.session_state.get("results_unlocked"):
         with st.expander("Alpaca Paper Auto Trading"):
             st.checkbox(
-                "Paper trade new scan debit candidates",
+                "Paper trade top 3 scan candidates",
                 key="auto_paper_trade_scans",
                 value=True,
                 help=(
-                    "After a manual scan, submit limit-buy paper orders for the "
-                    "long leg of tracked debit-spread candidates."
+                    "After a manual scan, submit Alpaca multi-leg paper orders for "
+                    "the three highest-scoring candidates."
                 ),
-            )
-            st.number_input(
-                "Max Paper Orders Per Scan",
-                min_value=1,
-                max_value=25,
-                value=3,
-                step=1,
-                key="auto_paper_trade_limit",
             )
             st.number_input(
                 "Contracts Per Paper Order",
@@ -1919,12 +1945,13 @@ if scan_button:
             st.session_state.get("results_unlocked")
             and st.session_state.get("auto_paper_trade_scans")
         ):
-            st.write("Submitting Alpaca paper orders for new debit candidates...")
+            st.write("Submitting Alpaca paper orders for the top 3 candidates...")
             paper_order_results = paper_trade_scan_candidates(
-                history_candidates,
+                scored_trades[:3],
                 quantity=int(st.session_state.get("auto_paper_trade_quantity", 1)),
-                limit=int(st.session_state.get("auto_paper_trade_limit", 3)),
+                limit=3,
             )
+            errors.extend(append_alpaca_paper_orders(paper_order_results))
         elif st.session_state.get("results_unlocked"):
             paper_order_results = [
                 {
