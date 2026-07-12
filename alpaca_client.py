@@ -197,6 +197,101 @@ def leg_key_from_legs(legs: list[dict]) -> str:
     )
 
 
+def ticker_from_option_symbol(symbol: str) -> str:
+    for index, character in enumerate(symbol):
+        if character.isdigit():
+            return symbol[:index]
+    return symbol
+
+
+def expiration_from_option_symbol(symbol: str) -> str | None:
+    for index, character in enumerate(symbol):
+        if character.isdigit():
+            expiration_code = symbol[index:index + 6]
+            if len(expiration_code) == 6:
+                return f"20{expiration_code[:2]}-{expiration_code[2:4]}-{expiration_code[4:6]}"
+            return None
+    return None
+
+
+def strategy_from_order_legs(legs: list[dict]) -> str:
+    symbols = [leg.get("symbol", "") for leg in legs]
+    sides = [leg.get("side") for leg in legs]
+    if len(legs) == 4:
+        return "iron condor"
+    if len(legs) != 2:
+        return "multi-leg option order"
+
+    option_type = "call" if "C" in symbols[0][-9:-8] else "put"
+    strikes = [int(symbol[-8:]) / 1000 for symbol in symbols]
+
+    if option_type == "call":
+        if sides == ["buy", "sell"] and strikes[0] < strikes[1]:
+            return "bull call debit spread"
+        if sides == ["buy", "sell"] and strikes[0] > strikes[1]:
+            return "call credit spread"
+    if option_type == "put":
+        if sides == ["buy", "sell"] and strikes[0] > strikes[1]:
+            return "bear put debit spread"
+        if sides == ["buy", "sell"] and strikes[0] < strikes[1]:
+            return "put credit spread"
+    return "multi-leg option order"
+
+
+def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
+    legs = order.get("legs") or []
+    if not legs:
+        return None
+
+    normalized_legs = [
+        {
+            "symbol": leg.get("symbol"),
+            "side": leg.get("side"),
+            "position_intent": leg.get("position_intent"),
+            "ratio_qty": leg.get("ratio_qty") or "1",
+        }
+        for leg in legs
+        if leg.get("symbol")
+    ]
+    if not normalized_legs:
+        return None
+
+    first_symbol = normalized_legs[0]["symbol"]
+    return {
+        "Candidate": "Alpaca backfill",
+        "Symbol": order.get("symbol") or (
+            "2-leg order" if len(normalized_legs) == 2 else "4-leg order"
+        ),
+        "Status": order.get("status", "accepted"),
+        "Message": f"Backfilled Alpaca order {order.get('id')}",
+        "Order ID": order.get("id"),
+        "Client Order ID": order.get("client_order_id"),
+        "Ticker": ticker_from_option_symbol(first_symbol),
+        "Strategy": strategy_from_order_legs(normalized_legs),
+        "Expiration": expiration_from_option_symbol(first_symbol),
+        "Setup Score": None,
+        "Entry Type": "credit" if float(order.get("limit_price") or 0) < 0 else "debit",
+        "Limit Price": float(order.get("limit_price") or 0),
+        "Quantity": int(float(order.get("qty") or 1)),
+        "Order Class": order.get("order_class") or "mleg",
+        "Leg Key": leg_key_from_legs(normalized_legs),
+    }
+
+
+def recent_alpaca_order_results(limit: int = 50) -> tuple[list[dict], list[str]]:
+    orders, errors = get_recent_alpaca_orders(limit)
+    if errors:
+        return [], errors
+    return [
+        result
+        for result in (
+            paper_order_result_from_alpaca_order(order)
+            for order in orders
+        )
+        if result is not None
+    ], []
+
+
 def get_alpaca_positions() -> tuple[list[dict], list[str]]:
     positions, errors = alpaca_request("GET", "/v2/positions")
     if errors:

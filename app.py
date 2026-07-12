@@ -14,6 +14,7 @@ from alpaca_client import (
     get_alpaca_account,
     get_alpaca_positions,
     get_recent_alpaca_orders,
+    recent_alpaca_order_results,
 )
 
 try:
@@ -1874,6 +1875,21 @@ def render_alpaca_account_status():
         st.info(
             "No Alpaca paper orders have been logged yet. Run the SQL file and then scan with paper auto trading enabled."
         )
+        if orders:
+            st.warning(
+                "Alpaca has recent paper orders, but Supabase has no logged paper-order rows yet."
+            )
+
+    if st.button("Backfill Recent Alpaca Orders To Supabase", width="stretch"):
+        backfill_results, backfill_errors = recent_alpaca_order_results(limit=50)
+        for error in backfill_errors:
+            st.error(error)
+        save_errors = append_alpaca_paper_orders(backfill_results)
+        for error in save_errors:
+            st.error(error)
+        if not backfill_errors and not save_errors:
+            st.success(f"Backfilled {len(backfill_results)} Alpaca paper orders.")
+            st.rerun()
 
     st.divider()
     st.subheader("Paper Trade A Scan Candidate")
