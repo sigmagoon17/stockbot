@@ -65,15 +65,40 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
         return []
 
     try:
-        conflict_key = (
-            "client_order_id"
-            if any(row.get("client_order_id") for row in rows)
-            else "leg_key"
+        existing_response = (
+            supabase.table("alpaca_paper_orders")
+            .select("order_id,client_order_id,leg_key")
+            .execute()
         )
-        supabase.table("alpaca_paper_orders").upsert(
-            rows,
-            on_conflict=conflict_key,
-        ).execute()
+        existing_keys = {
+            value
+            for row in existing_response.data
+            for value in (
+                row.get("order_id"),
+                row.get("client_order_id"),
+                row.get("leg_key"),
+            )
+            if value
+        }
+
+        new_rows = []
+        queued_keys = set()
+        for row in rows:
+            row_keys = {
+                row.get("order_id"),
+                row.get("client_order_id"),
+                row.get("leg_key"),
+            }
+            row_keys.discard(None)
+
+            if row_keys & existing_keys or row_keys & queued_keys:
+                continue
+
+            queued_keys.update(row_keys)
+            new_rows.append(row)
+
+        if new_rows:
+            supabase.table("alpaca_paper_orders").insert(new_rows).execute()
         return []
     except Exception as error:
         return [f"Could not save Alpaca paper orders: {error}"]
