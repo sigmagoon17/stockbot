@@ -6,6 +6,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from supabase import create_client
 
+from alpaca_client import get_alpaca_positions
 from stock2dupe import CONTRACT_MULTIPLIER
 
 
@@ -133,6 +134,113 @@ def fetch_alpaca_paper_leg_keys() -> tuple[set[str], list[str]]:
         }, []
     except Exception as error:
         return set(), [f"Could not load existing Alpaca paper leg keys: {error}"]
+
+
+def symbols_from_leg_key(leg_key: str | None) -> list[str]:
+    if not leg_key:
+        return []
+    return [
+        leg_part.split(":", 1)[0]
+        for leg_part in leg_key.split("|")
+        if leg_part
+    ]
+
+
+def append_alpaca_paper_snapshots() -> list[str]:
+    errors = []
+    paper_orders, order_errors = fetch_alpaca_paper_orders(limit=1000)
+    positions, position_errors = get_alpaca_positions()
+    errors.extend(order_errors)
+    errors.extend(position_errors)
+    if errors:
+        return errors
+    if not paper_orders:
+        return []
+
+    positions_by_symbol = {
+        position.get("symbol"): position
+        for position in positions
+        if position.get("symbol")
+    }
+    snapshot_timestamp = datetime.now(timezone.utc)
+    snapshot_time = snapshot_timestamp.isoformat()
+    snapshot_time_est = snapshot_timestamp.astimezone(
+        ZoneInfo("America/New_York")
+    ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    rows = []
+
+    for order in paper_orders:
+        symbols = symbols_from_leg_key(order.get("leg_key"))
+        if not symbols:
+            continue
+
+        matched_positions = [
+            positions_by_symbol[symbol]
+            for symbol in symbols
+            if symbol in positions_by_symbol
+        ]
+        current_value = sum(
+            numeric_value(position.get("market_value")) or 0
+            for position in matched_positions
+        )
+        unrealized_pnl = sum(
+            numeric_value(position.get("unrealized_pl")) or 0
+            for position in matched_positions
+        )
+        entry_basis = (
+            abs(numeric_value(order.get("limit_price")) or 0)
+            * int(order.get("quantity") or 1)
+            * CONTRACT_MULTIPLIER
+        )
+
+        rows.append(
+            {
+                "alpaca_paper_order_id": order.get("id"),
+                "snapshot_time": snapshot_time,
+                "snapshot_time_est": snapshot_time_est,
+                "order_id": order.get("order_id"),
+                "client_order_id": order.get("client_order_id"),
+                "ticker": order.get("ticker"),
+                "strategy": order.get("strategy"),
+                "expiration": order.get("expiration"),
+                "entry_type": order.get("entry_type"),
+                "limit_price": order.get("limit_price"),
+                "quantity": order.get("quantity"),
+                "current_value": round(current_value, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "unrealized_pnl_percent": (
+                    round(unrealized_pnl / entry_basis * 100, 2)
+                    if entry_basis > 0
+                    else None
+                ),
+                "matched_legs": len(matched_positions),
+                "total_legs": len(symbols),
+                "leg_key": order.get("leg_key"),
+            }
+        )
+
+    if not rows:
+        return []
+
+    try:
+        supabase.table("alpaca_paper_position_snapshots").insert(rows).execute()
+        return []
+    except Exception as error:
+        return [f"Could not save Alpaca paper position snapshots: {error}"]
+
+
+def fetch_alpaca_paper_snapshots(limit: int = 500) -> tuple[list[dict], list[str]]:
+    try:
+        response = (
+            supabase.table("alpaca_paper_position_snapshots")
+            .select("*")
+            .order("snapshot_time", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return response.data, []
+    except Exception as error:
+        return [], [f"Could not load Alpaca paper position snapshots: {error}"]
 
 
 def append_scan_history(scored_trades, event_analyses=None, price_moves=None):

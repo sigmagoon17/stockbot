@@ -14,6 +14,7 @@ except ImportError:
 from event_analysis import get_deep_event_analysis, get_event_analysis
 from history_tracker import (
     append_alpaca_paper_orders,
+    append_alpaca_paper_snapshots,
     append_scan_history,
     append_trade_snapshots,
     fetch_alpaca_paper_leg_keys,
@@ -279,6 +280,7 @@ def main() -> int:
                     f"{result['Status']} | {result['Symbol']} | {result['Message']}"
                 )
     errors.extend(append_trade_snapshots())
+    errors.extend(append_alpaca_paper_snapshots())
 
     print(f"Saved {len(history_candidates)} candidates from {len(scored_trades)} passing trades.")
     for error in errors:

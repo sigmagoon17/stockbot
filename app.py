@@ -44,13 +44,20 @@ from history_tracker import (
 try:
     from history_tracker import (
         append_alpaca_paper_orders,
+        append_alpaca_paper_snapshots,
         fetch_alpaca_paper_leg_keys,
         fetch_alpaca_paper_orders,
+        fetch_alpaca_paper_snapshots,
     )
 except ImportError:
     def append_alpaca_paper_orders(order_results):
         return [
             "Alpaca paper order tracking helpers are unavailable while the app finishes redeploying."
+        ]
+
+    def append_alpaca_paper_snapshots():
+        return [
+            "Alpaca paper snapshot helpers are unavailable while the app finishes redeploying."
         ]
 
     def fetch_alpaca_paper_leg_keys():
@@ -61,6 +68,11 @@ except ImportError:
     def fetch_alpaca_paper_orders(limit=250):
         return [], [
             "Alpaca paper order chart helpers are unavailable while the app finishes redeploying."
+        ]
+
+    def fetch_alpaca_paper_snapshots(limit=500):
+        return [], [
+            "Alpaca paper snapshot chart helpers are unavailable while the app finishes redeploying."
         ]
 
 from stock2dupe import (
@@ -1808,6 +1820,101 @@ def render_alpaca_account_status():
         )
     else:
         st.info("No logged Alpaca paper spreads match current open positions yet.")
+
+    snapshot_columns = st.columns([1, 2])
+    if snapshot_columns[0].button(
+        "Save Paper P/L Snapshot",
+        width="stretch",
+        help="Pull current Alpaca paper positions and save spread-level value/P&L to Supabase.",
+    ):
+        snapshot_errors = append_alpaca_paper_snapshots()
+        for error in snapshot_errors:
+            st.error(error)
+        if not snapshot_errors:
+            st.success("Saved the latest Alpaca paper P/L snapshot.")
+            st.rerun()
+
+    paper_snapshots, paper_snapshot_errors = fetch_alpaca_paper_snapshots()
+    for error in paper_snapshot_errors:
+        st.warning(error)
+
+    if paper_snapshots:
+        snapshot_df = pd.DataFrame(paper_snapshots)
+        snapshot_df["snapshot_time"] = pd.to_datetime(snapshot_df["snapshot_time"])
+        snapshot_df["Spread"] = (
+            snapshot_df["ticker"].fillna("")
+            + " "
+            + snapshot_df["strategy"].fillna("")
+            + " "
+            + snapshot_df["expiration"].astype(str)
+        )
+        latest_snapshot_df = (
+            snapshot_df.sort_values("snapshot_time")
+            .groupby("alpaca_paper_order_id", as_index=False)
+            .tail(1)
+        )
+        snapshot_metric_columns = st.columns(3)
+        snapshot_metric_columns[0].metric(
+            "Tracked Paper Spreads",
+            f"{latest_snapshot_df['alpaca_paper_order_id'].nunique()}",
+        )
+        snapshot_metric_columns[1].metric(
+            "Latest Snapshot Value",
+            f"${latest_snapshot_df['current_value'].fillna(0).sum():,.2f}",
+        )
+        snapshot_metric_columns[2].metric(
+            "Latest Snapshot P/L",
+            f"${latest_snapshot_df['unrealized_pnl'].fillna(0).sum():,.2f}",
+        )
+
+        pnl_chart_df = (
+            snapshot_df.pivot_table(
+                index="snapshot_time",
+                columns="Spread",
+                values="unrealized_pnl",
+                aggfunc="last",
+            )
+            .sort_index()
+        )
+        st.line_chart(pnl_chart_df, height=260)
+        st.dataframe(
+            latest_snapshot_df.reindex(
+                columns=[
+                    "snapshot_time_est",
+                    "ticker",
+                    "strategy",
+                    "expiration",
+                    "current_value",
+                    "unrealized_pnl",
+                    "unrealized_pnl_percent",
+                    "matched_legs",
+                    "total_legs",
+                ]
+            ).rename(
+                columns={
+                    "snapshot_time_est": "Snapshot Time",
+                    "ticker": "Ticker",
+                    "strategy": "Strategy",
+                    "expiration": "Expiration",
+                    "current_value": "Current Value",
+                    "unrealized_pnl": "Unrealized P/L",
+                    "unrealized_pnl_percent": "Unrealized P/L %",
+                    "matched_legs": "Matched Legs",
+                    "total_legs": "Total Legs",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Current Value": st.column_config.NumberColumn(format="$%.2f"),
+                "Unrealized P/L": st.column_config.NumberColumn(format="$%.2f"),
+                "Unrealized P/L %": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
+    else:
+        st.caption(
+            "No saved Alpaca paper P/L snapshots yet. Use the snapshot button after the SQL table is created."
+        )
 
     st.subheader("Recent Paper Orders")
     orders, order_errors = get_recent_alpaca_orders()
