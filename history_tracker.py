@@ -57,6 +57,7 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
                 "symbol": result.get("Symbol"),
                 "status": result.get("Status"),
                 "message": result.get("Message"),
+                "leg_key": result.get("Leg Key"),
             }
         )
 
@@ -85,6 +86,23 @@ def fetch_alpaca_paper_orders(limit: int = 250) -> tuple[list[dict], list[str]]:
         return response.data, []
     except Exception as error:
         return [], [f"Could not load Alpaca paper order history: {error}"]
+
+
+def fetch_alpaca_paper_leg_keys() -> tuple[set[str], list[str]]:
+    try:
+        response = (
+            supabase.table("alpaca_paper_orders")
+            .select("leg_key")
+            .not_.is_("leg_key", "null")
+            .execute()
+        )
+        return {
+            row["leg_key"]
+            for row in response.data
+            if row.get("leg_key")
+        }, []
+    except Exception as error:
+        return set(), [f"Could not load existing Alpaca paper leg keys: {error}"]
 
 
 def append_scan_history(scored_trades, event_analyses=None, price_moves=None):

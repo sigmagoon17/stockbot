@@ -187,6 +187,16 @@ def scan_client_order_id(scored) -> str:
     return f"scan-{scored_trade_paper_key(scored)}"[:48]
 
 
+def leg_key_from_legs(legs: list[dict]) -> str:
+    return "|".join(
+        (
+            f"{leg.get('symbol')}:{leg.get('side')}:"
+            f"{leg.get('position_intent')}:{leg.get('ratio_qty')}"
+        )
+        for leg in legs
+    )
+
+
 def get_alpaca_positions() -> tuple[list[dict], list[str]]:
     positions, errors = alpaca_request("GET", "/v2/positions")
     if errors:
@@ -403,6 +413,7 @@ def submit_scored_multileg_orders(
         )
         try:
             legs, limit_price, quantity_type = trade_multileg_order_details(scored)
+            leg_key = leg_key_from_legs(legs)
         except ValueError as error:
             results.append(
                 {
@@ -465,6 +476,7 @@ def submit_scored_multileg_orders(
                 "Limit Price": limit_price,
                 "Quantity": quantity,
                 "Order Class": order.get("order_class") or "mleg",
+                "Leg Key": leg_key,
             }
         )
 

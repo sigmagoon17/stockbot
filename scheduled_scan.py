@@ -2,14 +2,21 @@ import os
 from collections import Counter
 
 try:
-    from alpaca_client import submit_scored_multileg_orders
+    from alpaca_client import (
+        leg_key_from_legs,
+        submit_scored_multileg_orders,
+        trade_multileg_order_details,
+    )
 except ImportError:
+    leg_key_from_legs = None
     submit_scored_multileg_orders = None
+    trade_multileg_order_details = None
 from event_analysis import get_deep_event_analysis, get_event_analysis
 from history_tracker import (
     append_alpaca_paper_orders,
     append_scan_history,
     append_trade_snapshots,
+    fetch_alpaca_paper_leg_keys,
     update_expired_history,
 )
 from stock2dupe import (
@@ -94,6 +101,68 @@ def env_int(name: str, default: int) -> int:
         return int(value) if value else default
     except ValueError:
         return default
+
+
+def top_unplaced_paper_candidates(scored_trades, limit: int = 3):
+    if leg_key_from_legs is None or trade_multileg_order_details is None:
+        return [], [
+            {
+                "Candidate": "Duplicate Check",
+                "Symbol": "",
+                "Status": "Error",
+                "Message": "Alpaca multi-leg duplicate helpers are unavailable.",
+            }
+        ]
+
+    existing_leg_keys, errors = fetch_alpaca_paper_leg_keys()
+    selected = []
+    skipped = []
+
+    for scored in scored_trades:
+        trade = scored.trade
+        try:
+            legs, _, _ = trade_multileg_order_details(scored)
+            leg_key = leg_key_from_legs(legs)
+        except ValueError as error:
+            skipped.append(
+                {
+                    "Candidate": f"{trade.ticker} {trade.strategy}",
+                    "Symbol": "",
+                    "Status": "Skipped",
+                    "Message": str(error),
+                }
+            )
+            continue
+
+        if leg_key in existing_leg_keys:
+            skipped.append(
+                {
+                    "Candidate": (
+                        f"{trade.ticker} {trade.strategy} {trade.expiration} "
+                        f"score {scored.total_score}"
+                    ),
+                    "Symbol": "Multi-leg order",
+                    "Status": "Skipped",
+                    "Message": "Same expiration and legs were already paper traded.",
+                }
+            )
+            continue
+
+        selected.append(scored)
+        existing_leg_keys.add(leg_key)
+        if len(selected) == limit:
+            break
+
+    skipped.extend(
+        {
+            "Candidate": "Duplicate Check",
+            "Symbol": "",
+            "Status": "Error",
+            "Message": error,
+        }
+        for error in errors
+    )
+    return selected, skipped
 
 
 def main() -> int:
@@ -194,11 +263,15 @@ def main() -> int:
         if submit_scored_multileg_orders is None:
             print("Warning: Alpaca paper trading helper is unavailable.")
         else:
+            paper_candidates, duplicate_results = top_unplaced_paper_candidates(
+                scored_trades, limit=3
+            )
             paper_results = submit_scored_multileg_orders(
-                scored_trades[:3],
+                paper_candidates,
                 quantity=env_int("ALPACA_PAPER_TRADE_QUANTITY", 1),
                 limit=3,
             )
+            paper_results = duplicate_results + paper_results
             errors.extend(append_alpaca_paper_orders(paper_results))
             for result in paper_results:
                 print(

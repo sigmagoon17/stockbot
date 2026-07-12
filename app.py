@@ -14,27 +14,53 @@ from alpaca_client import (
     get_alpaca_account,
     get_alpaca_positions,
     get_recent_alpaca_orders,
-    submit_multileg_order,
-    trade_multileg_order_details,
 )
 
 try:
-    from alpaca_client import submit_scored_multileg_orders
+    from alpaca_client import (
+        leg_key_from_legs,
+        submit_multileg_order,
+        submit_scored_multileg_orders,
+        trade_multileg_order_details,
+    )
 except ImportError:
+    leg_key_from_legs = None
+    submit_multileg_order = None
     submit_scored_multileg_orders = None
+    trade_multileg_order_details = None
 from history_tracker import (
     add_manual_position,
-    append_alpaca_paper_orders,
     append_scan_history as save_history,
     close_candidate,
     close_manual_position,
     delete_manual_position,
     fetch_completed_history,
-    fetch_alpaca_paper_orders,
     fetch_open_history,
     manual_position_rows_with_marks,
     update_expired_history as update_history,
 )
+
+try:
+    from history_tracker import (
+        append_alpaca_paper_orders,
+        fetch_alpaca_paper_leg_keys,
+        fetch_alpaca_paper_orders,
+    )
+except ImportError:
+    def append_alpaca_paper_orders(order_results):
+        return [
+            "Alpaca paper order tracking helpers are unavailable while the app finishes redeploying."
+        ]
+
+    def fetch_alpaca_paper_leg_keys():
+        return set(), [
+            "Alpaca duplicate-check helpers are unavailable while the app finishes redeploying."
+        ]
+
+    def fetch_alpaca_paper_orders(limit=250):
+        return [], [
+            "Alpaca paper order chart helpers are unavailable while the app finishes redeploying."
+        ]
 
 from stock2dupe import (
     CONTRACT_MULTIPLIER,
@@ -726,6 +752,70 @@ def paper_trade_scan_candidates(
             "Message": "Alpaca multi-leg helper is unavailable.",
         }
     ]
+
+
+def top_unplaced_paper_candidates(scored_trades, limit: int = 3):
+    if leg_key_from_legs is None or trade_multileg_order_details is None:
+        return [], [
+            {
+                "Candidate": "Duplicate Check",
+                "Symbol": "",
+                "Status": "Error",
+                "Message": "Alpaca multi-leg duplicate helpers are unavailable while the app finishes redeploying.",
+            }
+        ]
+
+    existing_leg_keys, errors = fetch_alpaca_paper_leg_keys()
+    selected = []
+    skipped = []
+
+    for scored in scored_trades:
+        trade = scored.trade
+        try:
+            legs, _, _ = trade_multileg_order_details(scored)
+            leg_key = leg_key_from_legs(legs)
+        except ValueError as error:
+            skipped.append(
+                {
+                    "Candidate": f"{trade.ticker} {trade.strategy}",
+                    "Symbol": "",
+                    "Status": "Skipped",
+                    "Message": str(error),
+                }
+            )
+            continue
+
+        if leg_key in existing_leg_keys:
+            skipped.append(
+                {
+                    "Candidate": (
+                        f"{trade.ticker} {trade.strategy} {trade.expiration} "
+                        f"score {scored.total_score}"
+                    ),
+                    "Symbol": "Multi-leg order",
+                    "Status": "Skipped",
+                    "Message": "Same expiration and legs were already paper traded.",
+                }
+            )
+            continue
+
+        selected.append(scored)
+        existing_leg_keys.add(leg_key)
+        if len(selected) == limit:
+            break
+
+    if errors:
+        skipped.extend(
+            {
+                "Candidate": "Duplicate Check",
+                "Symbol": "",
+                "Status": "Error",
+                "Message": error,
+            }
+            for error in errors
+        )
+
+    return selected, skipped
 
 
 def debit_candidate_rows(scored_trades):
@@ -1703,6 +1793,11 @@ def render_alpaca_account_status():
     if not scan_output or not scan_output.get("scored_trades"):
         st.info("Run a scan first, then come back here to paper trade a candidate.")
         return
+    if submit_multileg_order is None or trade_multileg_order_details is None:
+        st.warning(
+            "Alpaca multi-leg order helpers are unavailable while the app finishes redeploying."
+        )
+        return
 
     paper_candidates = select_history_candidates(scan_output["scored_trades"])[:10]
     if not paper_candidates:
@@ -1946,11 +2041,15 @@ if scan_button:
             and st.session_state.get("auto_paper_trade_scans")
         ):
             st.write("Submitting Alpaca paper orders for the top 3 candidates...")
+            paper_candidates, duplicate_results = top_unplaced_paper_candidates(
+                scored_trades, limit=3
+            )
             paper_order_results = paper_trade_scan_candidates(
-                scored_trades[:3],
+                paper_candidates,
                 quantity=int(st.session_state.get("auto_paper_trade_quantity", 1)),
                 limit=3,
             )
+            paper_order_results = duplicate_results + paper_order_results
             errors.extend(append_alpaca_paper_orders(paper_order_results))
         elif st.session_state.get("results_unlocked"):
             paper_order_results = [

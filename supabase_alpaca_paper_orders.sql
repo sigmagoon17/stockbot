@@ -15,7 +15,8 @@ create table if not exists public.alpaca_paper_orders (
     order_class text,
     symbol text,
     status text,
-    message text
+    message text,
+    leg_key text
 );
 
 create index if not exists alpaca_paper_orders_scan_time_idx
@@ -25,3 +26,6 @@ create unique index if not exists alpaca_paper_orders_client_order_id_idx
     on public.alpaca_paper_orders(client_order_id)
     where client_order_id is not null;
 
+create unique index if not exists alpaca_paper_orders_leg_key_idx
+    on public.alpaca_paper_orders(leg_key)
+    where leg_key is not null;
