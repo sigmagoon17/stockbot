@@ -4,10 +4,7 @@ import hmac
 import os
 import pandas as pd
 import streamlit as st
-import datetime
-import supabase
 import time
-import yfinance as yf
 from types import SimpleNamespace
 
 from alpaca_client import (
@@ -85,8 +82,12 @@ from stock2dupe import (
     build_bear_put_debit_spread,
     condor_diagnostics,
     get_option_chain,
+    execution_selection_diagnostics,
     scan_trades,
+    select_execution_candidates,
+    strategy_direction,
 )
+from scanner_tracking import new_scan_run_id
 from stock_universe import prefilter_tickers
 
 try:
@@ -532,113 +533,6 @@ def prefilter_result_rows(results):
     return rows
 
 
-def expiration_close(ticker: str, expiration: date) -> float | None:
-    history = yf.Ticker(ticker).history(
-        start=expiration.isoformat(),
-        end=(expiration + datetime.timedelta(days=1)).isoformat(),
-        auto_adjust=False,
-    )
-    if history.empty:
-        return None
-    return round(float(history["Close"].iloc[-1]), 2)
-
-
-def expiration_pnl(row, closing_price: float) -> float | None:
-    strategy = row["strategy"]
-    long_strike = float(row["long_strike"])
-    short_strike = float(row["short_strike"])
-    width = abs(long_strike - short_strike)
-    max_risk = float(row["max_risk"])
-
-    if strategy == "bull call debit spread":
-        spread_value = max(0, min(closing_price - long_strike, width))
-        return round(spread_value * CONTRACT_MULTIPLIER - max_risk, 2)
-    if strategy == "bear put debit spread":
-        spread_value = max(0, min(long_strike - closing_price, width))
-        return round(spread_value * CONTRACT_MULTIPLIER - max_risk, 2)
-
-    credit = float(row["credit"])
-    if strategy == "put credit spread":
-        spread_loss = max(0, min(short_strike - closing_price, width))
-        return round(credit - spread_loss * CONTRACT_MULTIPLIER, 2)
-    if strategy == "call credit spread":
-        spread_loss = max(0, min(closing_price - short_strike, width))
-        return round(credit - spread_loss * CONTRACT_MULTIPLIER, 2)
-    if strategy == "iron condor":
-        put_short = float(row["put_short_strike"])
-        put_long = float(row["put_long_strike"])
-        call_short = float(row["call_short_strike"])
-        call_long = float(row["call_long_strike"])
-
-        put_width = put_short - put_long
-        call_width = call_long - call_short
-
-        put_loss = max(0, min(put_short - closing_price, put_width))
-        call_loss = max(0, min(closing_price - call_short, call_width))
-
-        credit = float(row["credit"])
-        return round(
-            credit - (put_loss + call_loss) * CONTRACT_MULTIPLIER,
-            2,
-        )
-    return None
-
-
-def update_expired_history() -> list[str]:
-    errors = []
-    closing_prices = {}
-    try:
-        response = (
-            supabase.table("scan_history")
-            .select("*")
-            .eq("expiration_status", "open")
-            .lt("expiration", date.today().isoformat())
-            .execute()
-        )
-    except Exception as error:
-        return [f"Could not read expiration results from Supabase: {error}"]
-
-    for row in response.data:
-        expiration = date.fromisoformat(row["expiration"])
-
-        price_key = (row["ticker"], expiration)
-        try:
-            if price_key not in closing_prices:
-                closing_prices[price_key] = expiration_close(*price_key)
-            closing_price = closing_prices[price_key]
-        except Exception as error:
-            errors.append(f"Could not update {row['ticker']} expiration result: {error}")
-            continue
-
-        if closing_price is None:
-            continue
-
-        pnl = expiration_pnl(row, closing_price)
-        if pnl is None:
-            update_values = {
-                "expiration_close": closing_price,
-                "expiration_status": "manual review",
-            }
-        else:
-            update_values = {
-                "expiration_close": closing_price,
-                "expiration_status": "expired",
-                "expiration_pnl": pnl,
-            }
-
-        try:
-            (
-                supabase.table("scan_history")
-                .update(update_values)
-                .eq("id", row["id"])
-                .execute()
-            )
-        except Exception as error:
-            errors.append(f"Could not save {row['ticker']} expiration result: {error}")
-
-    return errors
-
-
 def candidate_row(scored):
     trade = scored.trade
     return {
@@ -668,7 +562,9 @@ def candidate_row(scored):
         "Ticker Score": scored.normalized_ticker_score,
         "Quant Score": scored.quant_score,
         "Event Adjustment": scored.event_adjustment,
-        "Price Move Adjustment": scored.price_move_adjustment,
+        "Price Move Adjustment": scored.effective_price_move_adjustment,
+        "Raw Price Move Adjustment": scored.raw_price_move_adjustment,
+        "Base Score Without Price Move": scored.base_score_without_price_move,
         "Move Setup": scored.price_move_style,
         "Risk Level": scored.risk_level,
         "Realized Volatility Rank": round(trade.volatility_rank, 1),
@@ -677,6 +573,28 @@ def candidate_row(scored):
 
 def candidate_rows(scored_trades):
     return [candidate_row(scored) for scored in select_top_candidates(scored_trades)]
+
+
+def execution_candidate_rows(scored_trades):
+    rows = []
+    for rank, scored in enumerate(scored_trades, start=1):
+        trade = scored.trade
+        rows.append(
+            {
+                "Rank": scored.execution_rank or rank,
+                "Ticker": trade.ticker,
+                "Strategy": trade.strategy.title(),
+                "Direction": strategy_direction(trade.strategy).title(),
+                "Setup Score": scored.total_score,
+                "Ticker Score": scored.normalized_ticker_score,
+                "Quant Score": scored.quant_score,
+                "Event Adjustment": scored.event_adjustment,
+                "Price-Move Adjustment": scored.effective_price_move_adjustment,
+                "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
+                "Expiration": trade.expiration,
+            }
+        )
+    return rows
 
 
 def candidate_column_config():
@@ -712,6 +630,16 @@ def candidate_column_config():
             "Price Move Adjustment",
             help="Score change from recent stock movement. Directional strategies get credit when the move agrees with them and lose points when it does not.",
             format="%d",
+        ),
+        "Raw Price Move Adjustment": st.column_config.NumberColumn(
+            "Raw Price Move Adjustment",
+            help="Unmodified recent-price signal before the configured experiment mode.",
+            format="%d",
+        ),
+        "Base Score Without Price Move": st.column_config.NumberColumn(
+            "Base Score Without Price Move",
+            help="Quant score plus event adjustment before any recent-price signal.",
+            format="%d / 100",
         ),
         "Move Setup": st.column_config.TextColumn(
             "Move Setup",
@@ -749,6 +677,8 @@ def paper_trade_scan_candidates(
     scored_candidates,
     quantity: int,
     limit: int,
+    exit_policy: str = "none",
+    scan_run_id: str | None = None,
 ) -> list[dict]:
     paper_traded_keys = st.session_state.setdefault("paper_traded_scan_keys", set())
     fresh_candidates = []
@@ -777,6 +707,8 @@ def paper_trade_scan_candidates(
             fresh_candidates,
             quantity=quantity,
             limit=limit,
+            exit_policy=exit_policy,
+            scan_run_id=scan_run_id,
         )
 
     if not fresh_candidates and not skipped_results:
@@ -986,6 +918,9 @@ def credit_candidate_rows(scored_trades):
 
 def render_scan_output(scan_output):
     scored_trades = scan_output["scored_trades"]
+    execution_candidates = scan_output.get("execution_candidates") or (
+        select_execution_candidates(scored_trades, limit=3)
+    )
     rejected_trades = scan_output["rejected_trades"]
     trades = scan_output["trades"]
     ticker_data = scan_output["ticker_data"]
@@ -1028,7 +963,7 @@ def render_scan_output(scan_output):
     candidate_analyses = scan_output.get("candidate_analyses", {})
     if candidate_analyses:
         st.subheader("AI Review Of Top Candidates")
-        for index, scored in enumerate(scored_trades[:3], start=1):
+        for index, scored in enumerate(execution_candidates, start=1):
             trade = scored.trade
             analysis = candidate_analyses.get(candidate_analysis_key(scored))
             if analysis is None:
@@ -1055,6 +990,26 @@ def render_scan_output(scan_output):
     )
 
     with candidates_tab:
+        st.subheader("Execution Top 3")
+        st.caption(
+            "These are the distinct-ticker candidates used for AI review and "
+            "Alpaca paper auto-trading. The full table below keeps the best setup "
+            "for every ticker and strategy."
+        )
+        execution_rows = execution_candidate_rows(execution_candidates)
+        if execution_rows:
+            st.dataframe(
+                pd.DataFrame(execution_rows),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    **candidate_column_config(),
+                    "Max Risk": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+        else:
+            st.info("No distinct-ticker execution candidates passed the filters.")
+
         st.subheader("Top Candidates")
         candidates = candidate_rows(scored_trades)
         if candidates:
@@ -1109,7 +1064,7 @@ def render_scan_output(scan_output):
         debit_column, credit_column = st.columns(2)
         with debit_column:
             st.subheader("Best Debit Spreads")
-            debit_candidates = debit_candidate_rows(scored_trades)
+            debit_candidates = debit_candidate_rows(execution_candidates)
             if debit_candidates:
                 st.dataframe(
                     pd.DataFrame(debit_candidates),
@@ -1122,7 +1077,7 @@ def render_scan_output(scan_output):
 
         with credit_column:
             st.subheader("Best Credit Spreads")
-            credit_candidates = credit_candidate_rows(scored_trades)
+            credit_candidates = credit_candidate_rows(execution_candidates)
             if credit_candidates:
                 st.dataframe(
                     pd.DataFrame(credit_candidates),
@@ -1168,6 +1123,19 @@ def render_scan_output(scan_output):
         )
 
     with diagnostics_tab:
+        st.subheader("Execution Selection Diagnostics")
+        st.dataframe(
+            pd.DataFrame(
+                execution_selection_diagnostics(
+                    scored_trades,
+                    execution_candidates,
+                    requested_limit=3,
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
         st.subheader("Condor Diagnostics")
         if condor_diagnostic_rows:
             st.dataframe(
@@ -1295,27 +1263,48 @@ def ticker_rejection_rows(trades, rejected_trades, scored_trades):
 
 
 def outcome_summary(results, group_column: str, label: str):
-    summary = (
-        results.groupby(group_column, observed=True, as_index=False)
-        .agg(
-            Candidates=("id", "count"),
-            Win_Rate=("Outcome P/L", lambda pnl: (pnl > 0).mean() * 100),
-            Average_PnL=("Outcome P/L", "mean"),
-            Total_PnL=("Outcome P/L", "sum"),
-        )
-        .rename(
-            columns={
-                group_column: label,
-                "Win_Rate": "Win Rate",
-                "Average_PnL": "Average P/L",
-                "Total_PnL": "Total P/L",
+    rows = []
+    for group_value, group in results.groupby(group_column, observed=True, dropna=False):
+        pnl = pd.to_numeric(group["Outcome P/L"], errors="coerce").dropna()
+        return_on_risk = pd.to_numeric(
+            group["Realized Return On Risk"], errors="coerce"
+        ).dropna()
+        wins = pnl[pnl > 0].sum()
+        losses = abs(pnl[pnl < 0].sum())
+        sample_size = len(pnl)
+        rows.append(
+            {
+                label: "Not recorded" if pd.isna(group_value) else group_value,
+                "Recommendation Occurrences": sample_size,
+                "Unique Setups": group["setup_key"].nunique(dropna=True),
+                "Sample Status": (
+                    "insufficient sample" if sample_size < 10 else "usable sample"
+                ),
+                "Win Rate": round((pnl > 0).mean() * 100, 1) if sample_size else None,
+                "Average Return On Risk": round(return_on_risk.mean(), 2)
+                if not return_on_risk.empty
+                else None,
+                "Median Return On Risk": round(return_on_risk.median(), 2)
+                if not return_on_risk.empty
+                else None,
+                "Profit Factor": round(wins / losses, 2) if losses > 0 else None,
+                "Average P/L": round(pnl.mean(), 2) if sample_size else None,
+                "Median P/L": round(pnl.median(), 2) if sample_size else None,
+                "Median MFE": round(
+                    pd.to_numeric(
+                        group["maximum_favorable_excursion"], errors="coerce"
+                    ).median(),
+                    2,
+                ),
+                "Median MAE": round(
+                    pd.to_numeric(
+                        group["maximum_adverse_excursion"], errors="coerce"
+                    ).median(),
+                    2,
+                ),
             }
         )
-    )
-    summary["Win Rate"] = summary["Win Rate"].round(1)
-    summary["Average P/L"] = summary["Average P/L"].round(2)
-    summary["Total P/L"] = summary["Total P/L"].round(2)
-    return summary
+    return pd.DataFrame(rows)
 
 
 def render_results():
@@ -1356,6 +1345,8 @@ def render_results():
         open_candidates = open_candidates.reindex(
             columns=[
                 "Scan Time",
+                "scan_run_id",
+                "setup_key",
                 "ticker",
                 "strategy",
                 "expiration",
@@ -1373,6 +1364,11 @@ def render_results():
                 "move_setup",
                 "event_label",
                 "event_confidence",
+                "execution_selected",
+                "execution_rank",
+                "times_recommended",
+                "expiration_status",
+                "last_update_error",
             ]
         ).rename(
             columns={
@@ -1392,6 +1388,13 @@ def render_results():
                 "move_setup": "Move Setup",
                 "event_label": "Event Label",
                 "event_confidence": "Event Confidence",
+                "scan_run_id": "Scan Run ID",
+                "setup_key": "Setup Key",
+                "execution_selected": "Execution Selected",
+                "execution_rank": "Execution Rank",
+                "times_recommended": "Times Recommended",
+                "expiration_status": "Outcome Status",
+                "last_update_error": "Tracking Error",
             }
         )
         st.dataframe(
@@ -1483,10 +1486,38 @@ def render_results():
         return
 
     results = pd.DataFrame(result_rows)
-    results["expiration_pnl"] = pd.to_numeric(results["expiration_pnl"])
-    results["actual_realized_pnl"] = pd.to_numeric(results["actual_realized_pnl"])
-    results["Outcome P/L"] = results["actual_realized_pnl"].fillna(
-        results["expiration_pnl"]
+    for column in (
+        "realized_pnl",
+        "actual_realized_pnl",
+        "expiration_pnl",
+        "realized_return_on_risk",
+        "max_risk",
+        "setup_score",
+        "quant_score",
+        "event_adjustment",
+        "effective_price_move_adjustment",
+        "dte",
+        "volatility_rank",
+        "maximum_favorable_excursion",
+        "maximum_adverse_excursion",
+    ):
+        if column not in results:
+            results[column] = None
+        results[column] = pd.to_numeric(results[column], errors="coerce")
+    if "setup_key" not in results:
+        results["setup_key"] = results["id"].map(lambda value: f"legacy-{value}")
+    results["setup_key"] = results["setup_key"].fillna(
+        results["id"].map(lambda value: f"legacy-{value}")
+    )
+    results["Outcome P/L"] = results["realized_pnl"].fillna(
+        results["actual_realized_pnl"]
+    ).fillna(results["expiration_pnl"])
+    results["Realized Return On Risk"] = results["realized_return_on_risk"]
+    missing_return = results["Realized Return On Risk"].isna() & (results["max_risk"] > 0)
+    results.loc[missing_return, "Realized Return On Risk"] = (
+        results.loc[missing_return, "Outcome P/L"]
+        / results.loc[missing_return, "max_risk"]
+        * 100
     )
 
     completed_count = len(results)
@@ -1498,6 +1529,15 @@ def render_results():
     metric_columns[1].metric("Win Rate", f"{win_rate:.1f}%")
     metric_columns[2].metric("Average Outcome P/L", f"${average_pnl:.2f}")
     metric_columns[3].metric("Total Outcome P/L", f"${total_pnl:.2f}")
+
+    count_columns = st.columns(2)
+    count_columns[0].metric("Recommendation Occurrences", completed_count)
+    count_columns[1].metric("Unique Setups", results["setup_key"].nunique())
+    st.caption(
+        "Occurrences count every scan recommendation. Unique setups collapse "
+        "repeated recommendations with the same expiration and legs. Groups with "
+        "fewer than 10 closed trades are marked insufficient sample."
+    )
 
     results["Score Band"] = pd.cut(
         results["setup_score"],
@@ -1524,6 +1564,80 @@ def render_results():
     ] = "Positive"
     event_results = outcome_summary(
         results, "Event Adjustment Group", "Event Adjustment"
+    )
+    results["Quant Score Band"] = pd.cut(
+        results["quant_score"],
+        bins=[-1, 59, 69, 79, 89, 100],
+        labels=["Below 60", "60-69", "70-79", "80-89", "90-100"],
+    )
+    results["DTE Band"] = pd.cut(
+        results["dte"],
+        bins=[-1, 20, 30, 45, 60, 10000],
+        labels=["0-20", "21-30", "31-45", "46-60", "61+"],
+    )
+    results["Realized Volatility Rank Band"] = pd.cut(
+        results["volatility_rank"],
+        bins=[-1, 34, 49, 64, 79, 100],
+        labels=["Below 35", "35-49", "50-64", "65-79", "80-100"],
+    )
+    results["Event Adjustment Band"] = pd.cut(
+        results["event_adjustment"],
+        bins=[-100, -1, 0, 1, 100],
+        labels=["Negative", "Neutral", "Slight positive", "Positive"],
+    )
+    results["Price-Move Adjustment Band"] = pd.cut(
+        results["effective_price_move_adjustment"],
+        bins=[-100, -1, 0, 1, 3, 100],
+        labels=["Negative", "Neutral", "+1", "+2 to +3", "Above +3"],
+    )
+    for column, fallback in (
+        ("move_setup", "Not recorded"),
+        ("scanner_version", "legacy"),
+        ("selection_method", "raw"),
+    ):
+        if column not in results:
+            results[column] = fallback
+        results[column] = results[column].fillna(fallback)
+
+    analytics_segments = {
+        "Ticker": ("ticker", "Ticker"),
+        "Strategy": ("strategy", "Strategy"),
+        "Setup Score Band": ("Score Band", "Setup Score Band"),
+        "Quant Score Band": ("Quant Score Band", "Quant Score Band"),
+        "Event Adjustment": ("Event Adjustment Band", "Event Adjustment"),
+        "Price-Move Adjustment": (
+            "Price-Move Adjustment Band",
+            "Price-Move Adjustment",
+        ),
+        "Move Classification": ("move_setup", "Move Classification"),
+        "DTE": ("DTE Band", "DTE"),
+        "Realized Volatility Rank": (
+            "Realized Volatility Rank Band",
+            "Realized Volatility Rank",
+        ),
+        "Scanner Version": ("scanner_version", "Scanner Version"),
+        "Selection Method": ("selection_method", "Selection Method"),
+    }
+    st.subheader("Closed Outcome Analytics")
+    selected_segment = st.selectbox(
+        "Analyze closed results by",
+        list(analytics_segments),
+        key="closed_analytics_segment",
+    )
+    group_column, group_label = analytics_segments[selected_segment]
+    st.dataframe(
+        outcome_summary(results, group_column, group_label),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
+            "Average Return On Risk": st.column_config.NumberColumn(format="%.2f%%"),
+            "Median Return On Risk": st.column_config.NumberColumn(format="%.2f%%"),
+            "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Median P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Median MFE": st.column_config.NumberColumn(format="$%.2f"),
+            "Median MAE": st.column_config.NumberColumn(format="$%.2f"),
+        },
     )
     if "unusual_move" not in results:
         results["unusual_move"] = None
@@ -1953,6 +2067,10 @@ def render_alpaca_account_status():
                     "current_value",
                     "unrealized_pnl",
                     "unrealized_pnl_percent",
+                    "exit_policy",
+                    "target_value_per_share",
+                    "current_value_per_share",
+                    "exit_signal",
                     "matched_legs",
                     "total_legs",
                 ]
@@ -1965,6 +2083,10 @@ def render_alpaca_account_status():
                     "current_value": "Current Value",
                     "unrealized_pnl": "Unrealized P/L",
                     "unrealized_pnl_percent": "Unrealized P/L %",
+                    "exit_policy": "Exit Policy",
+                    "target_value_per_share": "TP Target / Share",
+                    "current_value_per_share": "Current / Share",
+                    "exit_signal": "Exit Signal",
                     "matched_legs": "Matched Legs",
                     "total_legs": "Total Legs",
                 }
@@ -1975,6 +2097,8 @@ def render_alpaca_account_status():
                 "Current Value": st.column_config.NumberColumn(format="$%.2f"),
                 "Unrealized P/L": st.column_config.NumberColumn(format="$%.2f"),
                 "Unrealized P/L %": st.column_config.NumberColumn(format="%.2f%%"),
+                "TP Target / Share": st.column_config.NumberColumn(format="$%.2f"),
+                "Current / Share": st.column_config.NumberColumn(format="$%.2f"),
             },
         )
     else:
@@ -2044,6 +2168,47 @@ def render_alpaca_account_status():
             .sort_values("Orders", ascending=False)
         )
         st.bar_chart(strategy_counts.set_index("strategy"), height=240)
+        st.dataframe(
+            paper_history_df.reindex(
+                columns=[
+                    "scan_time_est",
+                    "ticker",
+                    "strategy",
+                    "setup_score",
+                    "execution_rank",
+                    "exit_policy",
+                    "status",
+                    "position_status",
+                    "close_order_status",
+                    "exit_reason",
+                    "exit_fill_price",
+                    "realized_pnl",
+                    "last_exit_error",
+                ]
+            ).rename(
+                columns={
+                    "scan_time_est": "Scan Time",
+                    "ticker": "Ticker",
+                    "strategy": "Strategy",
+                    "setup_score": "Setup Score",
+                    "execution_rank": "Execution Rank",
+                    "exit_policy": "Exit Policy",
+                    "status": "Entry Status",
+                    "position_status": "Position Status",
+                    "close_order_status": "Close Status",
+                    "exit_reason": "Exit Reason",
+                    "exit_fill_price": "Exit Fill",
+                    "realized_pnl": "Realized P/L",
+                    "last_exit_error": "Exit Error",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Exit Fill": st.column_config.NumberColumn(format="$%.2f"),
+                "Realized P/L": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
     else:
         st.info(
             "No Alpaca paper orders have been logged yet. Run the SQL file and then scan with paper auto trading enabled."
@@ -2350,7 +2515,19 @@ with st.sidebar:
             step=5,
             disabled=not use_prefilter,
         )
+    price_move_mode = "Full"
     if st.session_state.get("results_unlocked"):
+        with st.expander("Scoring Experiments"):
+            price_move_mode = st.selectbox(
+                "Price-Move Adjustment Mode",
+                ["Full", "Conservative", "Shadow", "Off"],
+                index=0,
+                help=(
+                    "Full uses the current signal. Conservative caps positive "
+                    "bonuses at +3. Shadow records the signal without changing "
+                    "the score. Off disables it."
+                ),
+            )
         with st.expander("Alpaca Paper Auto Trading"):
             st.checkbox(
                 "Paper trade top 3 scan candidates",
@@ -2369,6 +2546,17 @@ with st.sidebar:
                 step=1,
                 key="auto_paper_trade_quantity",
             )
+            st.selectbox(
+                "Automatic Paper Exit",
+                [
+                    "No automatic exit",
+                    "Take profit at 50% of maximum profit",
+                    "Take profit at 75% of maximum profit",
+                ],
+                index=0,
+                key="paper_exit_policy_label",
+                help="Applies only to new Alpaca paper trades. No hard stop is enabled.",
+            )
     scan_button = st.button("Scan Watchlist", type="primary", width="stretch")
 
 if scan_button:
@@ -2385,6 +2573,7 @@ if scan_button:
         risk_tolerance=risk_tolerance,
         test_expiration=test_expiration,
         nearest_expiration=use_nearest_expiration,
+        price_move_mode=price_move_mode,
     )
     with st.status("Scanning watchlist...", expanded=True) as scan_status:
         prefilter_rows = []
@@ -2441,11 +2630,17 @@ if scan_button:
             price_moves,
         ) = scan_watchlist(tickers, preferences)
         st.session_state["latest_event_analyses"] = event_analyses
+        execution_candidates = select_execution_candidates(scored_trades, limit=3)
 
         st.write("Saving tracked candidates and updating snapshots...")
         history_candidates = select_history_candidates(scored_trades)
+        scan_run_id = new_scan_run_id()
         history_save_errors = save_history(
-            history_candidates, event_analyses, price_moves
+            history_candidates,
+            event_analyses,
+            price_moves,
+            execution_candidates=execution_candidates,
+            scan_run_id=scan_run_id,
         )
         errors = history_errors + errors + history_save_errors
 
@@ -2456,12 +2651,21 @@ if scan_button:
         ):
             st.write("Submitting Alpaca paper orders for the top 3 candidates...")
             paper_candidates, duplicate_results = top_unplaced_paper_candidates(
-                scored_trades, limit=3
+                execution_candidates, limit=3
             )
+            exit_policy_by_label = {
+                "No automatic exit": "none",
+                "Take profit at 50% of maximum profit": "tp50",
+                "Take profit at 75% of maximum profit": "tp75",
+            }
             paper_order_results = paper_trade_scan_candidates(
                 paper_candidates,
                 quantity=int(st.session_state.get("auto_paper_trade_quantity", 1)),
                 limit=3,
+                exit_policy=exit_policy_by_label.get(
+                    st.session_state.get("paper_exit_policy_label"), "none"
+                ),
+                scan_run_id=scan_run_id,
             )
             paper_order_results = duplicate_results + paper_order_results
             errors.extend(append_alpaca_paper_orders(paper_order_results))
@@ -2486,7 +2690,7 @@ if scan_button:
 
         st.write("Reviewing the top 3 candidates with AI...")
         candidate_analyses = {}
-        for scored in scored_trades[:3]:
+        for scored in execution_candidates:
             trade = scored.trade
             candidate_analyses[candidate_analysis_key(scored)] = (
                 get_cached_candidate_analysis(
@@ -2498,6 +2702,8 @@ if scan_button:
         scan_status.update(label="Scan complete", state="complete", expanded=False)
     st.session_state["last_scan_output"] = {
         "scored_trades": scored_trades,
+        "execution_candidates": execution_candidates,
+        "scan_run_id": scan_run_id,
         "rejected_trades": rejected_trades,
         "trades": trades,
         "ticker_data": ticker_data,

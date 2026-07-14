@@ -14,6 +14,16 @@ except ImportError:
 
 CONTRACT_MULTIPLIER = 100
 MAX_SETUP_SCORE = 125
+PRICE_MOVE_MODES = {"Full", "Conservative", "Shadow", "Off"}
+BULLISH_STRATEGIES = {
+    "put credit spread",
+    "bull call debit spread",
+}
+BEARISH_STRATEGIES = {
+    "call credit spread",
+    "bear put debit spread",
+}
+NEUTRAL_STRATEGIES = {"iron condor"}
 YFINANCE_CACHE_DIR = Path(__file__).with_name(".yfinance-cache")
 YFINANCE_CACHE_DIR.mkdir(exist_ok=True)
 yf.set_tz_cache_location(YFINANCE_CACHE_DIR)
@@ -26,6 +36,7 @@ class ScanPreferences:
     risk_tolerance: str #conservative, moderate, aggressive
     test_expiration: date | None = None
     nearest_expiration: bool = False
+    price_move_mode: str = "Full"
 
 
 
@@ -388,12 +399,18 @@ class ScoredTrade:
     category_scores: dict[str, int]
     quant_score: int
     event_adjustment: int
+    raw_price_move_adjustment: int
+    effective_price_move_adjustment: int
     price_move_adjustment: int
     price_move_style: str
+    base_score_without_price_move: int
     total_score: int
     reasons: list[str]
     explanation: str
     normalized_ticker_score: int = 0
+    raw_rank: int | None = None
+    diversified_rank: int | None = None
+    execution_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -408,6 +425,25 @@ class CondorDiagnostics:
     valid_order_pairs: int
     built_condors: int
     top_reason: str
+
+
+def strategy_direction(strategy: str) -> str:
+    normalized = strategy.lower().strip()
+    if normalized in BULLISH_STRATEGIES:
+        return "bullish"
+    if normalized in BEARISH_STRATEGIES:
+        return "bearish"
+    if normalized in NEUTRAL_STRATEGIES:
+        return "neutral"
+    return "unknown"
+
+
+def scored_trade_sort_key(scored: ScoredTrade) -> tuple[int, int, int]:
+    return (
+        scored.total_score,
+        scored.normalized_ticker_score,
+        scored.quant_score,
+    )
 
 def strategy_fit_score(trade: Trade, preferences: ScanPreferences) -> int:
     if preferences.outlook == "bullish":
@@ -763,6 +799,19 @@ def price_move_adjustment(
     return adjustment
 
 
+def apply_price_move_mode(raw_adjustment: int, mode: str) -> tuple[int, int]:
+    normalized_mode = mode.title()
+    if normalized_mode not in PRICE_MOVE_MODES:
+        normalized_mode = "Full"
+    if normalized_mode == "Off":
+        return 0, 0
+    if normalized_mode == "Shadow":
+        return raw_adjustment, 0
+    if normalized_mode == "Conservative":
+        return raw_adjustment, min(raw_adjustment, 3)
+    return raw_adjustment, raw_adjustment
+
+
 def score_trade(
     trade: Trade,
     preferences: ScanPreferences,
@@ -781,10 +830,19 @@ def score_trade(
     }
     raw_total_score = sum(category_scores.values())
     quant_score = max(0, min(100, round(raw_total_score / MAX_SETUP_SCORE * 100)))
-    price_adjustment, price_style = price_move_signal(
+    calculated_price_adjustment, price_style = price_move_signal(
         trade, price_move, event_label
     )
-    total_score = max(0, min(100, quant_score + event_adjustment + price_adjustment))
+    raw_price_adjustment, effective_price_adjustment = apply_price_move_mode(
+        calculated_price_adjustment,
+        preferences.price_move_mode,
+    )
+    base_score_without_price_move = max(
+        0, min(100, quant_score + event_adjustment)
+    )
+    total_score = max(
+        0, min(100, base_score_without_price_move + effective_price_adjustment)
+    )
     reasons = passing_reasons(trade)
 
     return ScoredTrade(
@@ -793,8 +851,11 @@ def score_trade(
         category_scores=category_scores,
         quant_score=quant_score,
         event_adjustment=event_adjustment,
-        price_move_adjustment=price_adjustment,
+        raw_price_move_adjustment=raw_price_adjustment,
+        effective_price_move_adjustment=effective_price_adjustment,
+        price_move_adjustment=effective_price_adjustment,
         price_move_style=price_style,
+        base_score_without_price_move=base_score_without_price_move,
         total_score=total_score,
         reasons=reasons,
         explanation=beginner_explanation(trade, category_scores),
@@ -866,7 +927,7 @@ def remove_similar_spreads(scored_trades: list[ScoredTrade]) -> list[ScoredTrade
     selected = []
     for scored in sorted(
         scored_trades,
-        key=lambda candidate: candidate.total_score,
+        key=scored_trade_sort_key,
         reverse=True,
     ):
         if any(similar_spread(scored, existing) for existing in selected):
@@ -883,18 +944,93 @@ def diversify_scored_trades(scored_trades: list[ScoredTrade]) -> list[ScoredTrad
     for scored in normalized:
         key = (scored.trade.ticker, scored.trade.strategy)
         current_best = best_by_ticker_strategy.get(key)
-        if current_best is None or scored.total_score > current_best.total_score:
+        if current_best is None or scored_trade_sort_key(scored) > scored_trade_sort_key(
+            current_best
+        ):
             best_by_ticker_strategy[key] = scored
 
-    return sorted(
+    ranked = sorted(
         best_by_ticker_strategy.values(),
-        key=lambda scored: (
-            scored.total_score,
-            scored.normalized_ticker_score,
-            scored.quant_score,
-        ),
+        key=scored_trade_sort_key,
         reverse=True,
     )
+    return [
+        replace(scored, diversified_rank=rank)
+        for rank, scored in enumerate(ranked, start=1)
+    ]
+
+
+def select_execution_candidates(
+    scored_trades: list[ScoredTrade],
+    limit: int = 3,
+    max_per_ticker: int = 1,
+) -> list[ScoredTrade]:
+    if limit <= 0 or max_per_ticker <= 0:
+        return []
+
+    selected = []
+    selected_by_ticker = Counter()
+    for scored in sorted(scored_trades, key=scored_trade_sort_key, reverse=True):
+        ticker = scored.trade.ticker
+        if selected_by_ticker[ticker] >= max_per_ticker:
+            continue
+        selected.append(replace(scored, execution_rank=len(selected) + 1))
+        selected_by_ticker[ticker] += 1
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def execution_selection_diagnostics(
+    scored_trades: list[ScoredTrade],
+    selected_trades: list[ScoredTrade],
+    requested_limit: int = 3,
+) -> list[dict[str, str | int]]:
+    selected_tickers = {scored.trade.ticker for scored in selected_trades}
+    selected_keys = {
+        (scored.trade.ticker, scored.trade.strategy, scored.trade.expiration)
+        for scored in selected_trades
+    }
+    diagnostics = []
+    for scored in scored_trades:
+        key = (
+            scored.trade.ticker,
+            scored.trade.strategy,
+            scored.trade.expiration,
+        )
+        if key in selected_keys:
+            continue
+        if scored.trade.ticker in selected_tickers:
+            diagnostics.append(
+                {
+                    "Ticker": scored.trade.ticker,
+                    "Strategy": scored.trade.strategy.title(),
+                    "Reason": (
+                        "Ticker already selected; this was a lower-ranked strategy "
+                        "for the same ticker."
+                    ),
+                }
+            )
+
+    diagnostics.append(
+        {
+            "Ticker": "All",
+            "Strategy": "Near duplicates",
+            "Reason": "Duplicate or similar spreads were removed before execution selection.",
+        }
+    )
+    if len(selected_trades) < requested_limit:
+        diagnostics.append(
+            {
+                "Ticker": "All",
+                "Strategy": "Execution selection",
+                "Reason": (
+                    f"Only {len(selected_trades)} distinct ticker(s) were available "
+                    f"for {requested_limit} requested slots."
+                ),
+            }
+        )
+    return diagnostics
 
 
 def passing_reasons(trade: Trade) -> list[str]:
@@ -1029,7 +1165,11 @@ def scan_trades(
         else:
             rejected.append((trade, reasons))
 
-    passing.sort(key=lambda scored_trade: scored_trade.total_score, reverse=True)
+    passing.sort(key=scored_trade_sort_key, reverse=True)
+    passing = [
+        replace(scored, raw_rank=rank)
+        for rank, scored in enumerate(passing, start=1)
+    ]
     return diversify_scored_trades(passing), rejected
 
 def build_put_credit_spreads(
@@ -1642,8 +1782,11 @@ def ranking_test_scored(
         category_scores={},
         quant_score=score,
         event_adjustment=0,
+        raw_price_move_adjustment=0,
+        effective_price_move_adjustment=0,
         price_move_adjustment=0,
         price_move_style="normal",
+        base_score_without_price_move=score,
         total_score=score,
         reasons=[],
         explanation="ranking test",
@@ -1758,6 +1901,74 @@ def test_diversified_ranking() -> None:
     test_diversified_ranking_iron_condor_similarity()
     test_diversified_ranking_highest_score_survives_deduplication()
     print("Diversified ranking tests passed.")
+
+
+def test_execution_selection() -> None:
+    displayed = diversify_scored_trades(
+        [
+            ranking_test_scored("SPY", "bull call debit spread", 91, 605, 600),
+            ranking_test_scored("SPY", "bear put debit spread", 89, 590, 595, option_type="put"),
+            ranking_test_scored("NVDA", "bull call debit spread", 88, 210, 205),
+            ranking_test_scored("QQQ", "put credit spread", 84, 480, 475, option_type="put"),
+        ]
+    )
+    assert len([item for item in displayed if item.trade.ticker == "SPY"]) == 2
+
+    selected = select_execution_candidates(displayed, limit=3)
+    assert [item.trade.ticker for item in selected] == ["SPY", "NVDA", "QQQ"]
+    assert len({item.trade.ticker for item in selected}) == len(selected)
+    assert [item.execution_rank for item in selected] == [1, 2, 3]
+
+    two_tickers = select_execution_candidates(displayed[:3], limit=3)
+    assert len(two_tickers) == 2
+    assert two_tickers[0].total_score == 91
+
+    tied = [
+        replace(
+            ranking_test_scored("AAPL", "bull call debit spread", 80, 105, 100),
+            normalized_ticker_score=80,
+            quant_score=75,
+        ),
+        replace(
+            ranking_test_scored("MSFT", "bull call debit spread", 80, 505, 500),
+            normalized_ticker_score=90,
+            quant_score=70,
+        ),
+        replace(
+            ranking_test_scored("NVDA", "bull call debit spread", 80, 205, 200),
+            normalized_ticker_score=90,
+            quant_score=78,
+        ),
+    ]
+    tied_selected = select_execution_candidates(tied, limit=3)
+    assert [item.trade.ticker for item in tied_selected] == ["NVDA", "MSFT", "AAPL"]
+
+    assert strategy_direction("put credit spread") == "bullish"
+    assert strategy_direction("bull call debit spread") == "bullish"
+    assert strategy_direction("call credit spread") == "bearish"
+    assert strategy_direction("bear put debit spread") == "bearish"
+    assert strategy_direction("iron condor") == "neutral"
+    assert strategy_direction("calendar spread") == "unknown"
+    print("Execution selection tests passed.")
+
+
+def test_price_move_modes() -> None:
+    assert apply_price_move_mode(8, "Full") == (8, 8)
+    assert apply_price_move_mode(-6, "Full") == (-6, -6)
+    assert apply_price_move_mode(8, "Conservative") == (8, 3)
+    assert apply_price_move_mode(-6, "Conservative") == (-6, -6)
+    assert apply_price_move_mode(8, "Shadow") == (8, 0)
+    assert apply_price_move_mode(8, "Off") == (0, 0)
+
+    trade = ranking_test_trade("AAPL", "bull call debit spread", 105, 100)
+    price_move = {"1D Move %": 4, "5D Move %": 5, "Move vs 20D Vol": 2}
+    preferences = ScanPreferences(500, "bullish", "moderate", price_move_mode="Shadow")
+    scored = score_trade(trade, preferences, price_move=price_move)
+    assert scored.raw_price_move_adjustment > 0
+    assert scored.effective_price_move_adjustment == 0
+    assert scored.price_move_adjustment == 0
+    assert scored.total_score == scored.base_score_without_price_move
+    print("Price move mode tests passed.")
 
 
 def test_event_adjustments() -> None:

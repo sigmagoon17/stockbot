@@ -3,6 +3,7 @@ from datetime import date, timedelta
 
 import requests
 from dotenv import load_dotenv
+from scanner_tracking import SELECTION_EXECUTION, setup_key_for_trade
 
 
 load_dotenv()
@@ -272,9 +273,12 @@ def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
         "Setup Score": None,
         "Entry Type": "credit" if float(order.get("limit_price") or 0) < 0 else "debit",
         "Limit Price": float(order.get("limit_price") or 0),
+        "Max Profit": None,
+        "Max Risk": None,
         "Quantity": int(float(order.get("qty") or 1)),
         "Order Class": order.get("order_class") or "mleg",
         "Leg Key": leg_key_from_legs(normalized_legs),
+        "Exit Policy": "none",
     }
 
 
@@ -313,6 +317,13 @@ def get_recent_alpaca_orders(limit: int = 10) -> tuple[list[dict], list[str]]:
     if errors:
         return [], errors
     return orders or [], []
+
+
+def get_alpaca_order(order_id: str) -> tuple[dict | None, list[str]]:
+    order, errors = alpaca_request("GET", f"/v2/orders/{order_id}")
+    if errors:
+        return None, errors
+    return order or {}, []
 
 
 def submit_option_order(
@@ -480,6 +491,8 @@ def submit_scored_multileg_orders(
     scored_candidates,
     quantity: int = 1,
     limit: int = 3,
+    exit_policy: str = "none",
+    scan_run_id: str | None = None,
 ) -> list[dict]:
     recent_orders, recent_errors = get_recent_alpaca_orders(limit=100)
     recent_client_order_ids = {
@@ -567,11 +580,27 @@ def submit_scored_multileg_orders(
                 "Strategy": trade.strategy,
                 "Expiration": trade.expiration,
                 "Setup Score": scored.total_score,
+                "Ticker Score": scored.normalized_ticker_score,
+                "Quant Score": scored.quant_score,
+                "Setup Key": setup_key_for_trade(trade),
+                "Scan Run ID": scan_run_id,
+                "Execution Rank": scored.execution_rank,
+                "Selection Method": SELECTION_EXECUTION,
                 "Entry Type": trade.entry_type,
                 "Limit Price": limit_price,
+                "Max Profit": round(
+                    float(
+                        trade.max_profit
+                        if trade.entry_type == "debit"
+                        else trade.credit
+                    ),
+                    2,
+                ),
+                "Max Risk": round(float(trade.max_risk), 2),
                 "Quantity": quantity,
                 "Order Class": order.get("order_class") or "mleg",
                 "Leg Key": leg_key,
+                "Exit Policy": exit_policy,
             }
         )
 
