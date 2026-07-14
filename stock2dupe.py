@@ -48,7 +48,7 @@ class ScanPreferences:
     condor_max_wings_per_side: int = 15
     condor_max_bid_ask_width: float = 0.40
     condor_max_bid_ask_to_credit_ratio: float | None = None
-    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE
 
 
 
@@ -280,7 +280,7 @@ def select_expirations(
     available_expirations: list[str] | tuple[str, ...],
     test_expiration: date | None = None,
     nearest_expiration: bool = False,
-    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY,
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE,
 ) -> list[str]:
     dte_by_expiration = {
         expiration: days_to_expiration(expiration)
@@ -330,7 +330,7 @@ def get_option_chain_result(
     ticker: str,
     test_expiration: date | None = None,
     nearest_expiration: bool = False,
-    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY,
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE,
 ) -> OptionChainResult:
     timings = {}
     stock = yf.Ticker(ticker)
@@ -451,7 +451,7 @@ def get_option_chain(
     ticker: str,
     test_expiration: date | None = None,
     nearest_expiration: bool = False,
-    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY,
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE,
 ) -> tuple[float, list[OptionContract], date | None, float, dict[str, float | str]]:
     return get_option_chain_result(
         ticker,
