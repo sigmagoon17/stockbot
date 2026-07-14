@@ -21,7 +21,8 @@ from history_tracker import (
     update_expired_history,
 )
 from stock2dupe import (
-    EXPIRATION_COVERAGE_FAST_WEEKLY,
+    EXPIRATION_COVERAGE_EXHAUSTIVE,
+    EXPIRATION_COVERAGE_MODES,
     ScanPreferences,
     build_bear_put_debit_spread,
     build_bull_call_debit_spread,
@@ -70,6 +71,20 @@ def env_int(name: str, default: int) -> int:
         return int(value) if value else default
     except ValueError:
         return default
+
+
+def configured_expiration_coverage() -> str:
+    configured = os.getenv(
+        "SCAN_EXPIRATION_COVERAGE",
+        EXPIRATION_COVERAGE_EXHAUSTIVE,
+    ).strip()
+    if configured not in EXPIRATION_COVERAGE_MODES:
+        raise ValueError(
+            "Unsupported SCAN_EXPIRATION_COVERAGE value "
+            f"{configured!r}; expected one of "
+            f"{sorted(EXPIRATION_COVERAGE_MODES)}."
+        )
+    return configured
 
 
 def top_unplaced_paper_candidates(scored_trades, limit: int = 3):
@@ -135,6 +150,7 @@ def top_unplaced_paper_candidates(scored_trades, limit: int = 3):
 
 
 def main() -> int:
+    expiration_coverage = configured_expiration_coverage()
     tickers = [
         ticker.strip().upper()
         for ticker in os.getenv(
@@ -176,10 +192,7 @@ def main() -> int:
         outlook=os.getenv("SCAN_OUTLOOK", "neutral"),
         risk_tolerance=os.getenv("SCAN_RISK_TOLERANCE", "moderate"),
         price_move_mode=os.getenv("PRICE_MOVE_MODE", "Full"),
-        expiration_coverage=os.getenv(
-            "SCAN_EXPIRATION_COVERAGE",
-            EXPIRATION_COVERAGE_FAST_WEEKLY,
-        ),
+        expiration_coverage=expiration_coverage,
     )
     trades = []
     event_analyses = {}
