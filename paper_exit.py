@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Callable
 
 
 EXIT_NONE = "none"
@@ -14,6 +15,14 @@ class PaperExitDecision:
     target_value_per_share: float | None
     current_value_per_share: float | None
     message: str
+
+
+@dataclass(frozen=True)
+class PaperExitSubmission:
+    claimed: bool
+    submitted: bool
+    recorded: bool
+    errors: tuple[str, ...]
 
 
 def normalized_exit_policy(policy: str | None) -> str:
@@ -106,6 +115,43 @@ def closing_legs_from_leg_key(leg_key: str) -> list[dict]:
             }
         )
     return closing_legs
+
+
+def submit_claimed_paper_exit(
+    *,
+    claim: Callable[[], dict | None],
+    submit: Callable[[dict], tuple[dict | None, list[str]]],
+    record_accepted: Callable[[dict, dict], None],
+    record_rejected: Callable[[dict, str], None],
+) -> PaperExitSubmission:
+    claimed_order = claim()
+    if claimed_order is None:
+        return PaperExitSubmission(False, False, False, ())
+
+    close_order, submit_errors = submit(claimed_order)
+    if submit_errors or close_order is None:
+        message = "; ".join(submit_errors) or "Alpaca returned no closing order."
+        try:
+            record_rejected(claimed_order, message)
+        except Exception as error:
+            return PaperExitSubmission(
+                True,
+                False,
+                False,
+                (message, f"Could not record rejected exit: {error}"),
+            )
+        return PaperExitSubmission(True, False, True, (message,))
+
+    try:
+        record_accepted(claimed_order, close_order)
+    except Exception as error:
+        return PaperExitSubmission(
+            True,
+            True,
+            False,
+            (f"Closing order accepted but could not be recorded: {error}",),
+        )
+    return PaperExitSubmission(True, True, True, ())
 
 
 def test_paper_exit_logic() -> None:

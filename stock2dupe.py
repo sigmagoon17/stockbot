@@ -804,7 +804,7 @@ def apply_price_move_mode(raw_adjustment: int, mode: str) -> tuple[int, int]:
     if normalized_mode not in PRICE_MOVE_MODES:
         normalized_mode = "Full"
     if normalized_mode == "Off":
-        return 0, 0
+        return raw_adjustment, 0
     if normalized_mode == "Shadow":
         return raw_adjustment, 0
     if normalized_mode == "Conservative":
@@ -978,6 +978,54 @@ def select_execution_candidates(
         selected_by_ticker[ticker] += 1
         if len(selected) >= limit:
             break
+    return selected
+
+
+def select_history_candidates(
+    scored_trades: list[ScoredTrade],
+    limit: int = 25,
+    per_ticker: int = 4,
+    per_strategy: int = 1,
+) -> list[ScoredTrade]:
+    if limit <= 0 or per_ticker <= 0 or per_strategy < 0:
+        return []
+
+    ranked = sorted(scored_trades, key=scored_trade_sort_key, reverse=True)
+    selected = []
+    selected_ids = set()
+    selected_by_strategy = Counter()
+    selected_by_ticker = Counter()
+
+    # Reserve a small number of slots for each strategy, while still applying
+    # the same ticker cap used by the overall fill pass.
+    for scored in ranked:
+        strategy = scored.trade.strategy
+        ticker = scored.trade.ticker
+        scored_id = id(scored)
+        if (
+            selected_by_strategy[strategy] >= per_strategy
+            or selected_by_ticker[ticker] >= per_ticker
+            or scored_id in selected_ids
+        ):
+            continue
+        selected.append(scored)
+        selected_ids.add(scored_id)
+        selected_by_strategy[strategy] += 1
+        selected_by_ticker[ticker] += 1
+        if len(selected) >= limit:
+            return selected
+
+    for scored in ranked:
+        ticker = scored.trade.ticker
+        scored_id = id(scored)
+        if scored_id in selected_ids or selected_by_ticker[ticker] >= per_ticker:
+            continue
+        selected.append(scored)
+        selected_ids.add(scored_id)
+        selected_by_ticker[ticker] += 1
+        if len(selected) >= limit:
+            break
+
     return selected
 
 
@@ -1958,7 +2006,7 @@ def test_price_move_modes() -> None:
     assert apply_price_move_mode(8, "Conservative") == (8, 3)
     assert apply_price_move_mode(-6, "Conservative") == (-6, -6)
     assert apply_price_move_mode(8, "Shadow") == (8, 0)
-    assert apply_price_move_mode(8, "Off") == (0, 0)
+    assert apply_price_move_mode(8, "Off") == (8, 0)
 
     trade = ranking_test_trade("AAPL", "bull call debit spread", 105, 100)
     price_move = {"1D Move %": 4, "5D Move %": 5, "Move vs 20D Vol": 2}

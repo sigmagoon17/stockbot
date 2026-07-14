@@ -175,17 +175,18 @@ def option_symbol(
 
 
 def scored_trade_paper_key(scored, trading_day: date | None = None) -> str:
-    trade = scored.trade
     trading_day = trading_day or date.today()
-    strike_key = f"{float(trade.long_strike):.3f}".replace(".", "p")
-    return (
-        f"{trade.ticker}-{trade.expiration}-{trade.option_type}-"
-        f"{strike_key}-{trading_day.isoformat()}"
+    return f"{setup_key_for_trade(scored.trade)}-{trading_day:%Y%m%d}"
+
+
+def scan_client_order_id(scored, scan_run_id: str | None = None) -> str:
+    setup_hash = setup_key_for_trade(scored.trade)[:24]
+    run_suffix = (
+        scan_run_id.replace("-", "")[:12]
+        if scan_run_id
+        else date.today().strftime("%Y%m%d")
     )
-
-
-def scan_client_order_id(scored) -> str:
-    return f"scan-{scored_trade_paper_key(scored)}"[:48]
+    return f"scan-{setup_hash}-{run_suffix}"[:48]
 
 
 def leg_key_from_legs(legs: list[dict]) -> str:
@@ -279,6 +280,9 @@ def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
         "Order Class": order.get("order_class") or "mleg",
         "Leg Key": leg_key_from_legs(normalized_legs),
         "Exit Policy": "none",
+        "Opening Order Status": order.get("status"),
+        "Opening Filled At": order.get("filled_at"),
+        "Opening Filled Avg Price": order.get("filled_avg_price"),
     }
 
 
@@ -321,6 +325,19 @@ def get_recent_alpaca_orders(limit: int = 10) -> tuple[list[dict], list[str]]:
 
 def get_alpaca_order(order_id: str) -> tuple[dict | None, list[str]]:
     order, errors = alpaca_request("GET", f"/v2/orders/{order_id}")
+    if errors:
+        return None, errors
+    return order or {}, []
+
+
+def get_alpaca_order_by_client_id(
+    client_order_id: str,
+) -> tuple[dict | None, list[str]]:
+    order, errors = alpaca_request(
+        "GET",
+        "/v2/orders:by_client_order_id",
+        params={"client_order_id": client_order_id},
+    )
     if errors:
         return None, errors
     return order or {}, []
@@ -533,7 +550,7 @@ def submit_scored_multileg_orders(
             )
             continue
 
-        client_order_id = scan_client_order_id(scored)
+        client_order_id = scan_client_order_id(scored, scan_run_id)
         if client_order_id in recent_client_order_ids:
             results.append(
                 {
@@ -601,6 +618,9 @@ def submit_scored_multileg_orders(
                 "Order Class": order.get("order_class") or "mleg",
                 "Leg Key": leg_key,
                 "Exit Policy": exit_policy,
+                "Opening Order Status": order.get("status"),
+                "Opening Filled At": order.get("filled_at"),
+                "Opening Filled Avg Price": order.get("filled_avg_price"),
             }
         )
 

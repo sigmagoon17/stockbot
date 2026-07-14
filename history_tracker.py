@@ -8,10 +8,15 @@ from supabase import create_client
 
 from alpaca_client import (
     get_alpaca_order,
+    get_alpaca_order_by_client_id,
     get_alpaca_positions,
     submit_multileg_order,
 )
-from paper_exit import closing_legs_from_leg_key, evaluate_paper_exit
+from paper_exit import (
+    closing_legs_from_leg_key,
+    evaluate_paper_exit,
+    submit_claimed_paper_exit,
+)
 from scanner_tracking import (
     SCANNER_VERSION,
     SELECTION_DIVERSIFIED,
@@ -56,11 +61,29 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
         if result.get("Status") in {"Skipped", "Error"}:
             continue
 
+        opening_status = str(
+            result.get("Opening Order Status") or result.get("Status") or "unknown"
+        ).lower()
+        opening_fill = numeric_value(result.get("Opening Filled Avg Price"))
+        if opening_fill is not None:
+            opening_fill = abs(opening_fill)
+        opening_filled_at = result.get("Opening Filled At")
+        if (
+            opening_status == "filled"
+            and opening_fill is not None
+            and opening_fill > 0
+        ):
+            position_status = "open"
+        elif opening_status in {"canceled", "rejected", "expired"}:
+            position_status = opening_status
+        else:
+            position_status = "pending"
+
         rows.append(
             {
                 "scan_time": current_time,
                 "scan_time_est": current_time_est,
-                "entry_timestamp": current_time,
+                "entry_timestamp": opening_filled_at,
                 "order_id": result.get("Order ID"),
                 "client_order_id": result.get("Client Order ID"),
                 "ticker": result.get("Ticker"),
@@ -75,7 +98,10 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
                 "selection_method": result.get("Selection Method"),
                 "entry_type": result.get("Entry Type"),
                 "limit_price": result.get("Limit Price"),
-                "entry_price": result.get("Limit Price"),
+                "entry_price": opening_fill,
+                "opening_order_status": opening_status,
+                "opening_filled_at": opening_filled_at,
+                "opening_filled_avg_price": opening_fill,
                 "max_profit": result.get("Max Profit"),
                 "max_risk": result.get("Max Risk"),
                 "quantity": result.get("Quantity"),
@@ -85,6 +111,7 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
                 "message": result.get("Message"),
                 "leg_key": result.get("Leg Key"),
                 "exit_policy": result.get("Exit Policy") or "none",
+                "position_status": position_status,
             }
         )
 
@@ -172,16 +199,106 @@ def symbols_from_leg_key(leg_key: str | None) -> list[str]:
     ]
 
 
+OPENING_TERMINAL_STATUSES = {"canceled", "rejected", "expired"}
+
+
+def opening_order_update_values(alpaca_order: dict) -> dict:
+    status = str(alpaca_order.get("status") or "unknown").lower()
+    filled_price = numeric_value(alpaca_order.get("filled_avg_price"))
+    if filled_price is not None:
+        filled_price = abs(filled_price)
+    filled_at = alpaca_order.get("filled_at")
+    values = {
+        "opening_order_status": status,
+        "opening_filled_at": filled_at,
+        "opening_filled_avg_price": filled_price,
+    }
+    if status == "filled" and filled_price is not None and filled_price > 0:
+        values.update(
+            {
+                "position_status": "open",
+                "entry_timestamp": filled_at,
+                "entry_price": filled_price,
+            }
+        )
+    elif status in OPENING_TERMINAL_STATUSES:
+        values["position_status"] = status
+    else:
+        values["position_status"] = "pending"
+    return values
+
+
+def paper_order_is_active(order: dict) -> bool:
+    opening_status = str(
+        order.get("opening_order_status") or order.get("status") or ""
+    ).lower()
+    position_status = str(order.get("position_status") or "").lower()
+    close_status = str(order.get("close_order_status") or "").lower()
+    return (
+        opening_status == "filled"
+        and (numeric_value(order.get("opening_filled_avg_price")) or 0) > 0
+        and position_status == "open"
+        and close_status != "filled"
+    )
+
+
+def active_symbol_order_counts(paper_orders: list[dict]) -> dict[str, int]:
+    counts = {}
+    for order in paper_orders:
+        if not paper_order_is_active(order):
+            continue
+        for symbol in set(symbols_from_leg_key(order.get("leg_key"))):
+            counts[symbol] = counts.get(symbol, 0) + 1
+    return counts
+
+
+def paper_exit_decision_for_order(
+    order: dict,
+    current_value_per_share: float | None,
+):
+    if not paper_order_is_active(order):
+        return evaluate_paper_exit(
+            entry_type=order.get("entry_type") or "",
+            entry_price_per_share=0,
+            max_profit_per_share=abs(numeric_value(order.get("max_profit")) or 0),
+            current_value_per_share=None,
+            policy="none",
+        )
+    return evaluate_paper_exit(
+        entry_type=order.get("entry_type") or "",
+        entry_price_per_share=abs(
+            numeric_value(order.get("opening_filled_avg_price")) or 0
+        ),
+        max_profit_per_share=abs(numeric_value(order.get("max_profit")) or 0),
+        current_value_per_share=current_value_per_share,
+        policy=order.get("exit_policy"),
+        close_order_status=order.get("close_order_status"),
+    )
+
+
 def append_alpaca_paper_snapshots() -> list[str]:
     errors = []
     paper_orders, order_errors = fetch_alpaca_paper_orders(limit=1000)
-    positions, position_errors = get_alpaca_positions()
     errors.extend(order_errors)
-    errors.extend(position_errors)
-    if errors:
+    if order_errors:
         return errors
     if not paper_orders:
         return []
+
+    refreshed_orders = []
+    for original_order in paper_orders:
+        order, opening_errors = _refresh_paper_opening_order(original_order)
+        errors.extend(opening_errors)
+        order, close_errors = _refresh_paper_close_order(order)
+        errors.extend(close_errors)
+        if str(order.get("close_order_status") or "").lower() == "filled":
+            continue
+        refreshed_orders.append(order)
+
+    positions, position_errors = get_alpaca_positions()
+    errors.extend(position_errors)
+    if position_errors:
+        return errors
 
     positions_by_symbol = {
         position.get("symbol"): position
@@ -195,16 +312,11 @@ def append_alpaca_paper_snapshots() -> list[str]:
     ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
     rows = []
     pnl_extreme_updates = []
-    symbol_order_counts = {}
-    for paper_order in paper_orders:
-        for symbol in set(symbols_from_leg_key(paper_order.get("leg_key"))):
-            symbol_order_counts[symbol] = symbol_order_counts.get(symbol, 0) + 1
+    symbol_order_counts = active_symbol_order_counts(refreshed_orders)
 
-    for order in paper_orders:
-        if order.get("close_order_id"):
-            errors.extend(_refresh_paper_close_order(order))
-            if order.get("close_order_status") == "filled":
-                continue
+    for order in refreshed_orders:
+        if not paper_order_is_active(order):
+            continue
 
         symbols = symbols_from_leg_key(order.get("leg_key"))
         if not symbols:
@@ -223,8 +335,11 @@ def append_alpaca_paper_snapshots() -> list[str]:
             numeric_value(position.get("unrealized_pl")) or 0
             for position in matched_positions
         )
+        opening_fill_price = abs(
+            numeric_value(order.get("opening_filled_avg_price")) or 0
+        )
         entry_basis = (
-            abs(numeric_value(order.get("limit_price")) or 0)
+            opening_fill_price
             * int(order.get("quantity") or 1)
             * CONTRACT_MULTIPLIER
         )
@@ -238,13 +353,9 @@ def append_alpaca_paper_snapshots() -> list[str]:
             if all_legs_matched and not ambiguous_allocation and quantity > 0
             else None
         )
-        exit_decision = evaluate_paper_exit(
-            entry_type=order.get("entry_type") or "",
-            entry_price_per_share=abs(numeric_value(order.get("limit_price")) or 0),
-            max_profit_per_share=abs(numeric_value(order.get("max_profit")) or 0),
-            current_value_per_share=current_value_per_share,
-            policy=order.get("exit_policy"),
-            close_order_status=order.get("close_order_status"),
+        exit_decision = paper_exit_decision_for_order(
+            order,
+            current_value_per_share,
         )
         previous_mfe = numeric_value(order.get("maximum_favorable_excursion"))
         previous_mae = numeric_value(order.get("maximum_adverse_excursion"))
@@ -330,59 +441,53 @@ def _submit_paper_exit(
     current_value_per_share: float,
     signal_time: str,
 ) -> list[str]:
-    if order.get("close_order_status"):
+    if order.get("close_order_status") or not paper_order_is_active(order):
         return []
     closing_legs = closing_legs_from_leg_key(order.get("leg_key") or "")
     if not closing_legs:
         return [f"Could not close Alpaca paper order {order.get('order_id')}: missing legs."]
 
-    client_order_id = f"close-{order.get('order_id')}-{exit_reason}"[:48]
-    try:
-        (
-            supabase.table("alpaca_paper_orders")
-            .update(
-                {
-                    "exit_signal_time": signal_time,
-                    "exit_reason": exit_reason,
-                    "close_client_order_id": client_order_id,
-                    "close_order_status": "submitting",
-                    "last_exit_error": None,
-                }
-            )
-            .eq("id", order["id"])
-            .is_("close_order_status", "null")
-            .execute()
-        )
-    except Exception as error:
-        return [f"Could not reserve paper exit for order {order.get('order_id')}: {error}"]
+    identity = str(order.get("setup_key") or "unknown")[:16]
+    client_order_id = f"close-{identity}-{order.get('id')}-{exit_reason}"[:48]
+    claim_errors = []
 
-    close_order, submit_errors = submit_multileg_order(
-        closing_legs,
-        quantity=int(order.get("quantity") or 1),
-        limit_price=max(0.01, round(current_value_per_share, 2)),
-        client_order_id=client_order_id,
-    )
-    if submit_errors:
-        message = "; ".join(submit_errors)
+    def claim() -> dict | None:
         try:
-            (
-                supabase.table("alpaca_paper_orders")
-                .update(
-                    {
-                        "close_order_status": "rejected",
-                        "exit_reason": "order_rejected",
-                        "last_exit_error": message,
-                    }
-                )
-                .eq("id", order["id"])
-                .execute()
+            response = supabase.rpc(
+                "claim_alpaca_paper_exit",
+                {
+                    "p_order_id": order["id"],
+                    "p_exit_reason": exit_reason,
+                    "p_signal_time": signal_time,
+                    "p_close_client_order_id": client_order_id,
+                },
+            ).execute()
+        except Exception as error:
+            claim_errors.append(
+                f"Could not reserve paper exit for order {order.get('order_id')}: {error}"
             )
-        except Exception:
-            pass
-        return [f"Paper exit rejected for order {order.get('order_id')}: {message}"]
+            return None
+        claimed_rows = response.data or []
+        if len(claimed_rows) == 0:
+            return None
+        if len(claimed_rows) != 1:
+            claim_errors.append(
+                f"Exit claim for order {order.get('order_id')} returned "
+                f"{len(claimed_rows)} rows; no order was submitted."
+            )
+            return None
+        return claimed_rows[0]
 
-    try:
-        (
+    def submit(claimed_order: dict) -> tuple[dict | None, list[str]]:
+        return submit_multileg_order(
+            closing_legs,
+            quantity=int(claimed_order.get("quantity") or 1),
+            limit_price=max(0.01, round(current_value_per_share, 2)),
+            client_order_id=client_order_id,
+        )
+
+    def record_accepted(claimed_order: dict, close_order: dict) -> None:
+        response = (
             supabase.table("alpaca_paper_orders")
             .update(
                 {
@@ -391,27 +496,131 @@ def _submit_paper_exit(
                     "close_order_submitted_at": signal_time,
                 }
             )
+            .eq("id", claimed_order["id"])
+            .eq("close_client_order_id", client_order_id)
+            .execute()
+        )
+        if len(response.data or []) != 1:
+            raise RuntimeError(
+                "accepted closing order update did not match exactly one tracked row"
+            )
+
+    def record_rejected(claimed_order: dict, message: str) -> None:
+        (
+            supabase.table("alpaca_paper_orders")
+            .update(
+                {
+                    "close_order_status": "rejected",
+                    "exit_reason": "order_rejected",
+                    "last_exit_error": message,
+                }
+            )
+            .eq("id", claimed_order["id"])
+            .eq("close_client_order_id", client_order_id)
+            .execute()
+        )
+
+    result = submit_claimed_paper_exit(
+        claim=claim,
+        submit=submit,
+        record_accepted=record_accepted,
+        record_rejected=record_rejected,
+    )
+    errors = claim_errors + list(result.errors)
+    return [
+        f"Paper exit for order {order.get('order_id')}: {message}"
+        for message in errors
+    ]
+
+
+def _refresh_paper_opening_order(order: dict) -> tuple[dict, list[str]]:
+    status = str(order.get("opening_order_status") or "").lower()
+    has_fill = (numeric_value(order.get("opening_filled_avg_price")) or 0) > 0
+    if status in OPENING_TERMINAL_STATUSES or (status == "filled" and has_fill):
+        return order, []
+    if not order.get("order_id"):
+        return order, ["Could not refresh an Alpaca opening order without an order ID."]
+
+    alpaca_order, errors = get_alpaca_order(order["order_id"])
+    if errors:
+        return order, errors
+    update_values = opening_order_update_values(alpaca_order)
+    try:
+        (
+            supabase.table("alpaca_paper_orders")
+            .update(update_values)
             .eq("id", order["id"])
             .execute()
         )
     except Exception as error:
-        return [f"Paper exit submitted but could not be recorded: {error}"]
-    return []
+        return order, [
+            f"Could not refresh Alpaca opening order {order['order_id']}: {error}"
+        ]
+    return {**order, **update_values}, []
 
 
-def _refresh_paper_close_order(order: dict) -> list[str]:
+def _refresh_paper_close_order(order: dict) -> tuple[dict, list[str]]:
+    if (
+        str(order.get("close_order_status") or "").lower() == "filled"
+        and str(order.get("position_status") or "").lower() == "closed"
+    ):
+        return order, []
+    if (
+        order.get("close_order_status") == "submitting"
+        and not order.get("close_order_id")
+        and order.get("close_client_order_id")
+    ):
+        recovered_order, recovery_errors = get_alpaca_order_by_client_id(
+            order["close_client_order_id"]
+        )
+        if recovery_errors:
+            return order, recovery_errors
+        recovery_values = {
+            "close_order_id": recovered_order.get("id"),
+            "close_order_status": recovered_order.get("status") or "accepted",
+            "close_order_submitted_at": (
+                recovered_order.get("submitted_at") or order.get("exit_signal_time")
+            ),
+            "last_exit_error": None,
+        }
+        try:
+            response = (
+                supabase.table("alpaca_paper_orders")
+                .update(recovery_values)
+                .eq("id", order["id"])
+                .eq("close_client_order_id", order["close_client_order_id"])
+                .execute()
+            )
+            if len(response.data or []) != 1:
+                raise RuntimeError(
+                    "recovered closing order update did not match exactly one tracked row"
+                )
+        except Exception as error:
+            return order, [
+                "Recovered Alpaca closing order but could not save it: " + str(error)
+            ]
+        order = {**order, **recovery_values}
+
+    if not order.get("close_order_id"):
+        return order, []
+
     close_order, errors = get_alpaca_order(order["close_order_id"])
     if errors:
-        return errors
+        return order, errors
     status = close_order.get("status") or order.get("close_order_status")
+    close_fill_price = numeric_value(close_order.get("filled_avg_price"))
+    if close_fill_price is not None:
+        close_fill_price = abs(close_fill_price)
     update_values = {
         "close_order_status": status,
-        "exit_fill_price": numeric_value(close_order.get("filled_avg_price")),
+        "exit_fill_price": close_fill_price,
         "last_exit_error": None,
     }
     if status == "filled":
-        fill_price = numeric_value(close_order.get("filled_avg_price")) or 0
-        entry_price = abs(numeric_value(order.get("limit_price")) or 0)
+        fill_price = close_fill_price or 0
+        entry_price = abs(
+            numeric_value(order.get("opening_filled_avg_price")) or 0
+        )
         quantity = int(order.get("quantity") or 1)
         if order.get("entry_type") == "credit":
             realized_pnl = (entry_price - fill_price) * quantity * CONTRACT_MULTIPLIER
@@ -442,9 +651,11 @@ def _refresh_paper_close_order(order: dict) -> list[str]:
             .eq("id", order["id"])
             .execute()
         )
-        return []
+        return {**order, **update_values}, []
     except Exception as error:
-        return [f"Could not refresh Alpaca close order {order['close_order_id']}: {error}"]
+        return order, [
+            f"Could not refresh Alpaca close order {order['close_order_id']}: {error}"
+        ]
 
 
 def fetch_alpaca_paper_snapshots(limit: int = 500) -> tuple[list[dict], list[str]]:
@@ -1284,6 +1495,15 @@ def expiration_pnl(row, closing_price: float) -> float | None:
         return round(credit - (put_loss + call_loss) * CONTRACT_MULTIPLIER, 2)
 
     return None
+
+
+def expiration_is_ready(
+    expiration: date,
+    today: date | None = None,
+    include_today: bool = False,
+) -> bool:
+    today = today or date.today()
+    return expiration <= today if include_today else expiration < today
 
 
 def update_expired_history(include_today: bool = False) -> list[str]:

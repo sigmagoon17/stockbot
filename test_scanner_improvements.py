@@ -147,7 +147,7 @@ class PriceMoveModeTests(unittest.TestCase):
         self.assertEqual((8, 3), apply_price_move_mode(8, "Conservative"))
         self.assertEqual((-6, -6), apply_price_move_mode(-6, "Conservative"))
         self.assertEqual((8, 0), apply_price_move_mode(8, "Shadow"))
-        self.assertEqual((0, 0), apply_price_move_mode(8, "Off"))
+        self.assertEqual((8, 0), apply_price_move_mode(8, "Off"))
 
     def test_raw_and_effective_adjustments_are_separate(self):
         trade = ranking_test_trade("AAPL", "bull call debit spread", 105, 100)
