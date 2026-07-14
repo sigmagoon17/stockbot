@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 import math
 from pathlib import Path
@@ -393,6 +393,7 @@ class ScoredTrade:
     total_score: int
     reasons: list[str]
     explanation: str
+    normalized_ticker_score: int = 0
 
 
 @dataclass(frozen=True)
@@ -771,7 +772,7 @@ def score_trade(
 ) -> ScoredTrade:
     category_scores = {
         "Expected Move": score_expected_move(trade),
-        "Volatility Rank": score_volatility_rank(trade),
+        "Realized Volatility Rank": score_volatility_rank(trade),
         "Liquidity": score_liquidity(trade),
         "DTE": score_dte(trade),
         "Delta/Probability": score_delta_probability(trade),
@@ -797,6 +798,101 @@ def score_trade(
         total_score=total_score,
         reasons=reasons,
         explanation=beginner_explanation(trade, category_scores),
+    )
+
+
+def apply_normalized_ticker_scores(scored_trades: list[ScoredTrade]) -> list[ScoredTrade]:
+    scores_by_ticker = {}
+    for scored in scored_trades:
+        scores_by_ticker.setdefault(scored.trade.ticker, []).append(scored.total_score)
+
+    normalized = []
+    for scored in scored_trades:
+        ticker_scores = scores_by_ticker[scored.trade.ticker]
+        if len(ticker_scores) == 1:
+            ticker_score = 100
+        else:
+            lower_or_equal_count = sum(
+                score <= scored.total_score for score in ticker_scores
+            )
+            ticker_score = round(lower_or_equal_count / len(ticker_scores) * 100)
+        normalized.append(
+            replace(scored, normalized_ticker_score=max(0, min(100, ticker_score)))
+        )
+    return normalized
+
+
+def similar_spread(left: ScoredTrade, right: ScoredTrade) -> bool:
+    left_trade = left.trade
+    right_trade = right.trade
+    if (
+        left_trade.ticker != right_trade.ticker
+        or left_trade.strategy != right_trade.strategy
+        or left_trade.expiration != right_trade.expiration
+    ):
+        return False
+
+    if left_trade.strategy == "iron condor":
+        left_strikes = (
+            left_trade.put_long_strike,
+            left_trade.put_short_strike,
+            left_trade.call_short_strike,
+            left_trade.call_long_strike,
+        )
+        right_strikes = (
+            right_trade.put_long_strike,
+            right_trade.put_short_strike,
+            right_trade.call_short_strike,
+            right_trade.call_long_strike,
+        )
+        if any(value is None for value in left_strikes + right_strikes):
+            return False
+        return all(
+            abs(float(left_value) - float(right_value)) <= 2
+            for left_value, right_value in zip(left_strikes, right_strikes)
+        )
+
+    left_width = spread_width(left_trade)
+    right_width = spread_width(right_trade)
+    left_center = (left_trade.short_strike + left_trade.long_strike) / 2
+    right_center = (right_trade.short_strike + right_trade.long_strike) / 2
+    return (
+        abs(left_width - right_width) <= 1
+        and abs(left_center - right_center) <= 2
+    )
+
+
+def remove_similar_spreads(scored_trades: list[ScoredTrade]) -> list[ScoredTrade]:
+    selected = []
+    for scored in sorted(
+        scored_trades,
+        key=lambda candidate: candidate.total_score,
+        reverse=True,
+    ):
+        if any(similar_spread(scored, existing) for existing in selected):
+            continue
+        selected.append(scored)
+    return selected
+
+
+def diversify_scored_trades(scored_trades: list[ScoredTrade]) -> list[ScoredTrade]:
+    deduped = remove_similar_spreads(scored_trades)
+    best_by_ticker_strategy = {}
+
+    for scored in deduped:
+        key = (scored.trade.ticker, scored.trade.strategy)
+        current_best = best_by_ticker_strategy.get(key)
+        if current_best is None or scored.total_score > current_best.total_score:
+            best_by_ticker_strategy[key] = scored
+
+    return sorted(
+        best_by_ticker_strategy.values(),
+        key=lambda scored: (
+            scored.total_score,
+            scored.normalized_ticker_score,
+            scored.quant_score,
+        ),
+        reverse=True,
     )
 
 
@@ -932,8 +1028,9 @@ def scan_trades(
         else:
             rejected.append((trade, reasons))
 
+    passing = apply_normalized_ticker_scores(passing)
     passing.sort(key=lambda scored_trade: scored_trade.total_score, reverse=True)
-    return passing, rejected
+    return diversify_scored_trades(passing), rejected
 
 def build_put_credit_spreads(
     option_chain, underlying_price: float, earnings_date, volatility_rank: float, preferences

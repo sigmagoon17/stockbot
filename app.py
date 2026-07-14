@@ -331,18 +331,8 @@ st.markdown(
 )
 
 
-def select_top_candidates(scored_trades, per_ticker: int = 3):
-    selected = []
-    selected_by_ticker = Counter()
-
-    for scored in scored_trades:
-        ticker = scored.trade.ticker
-        if selected_by_ticker[ticker] >= per_ticker:
-            continue
-        selected_by_ticker[ticker] += 1
-        selected.append(scored)
-
-    return selected
+def select_top_candidates(scored_trades, limit: int | None = 50):
+    return scored_trades[:limit] if limit is not None else scored_trades
 
 
 def select_history_candidates(
@@ -363,7 +353,7 @@ def select_history_candidates(
         if len(selected) == limit:
             return selected
 
-    for scored in select_top_candidates(scored_trades, per_ticker=per_ticker):
+    for scored in select_top_candidates(scored_trades):
         if id(scored) in selected_ids:
             continue
         selected.append(scored)
@@ -415,7 +405,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     "Ticker": ticker,
                     "Price": price,
                     "Contracts": len(option_chain),
-                    "Volatility Rank": volatility_rank,
+                    "Realized Volatility Rank": volatility_rank,
                     **price_move,
                     "Earnings Date": earnings_date.isoformat() if earnings_date else "None",
                     "Expiration Used": (
@@ -533,7 +523,7 @@ def prefilter_result_rows(results):
                 "Prefilter Score": result.score,
                 "Price": result.price,
                 "20D Avg Volume": result.average_volume,
-                "Volatility Rank": result.volatility_rank,
+                "Realized Volatility Rank": result.volatility_rank,
                 "1D Move %": result.one_day_move_percent,
                 "5D Move %": result.five_day_move_percent,
                 "Reason": result.reason,
@@ -675,12 +665,13 @@ def candidate_row(scored):
         ),
         "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
         "Setup Score": scored.total_score,
+        "Ticker Score": scored.normalized_ticker_score,
         "Quant Score": scored.quant_score,
         "Event Adjustment": scored.event_adjustment,
         "Price Move Adjustment": scored.price_move_adjustment,
         "Move Setup": scored.price_move_style,
         "Risk Level": scored.risk_level,
-        "Volatility Rank": round(trade.volatility_rank, 1),
+        "Realized Volatility Rank": round(trade.volatility_rank, 1),
     }
 
 
@@ -726,8 +717,13 @@ def candidate_column_config():
             "Move Setup",
             help="Whether recent price movement is being treated as trend continuation, mean reversion, or normal movement.",
         ),
-        "Volatility Rank": st.column_config.NumberColumn(
-            "Volatility Rank",
+        "Ticker Score": st.column_config.NumberColumn(
+            "Ticker Score",
+            help="How strong this setup is compared with today's other passing setups for the same ticker.",
+            format="%d / 100",
+        ),
+        "Realized Volatility Rank": st.column_config.NumberColumn(
+            "Realized Volatility Rank",
             help="Current realized volatility compared with the last year of price movement.",
             format="%.1f",
         ),
@@ -940,12 +936,13 @@ def debit_candidate_rows(scored_trades):
                 "Debit": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "Max Profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
                 "Setup Score": scored.total_score,
+                "Ticker Score": scored.normalized_ticker_score,
                 "Quant Score": scored.quant_score,
                 "Event Adjustment": scored.event_adjustment,
                 "Price Move Adjustment": scored.price_move_adjustment,
                 "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
-                "Volatility Rank": round(trade.volatility_rank, 1),
+                "Realized Volatility Rank": round(trade.volatility_rank, 1),
             }
         )
 
@@ -970,12 +967,13 @@ def credit_candidate_rows(scored_trades):
                 "Credit": round(trade.credit * CONTRACT_MULTIPLIER, 2),
                 "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "Setup Score": scored.total_score,
+                "Ticker Score": scored.normalized_ticker_score,
                 "Quant Score": scored.quant_score,
                 "Event Adjustment": scored.event_adjustment,
                 "Price Move Adjustment": scored.price_move_adjustment,
                 "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
-                "Volatility Rank": round(trade.volatility_rank, 1),
+                "Realized Volatility Rank": round(trade.volatility_rank, 1),
             }
         )
 
@@ -1147,7 +1145,7 @@ def render_scan_output(scan_output):
                 column_config={
                     "Price": st.column_config.NumberColumn(format="$%.2f"),
                     "20D Avg Volume": st.column_config.NumberColumn(format="%d"),
-                    "Volatility Rank": st.column_config.NumberColumn(format="%.1f"),
+                    "Realized Volatility Rank": st.column_config.NumberColumn(format="%.1f"),
                     "1D Move %": st.column_config.NumberColumn(format="%.2f%%"),
                     "5D Move %": st.column_config.NumberColumn(format="%.2f%%"),
                 },
@@ -2262,7 +2260,7 @@ def render_ready_state():
         st.caption("Ranked spreads with setup, quant, event, and price-move scores.")
     with preview_columns[1]:
         st.markdown("**Market Data**")
-        st.caption("Underlying price, volatility rank, recent move, and event label.")
+        st.caption("Underlying price, realized volatility rank, recent move, and event label.")
     with preview_columns[2]:
         st.markdown("**Diagnostics**")
         st.caption("Why tickers or strategies were rejected by the filters.")
@@ -2270,7 +2268,7 @@ def render_ready_state():
 
 st.title("Options Scanner")
 st.caption(
-    "Yahoo Finance data may be delayed. Volatility Rank uses historical price movement."
+    "Yahoo Finance data may be delayed. Realized Volatility Rank uses historical price movement."
 )
 
 with st.sidebar:
@@ -2341,7 +2339,7 @@ with st.sidebar:
             disabled=not use_prefilter,
         )
         prefilter_min_vol_rank = st.number_input(
-            "Minimum Volatility Rank",
+            "Minimum Realized Volatility Rank",
             min_value=0,
             max_value=100,
             value=20,

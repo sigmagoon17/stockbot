@@ -539,7 +539,7 @@ def analyze_candidate_setup(scored_trade, event_analysis=None, price_move=None):
     Max risk: {trade.max_risk * 100:.2f}
     Max profit: {trade.max_profit * 100:.2f}
     Delta: {trade.delta:.2f}
-    Volatility rank: {trade.volatility_rank:.1f}
+    Realized volatility rank: {trade.volatility_rank:.1f}
     Quant score: {scored_trade.quant_score}
     Event adjustment: {scored_trade.event_adjustment}
     Price move adjustment: {scored_trade.price_move_adjustment}
