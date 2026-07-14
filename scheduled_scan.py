@@ -1,4 +1,5 @@
 import os
+import time
 
 try:
     from alpaca_client import (
@@ -20,13 +21,13 @@ from history_tracker import (
     update_expired_history,
 )
 from stock2dupe import (
+    EXPIRATION_COVERAGE_FAST_WEEKLY,
     ScanPreferences,
     build_bear_put_debit_spread,
     build_bull_call_debit_spread,
     build_call_credit_spreads,
-    build_iron_condor,
+    build_iron_condors_with_diagnostics,
     build_put_credit_spreads,
-    condor_diagnostics,
     get_option_chain,
     scan_trades,
     select_execution_candidates,
@@ -175,6 +176,10 @@ def main() -> int:
         outlook=os.getenv("SCAN_OUTLOOK", "neutral"),
         risk_tolerance=os.getenv("SCAN_RISK_TOLERANCE", "moderate"),
         price_move_mode=os.getenv("PRICE_MOVE_MODE", "Full"),
+        expiration_coverage=os.getenv(
+            "SCAN_EXPIRATION_COVERAGE",
+            EXPIRATION_COVERAGE_FAST_WEEKLY,
+        ),
     )
     trades = []
     event_analyses = {}
@@ -182,6 +187,7 @@ def main() -> int:
     event_labels = {}
     price_moves = {}
     errors = update_expired_history()
+    scan_started = time.perf_counter()
 
     for ticker in tickers:
         try:
@@ -191,21 +197,20 @@ def main() -> int:
                 earnings_date,
                 volatility_rank,
                 price_move,
-            ) = get_option_chain(ticker)
+            ) = get_option_chain(
+                ticker,
+                expiration_coverage=preferences.expiration_coverage,
+            )
             event_analysis = get_event_analysis(ticker, preferences.outlook)
             event_analyses[ticker] = event_analysis
             event_adjustments[ticker] = event_analysis.adjustment
             event_labels[ticker] = event_analysis.label
             price_moves[ticker] = price_move
-            condor_diag = condor_diagnostics(
+            condor_result = build_iron_condors_with_diagnostics(
                 option_chain, price, earnings_date, volatility_rank, preferences
             )
 
-            trades.extend(
-                build_iron_condor(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
+            trades.extend(condor_result.condors)
             trades.extend(
                 build_call_credit_spreads(
                     option_chain, price, earnings_date, volatility_rank, preferences
@@ -228,8 +233,9 @@ def main() -> int:
             )
             print(
                 f"{ticker}: fetched {len(option_chain)} contracts; "
-                f"condors built {condor_diag.built_condors}; "
-                f"blocker: {condor_diag.top_reason}"
+                f"condors built {condor_result.diagnostics.built_condors}; "
+                f"blocker: {condor_result.diagnostics.top_reason}; "
+                f"coverage: {preferences.expiration_coverage}"
             )
         except Exception as error:
             errors.append(f"{ticker}: {error}")
@@ -290,6 +296,7 @@ def main() -> int:
     errors.extend(append_alpaca_paper_snapshots())
 
     print(f"Saved {len(history_candidates)} candidates from {len(scored_trades)} passing trades.")
+    print(f"Total scan elapsed: {time.perf_counter() - scan_started:.3f} seconds")
     for error in errors:
         print(f"Warning: {error}")
 

@@ -1,7 +1,9 @@
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 from datetime import date
 import math
 from pathlib import Path
+import time
 import yfinance as yf
 from collections import Counter
 
@@ -15,6 +17,12 @@ except ImportError:
 CONTRACT_MULTIPLIER = 100
 MAX_SETUP_SCORE = 125
 PRICE_MOVE_MODES = {"Full", "Conservative", "Shadow", "Off"}
+EXPIRATION_COVERAGE_FAST_WEEKLY = "fast_weekly"
+EXPIRATION_COVERAGE_EXHAUSTIVE = "exhaustive"
+EXPIRATION_COVERAGE_MODES = {
+    EXPIRATION_COVERAGE_FAST_WEEKLY,
+    EXPIRATION_COVERAGE_EXHAUSTIVE,
+}
 BULLISH_STRATEGIES = {
     "put credit spread",
     "bull call debit spread",
@@ -40,6 +48,7 @@ class ScanPreferences:
     condor_max_wings_per_side: int = 15
     condor_max_bid_ask_width: float = 0.40
     condor_max_bid_ask_to_credit_ratio: float | None = None
+    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY
 
 
 
@@ -59,6 +68,27 @@ class OptionContract:
     open_interest: int
     volume: int
     quote_source: str = "bid/ask"
+
+
+@dataclass(frozen=True)
+class OptionChainResult:
+    underlying_price: float
+    contracts: list[OptionContract]
+    earnings_date: date | None
+    volatility_rank: float
+    price_move: dict[str, float | str]
+    expirations_fetched: tuple[str, ...]
+    expiration_coverage: str
+    timings: dict[str, float]
+
+    def legacy_tuple(self):
+        return (
+            self.underlying_price,
+            self.contracts,
+            self.earnings_date,
+            self.volatility_rank,
+            self.price_move,
+        )
 
 
 def normal_cdf(value: float) -> float:
@@ -246,12 +276,65 @@ def realized_volatility_rank(stock: yf.Ticker) -> float:
     return volatility_rank
 
 
-def get_option_chain(
+def select_expirations(
+    available_expirations: list[str] | tuple[str, ...],
+    test_expiration: date | None = None,
+    nearest_expiration: bool = False,
+    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY,
+) -> list[str]:
+    dte_by_expiration = {
+        expiration: days_to_expiration(expiration)
+        for expiration in available_expirations
+    }
+    available = sorted(
+        (
+            expiration
+            for expiration in available_expirations
+            if dte_by_expiration[expiration] >= 0
+        ),
+        key=lambda expiration: (dte_by_expiration[expiration], expiration),
+    )
+
+    if test_expiration is not None:
+        selected_expiration = test_expiration.isoformat()
+        if selected_expiration not in available:
+            raise ValueError(
+                f"Yahoo Finance does not offer {selected_expiration} for this ticker."
+            )
+        return [selected_expiration]
+
+    if nearest_expiration:
+        return available[:5]
+
+    if expiration_coverage not in EXPIRATION_COVERAGE_MODES:
+        raise ValueError(
+            f"Unsupported expiration coverage mode: {expiration_coverage}"
+        )
+
+    in_range = [
+        expiration
+        for expiration in available
+        if 21 <= dte_by_expiration[expiration] <= 60
+    ]
+    if expiration_coverage == EXPIRATION_COVERAGE_EXHAUSTIVE:
+        return in_range
+
+    nearest_by_bucket = {}
+    for expiration in in_range:
+        bucket = (dte_by_expiration[expiration] - 21) // 7
+        nearest_by_bucket.setdefault(bucket, expiration)
+    return list(nearest_by_bucket.values())[:7]
+
+
+def get_option_chain_result(
     ticker: str,
     test_expiration: date | None = None,
     nearest_expiration: bool = False,
-) -> tuple[float, list[OptionContract], date | None, float, dict[str, float | str]]:
+    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY,
+) -> OptionChainResult:
+    timings = {}
     stock = yf.Ticker(ticker)
+    underlying_started = time.perf_counter()
     earnings_date = None
     etf_tickers = ["SPY", "QQQ"]
     if ticker not in etf_tickers:
@@ -274,33 +357,35 @@ def get_option_chain(
     except Exception:
         underlying_price = get_underlying_price(stock)
         volatility_rank, price_move = price_history_metrics(stock)
+    timings["underlying_history_data"] = time.perf_counter() - underlying_started
     contracts = []
 
-    available_expirations = [
-        expiration
-        for expiration in stock.options
-        if days_to_expiration(expiration) >= 0
-    ]
-    if test_expiration is not None:
-        selected_expiration = test_expiration.isoformat()
-        if selected_expiration not in available_expirations:
-            raise ValueError(
-                f"Yahoo Finance does not offer {selected_expiration} for {ticker}."
-            )
-        expirations_to_fetch = [selected_expiration]
-    elif nearest_expiration:
-        expirations_to_fetch = sorted(
-            available_expirations, key=days_to_expiration
-        )[:5]
-    else:
-        expirations_to_fetch = [
-            expiration
-            for expiration in available_expirations
-            if 21 <= days_to_expiration(expiration) <= 60
-        ]
+    expiration_list_started = time.perf_counter()
+    available_expirations = list(stock.options)
+    if (
+        test_expiration is not None
+        and test_expiration.isoformat() not in available_expirations
+    ):
+        raise ValueError(
+            f"Yahoo Finance does not offer {test_expiration.isoformat()} for {ticker}."
+        )
+    expirations_to_fetch = select_expirations(
+        available_expirations,
+        test_expiration=test_expiration,
+        nearest_expiration=nearest_expiration,
+        expiration_coverage=expiration_coverage,
+    )
+    timings["expiration_list_retrieval"] = (
+        time.perf_counter() - expiration_list_started
+    )
 
+    download_started = time.perf_counter()
+    dte_by_expiration = {
+        expiration: days_to_expiration(expiration)
+        for expiration in expirations_to_fetch
+    }
     for expiration in expirations_to_fetch:
-        dte = days_to_expiration(expiration)
+        dte = dte_by_expiration[expiration]
         chain = stock.option_chain(expiration)
         for option_type, table in (("call", chain.calls), ("put", chain.puts)):
             for _, row in table.iterrows():
@@ -338,6 +423,7 @@ def get_option_chain(
                         quote_source=quote_source,
                     )
                 )
+    timings["option_chain_downloads"] = time.perf_counter() - download_started
 
     if not contracts:
         expiration_range = (
@@ -349,7 +435,30 @@ def get_option_chain(
             f"Yahoo Finance returned no usable option contracts for {expiration_range}."
         )
 
-    return underlying_price, contracts, earnings_date, volatility_rank, price_move
+    return OptionChainResult(
+        underlying_price=underlying_price,
+        contracts=contracts,
+        earnings_date=earnings_date,
+        volatility_rank=volatility_rank,
+        price_move=price_move,
+        expirations_fetched=tuple(expirations_to_fetch),
+        expiration_coverage=expiration_coverage,
+        timings=timings,
+    )
+
+
+def get_option_chain(
+    ticker: str,
+    test_expiration: date | None = None,
+    nearest_expiration: bool = False,
+    expiration_coverage: str = EXPIRATION_COVERAGE_FAST_WEEKLY,
+) -> tuple[float, list[OptionContract], date | None, float, dict[str, float | str]]:
+    return get_option_chain_result(
+        ticker,
+        test_expiration=test_expiration,
+        nearest_expiration=nearest_expiration,
+        expiration_coverage=expiration_coverage,
+    ).legacy_tuple()
 
 
 def days_to_expiration(expiration: str) -> int:
@@ -454,6 +563,14 @@ class CondorDiagnostics:
     @property
     def top_reason(self) -> str:
         return self.primary_blocker
+
+
+@dataclass(frozen=True)
+class CondorConstructionResult:
+    condors: list[Trade]
+    diagnostics: CondorDiagnostics
+    timings: dict[str, float]
+    operation_counts: dict[str, int]
 
 
 def strategy_direction(strategy: str) -> str:
@@ -1338,6 +1455,7 @@ def scan_trades(
     event_adjustments: dict[str, int] | None = None,
     price_moves: dict[str, dict[str, float | str]] | None = None,
     event_labels: dict[str, str] | None = None,
+    timing_by_ticker: dict[str, float] | None = None,
 ) -> tuple[list[ScoredTrade], list[tuple[Trade, list[str]]]]:
     passing = []
     rejected = []
@@ -1348,6 +1466,7 @@ def scan_trades(
     if event_labels is None:
         event_labels = {}
     for trade in trades:
+        trade_started = time.perf_counter() if timing_by_ticker is not None else None
         passed, reasons = passes_filters(trade, preferences)
 
         if passed:
@@ -1365,6 +1484,12 @@ def scan_trades(
             )
         else:
             rejected.append((trade, reasons))
+        if timing_by_ticker is not None:
+            timing_by_ticker[trade.ticker] = (
+                timing_by_ticker.get(trade.ticker, 0.0)
+                + time.perf_counter()
+                - trade_started
+            )
 
     passing.sort(key=scored_trade_sort_key, reverse=True)
     passing = [
@@ -1534,6 +1659,11 @@ def _condor_wing_trade(
     underlying_price: float,
     earnings_date,
     volatility_rank: float,
+    *,
+    dte: int | None = None,
+    expiration_date: date | None = None,
+    earnings_before_exp: bool | None = None,
+    expected_move_value: float | None = None,
 ) -> Trade:
     is_put = short_contract.option_type == "put"
     width = (
@@ -1542,13 +1672,14 @@ def _condor_wing_trade(
         else long_contract.strike - short_contract.strike
     )
     credit = round(short_contract.bid - long_contract.ask, 2)
-    expiration_date = date.fromisoformat(short_contract.expiration)
-    dte = days_to_expiration(short_contract.expiration)
-    earnings_before_exp = (
-        date.today() <= earnings_date <= expiration_date
-        if earnings_date is not None
-        else False
-    )
+    expiration_date = expiration_date or date.fromisoformat(short_contract.expiration)
+    dte = dte if dte is not None else days_to_expiration(short_contract.expiration)
+    if earnings_before_exp is None:
+        earnings_before_exp = (
+            date.today() <= earnings_date <= expiration_date
+            if earnings_date is not None
+            else False
+        )
     return Trade(
         ticker=short_contract.ticker,
         strategy=("put credit spread" if is_put else "call credit spread"),
@@ -1568,10 +1699,14 @@ def _condor_wing_trade(
         credit=credit,
         max_risk=round(width - credit, 2),
         underlying_price=underlying_price,
-        expected_move=expected_move(
-            underlying_price,
-            short_contract.implied_volatility,
-            dte,
+        expected_move=(
+            expected_move_value
+            if expected_move_value is not None
+            else expected_move(
+                underlying_price,
+                short_contract.implied_volatility,
+                dte,
+            )
         ),
         short_strike=short_contract.strike,
         long_strike=long_contract.strike,
@@ -1596,6 +1731,7 @@ def _build_condor_wings_for_type(
     underlying_price: float,
     earnings_date,
     volatility_rank: float,
+    operation_stats: Counter | None = None,
 ) -> tuple[list[Trade], Counter]:
     contracts = [
         contract
@@ -1604,24 +1740,73 @@ def _build_condor_wings_for_type(
     ]
     eligible_wings = []
     stats = Counter()
+    grouped_contracts = {}
+    for contract in contracts:
+        grouped_contracts.setdefault(
+            (contract.ticker, contract.expiration, contract.option_type), []
+        ).append(contract)
+    strike_indexes = {}
+    for key, group in grouped_contracts.items():
+        by_strike = sorted(
+            enumerate(group),
+            key=lambda item: (item[1].strike, item[0]),
+        )
+        strike_indexes[key] = (
+            [contract.strike for _, contract in by_strike],
+            by_strike,
+        )
+
+    dte_by_expiration = {}
+    date_by_expiration = {}
+    earnings_by_expiration = {}
+    expected_move_by_contract = {}
 
     for short_contract in contracts:
-        for long_contract in contracts:
-            if short_contract.ticker != long_contract.ticker:
-                continue
-            if short_contract.expiration != long_contract.expiration:
-                continue
-            if option_type == "put" and short_contract.strike <= long_contract.strike:
-                continue
-            if option_type == "call" and short_contract.strike >= long_contract.strike:
-                continue
+        key = (
+            short_contract.ticker,
+            short_contract.expiration,
+            short_contract.option_type,
+        )
+        strikes, by_strike = strike_indexes[key]
+        expiration = short_contract.expiration
+        if expiration not in dte_by_expiration:
+            dte_by_expiration[expiration] = days_to_expiration(expiration)
+            date_by_expiration[expiration] = date.fromisoformat(expiration)
+            earnings_by_expiration[expiration] = (
+                date.today() <= earnings_date <= date_by_expiration[expiration]
+                if earnings_date is not None
+                else False
+            )
+        dte = dte_by_expiration[expiration]
+        if dte <= 0:
+            continue
+        expected_move_key = (
+            expiration,
+            short_contract.strike,
+            short_contract.implied_volatility,
+        )
+        if expected_move_key not in expected_move_by_contract:
+            expected_move_by_contract[expected_move_key] = expected_move(
+                underlying_price,
+                short_contract.implied_volatility,
+                dte,
+            )
+        if option_type == "put":
+            first = bisect_left(strikes, short_contract.strike - 5)
+            last = bisect_left(strikes, short_contract.strike)
+        else:
+            first = bisect_right(strikes, short_contract.strike)
+            last = bisect_right(strikes, short_contract.strike + 5)
+        protective_longs = sorted(
+            by_strike[first:last],
+            key=lambda item: item[0],
+        )
+        if operation_stats is not None:
+            operation_stats["reference_contract_pairs"] += len(contracts)
+            operation_stats["contract_pairs_considered"] += len(protective_longs)
 
+        for _, long_contract in protective_longs:
             width = abs(short_contract.strike - long_contract.strike)
-            if width <= 0 or width > 5:
-                continue
-            dte = days_to_expiration(short_contract.expiration)
-            if dte <= 0:
-                continue
             credit = round(short_contract.bid - long_contract.ask, 2)
             if credit <= 0 or width - credit <= 0:
                 continue
@@ -1633,6 +1818,10 @@ def _build_condor_wings_for_type(
                 underlying_price,
                 earnings_date,
                 volatility_rank,
+                dte=dte_by_expiration[expiration],
+                expiration_date=date_by_expiration[expiration],
+                earnings_before_exp=earnings_by_expiration[expiration],
+                expected_move_value=expected_move_by_contract[expected_move_key],
             )
             passed, reasons = passes_condor_wing_filters(wing)
             if "open interest is below 200" in reasons or "volume is below 25" in reasons:
@@ -1647,15 +1836,6 @@ def _build_condor_wings_for_type(
     return eligible_wings, stats
 
 
-def _rank_condor_wing(trade: Trade, preferences: ScanPreferences) -> tuple:
-    return (
-        score_trade(trade, preferences).total_score,
-        trade.credit,
-        -bid_ask_spread(trade),
-        -abs(trade.delta),
-    )
-
-
 def _group_ranked_condor_wings(
     wings: list[Trade],
     preferences: ScanPreferences,
@@ -1664,10 +1844,22 @@ def _group_ranked_condor_wings(
     for wing in wings:
         grouped.setdefault((wing.ticker, wing.expiration), []).append(wing)
     limit = max(0, int(preferences.condor_max_wings_per_side))
+    rank_cache = {}
+
+    def rank_key(trade: Trade) -> tuple:
+        if trade not in rank_cache:
+            rank_cache[trade] = (
+                score_trade(trade, preferences).total_score,
+                trade.credit,
+                -bid_ask_spread(trade),
+                -abs(trade.delta),
+            )
+        return rank_cache[trade]
+
     return {
         key: sorted(
             group,
-            key=lambda trade: _rank_condor_wing(trade, preferences),
+            key=rank_key,
             reverse=True,
         )[:limit]
         for key, group in grouped.items()
@@ -1816,95 +2008,19 @@ def combine_condor_wings(
     return condors
 
 
-def _construct_iron_condor_candidates(
+def _condor_diagnostics_from_construction(
     option_chain,
-    underlying_price: float,
-    earnings_date,
-    volatility_rank: float,
     preferences: ScanPreferences,
-):
-    put_wings, put_stats = _build_condor_wings_for_type(
-        option_chain,
-        "put",
-        underlying_price,
-        earnings_date,
-        volatility_rank,
-    )
-    call_wings, call_stats = _build_condor_wings_for_type(
-        option_chain,
-        "call",
-        underlying_price,
-        earnings_date,
-        volatility_rank,
-    )
-    (
-        condors,
-        pairing_stats,
-        put_expirations,
-        call_expirations,
-        common_expirations,
-    ) = _combine_condor_wings(
-        put_wings,
-        call_wings,
-        underlying_price,
-        volatility_rank,
-        preferences,
-    )
-    return (
-        condors,
-        put_wings,
-        call_wings,
-        put_stats,
-        call_stats,
-        pairing_stats,
-        put_expirations,
-        call_expirations,
-        common_expirations,
-    )
-
-
-def build_iron_condor(
-    option_chain,
-    underlying_price: float,
-    earnings_date,
-    volatility_rank: float,
-    preferences,
-):
-    condors, *_ = _construct_iron_condor_candidates(
-        option_chain,
-        underlying_price,
-        earnings_date,
-        volatility_rank,
-        preferences,
-    )
-    return condors
-
-
-def condor_diagnostics(
-    option_chain,
-    underlying_price: float,
-    earnings_date,
-    volatility_rank: float,
-    preferences,
+    condors: list[Trade],
+    put_wings: list[Trade],
+    call_wings: list[Trade],
+    put_stats: Counter,
+    call_stats: Counter,
+    pairing_stats: Counter,
+    put_expirations: int,
+    call_expirations: int,
+    common_expirations: int,
 ) -> CondorDiagnostics:
-    (
-        condors,
-        put_wings,
-        call_wings,
-        put_stats,
-        call_stats,
-        pairing_stats,
-        put_expirations,
-        call_expirations,
-        common_expirations,
-    ) = _construct_iron_condor_candidates(
-        option_chain,
-        underlying_price,
-        earnings_date,
-        volatility_rank,
-        preferences,
-    )
-
     rejection_counts = Counter()
     passing_scores = []
     built_scores = []
@@ -1989,6 +2105,108 @@ def condor_diagnostics(
         highest_built_condor_score=(max(built_scores) if built_scores else None),
         primary_blocker=primary_blocker,
     )
+
+
+def build_iron_condors_with_diagnostics(
+    option_chain,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    preferences: ScanPreferences,
+) -> CondorConstructionResult:
+    operation_stats = Counter()
+    wing_started = time.perf_counter()
+    put_wings, put_stats = _build_condor_wings_for_type(
+        option_chain,
+        "put",
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        operation_stats,
+    )
+    call_wings, call_stats = _build_condor_wings_for_type(
+        option_chain,
+        "call",
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        operation_stats,
+    )
+    wing_seconds = time.perf_counter() - wing_started
+
+    pairing_started = time.perf_counter()
+    (
+        condors,
+        pairing_stats,
+        put_expirations,
+        call_expirations,
+        common_expirations,
+    ) = _combine_condor_wings(
+        put_wings,
+        call_wings,
+        underlying_price,
+        volatility_rank,
+        preferences,
+    )
+    pairing_seconds = time.perf_counter() - pairing_started
+
+    diagnostics_started = time.perf_counter()
+    diagnostics = _condor_diagnostics_from_construction(
+        option_chain,
+        preferences,
+        condors,
+        put_wings,
+        call_wings,
+        put_stats,
+        call_stats,
+        pairing_stats,
+        put_expirations,
+        call_expirations,
+        common_expirations,
+    )
+    diagnostics_seconds = time.perf_counter() - diagnostics_started
+    return CondorConstructionResult(
+        condors=condors,
+        diagnostics=diagnostics,
+        timings={
+            "wing_construction": wing_seconds,
+            "pairing": pairing_seconds,
+            "diagnostics": diagnostics_seconds,
+        },
+        operation_counts=dict(operation_stats),
+    )
+
+
+def build_iron_condor(
+    option_chain,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    preferences,
+):
+    return build_iron_condors_with_diagnostics(
+        option_chain,
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        preferences,
+    ).condors
+
+
+def condor_diagnostics(
+    option_chain,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    preferences,
+) -> CondorDiagnostics:
+    return build_iron_condors_with_diagnostics(
+        option_chain,
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        preferences,
+    ).diagnostics
 
 
 def build_bull_call_debit_spread(

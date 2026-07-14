@@ -74,14 +74,15 @@ except ImportError:
 
 from stock2dupe import (
     CONTRACT_MULTIPLIER,
+    EXPIRATION_COVERAGE_EXHAUSTIVE,
+    EXPIRATION_COVERAGE_FAST_WEEKLY,
     ScanPreferences,
     build_call_credit_spreads,
-    build_iron_condor,
+    build_iron_condors_with_diagnostics,
     build_put_credit_spreads,
     build_bull_call_debit_spread,
     build_bear_put_debit_spread,
-    condor_diagnostics,
-    get_option_chain,
+    get_option_chain_result,
     execution_selection_diagnostics,
     scan_trades,
     select_execution_candidates,
@@ -122,6 +123,24 @@ LARGE_PRESET_TICKERS = (
 @st.cache_resource
 def event_analysis_cache():
     return {}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_cached_option_chain_result(
+    ticker: str,
+    test_expiration,
+    nearest_expiration: bool,
+    expiration_coverage: str,
+):
+    return (
+        get_option_chain_result(
+            ticker,
+            test_expiration=test_expiration,
+            nearest_expiration=nearest_expiration,
+            expiration_coverage=expiration_coverage,
+        ),
+        time.monotonic(),
+    )
 
 
 @st.cache_resource
@@ -252,6 +271,9 @@ def apply_deep_event_analysis(
     event_adjustments,
     event_labels,
     price_moves,
+    event_timing_by_ticker=None,
+    scoring_timing_by_ticker=None,
+    whole_scoring_timing=None,
 ):
     deep_tickers = selected_deep_analysis_tickers(scored_trades, price_moves)
     if not deep_tickers:
@@ -259,7 +281,14 @@ def apply_deep_event_analysis(
 
     messages = []
     for ticker in deep_tickers:
+        analysis_started = time.perf_counter()
         deep_analysis = get_cached_deep_event_analysis(ticker, preferences.outlook)
+        if event_timing_by_ticker is not None:
+            event_timing_by_ticker[ticker] = (
+                event_timing_by_ticker.get(ticker, 0.0)
+                + time.perf_counter()
+                - analysis_started
+            )
         event_analyses[ticker] = deep_analysis
         event_adjustments[ticker] = deep_analysis.adjustment
         event_labels[ticker] = deep_analysis.label
@@ -268,9 +297,21 @@ def apply_deep_event_analysis(
             f"({deep_analysis.adjustment:+d})"
         )
 
+    scoring_started = time.perf_counter()
     rescored_trades, _ = scan_trades(
-        trades, preferences, event_adjustments, price_moves, event_labels
+        trades,
+        preferences,
+        event_adjustments,
+        price_moves,
+        event_labels,
+        timing_by_ticker=scoring_timing_by_ticker,
     )
+    if whole_scoring_timing is not None:
+        whole_scoring_timing["seconds"] = (
+            whole_scoring_timing.get("seconds", 0.0)
+            + time.perf_counter()
+            - scoring_started
+        )
     return rescored_trades, event_analyses, event_adjustments, event_labels, messages
 
 
@@ -337,7 +378,39 @@ def select_top_candidates(scored_trades, limit: int | None = 50):
     return scored_trades[:limit] if limit is not None else scored_trades
 
 
+PERFORMANCE_PHASES = (
+    "Underlying / History",
+    "Expiration List",
+    "Option Downloads",
+    "Event Analysis",
+    "Condor Wings",
+    "Condor Pairing",
+    "Condor Diagnostics",
+    "Other Strategies",
+    "Filter / Score / Rank",
+    "AI Candidate Review",
+    "Alpaca Preflight / Submission",
+)
+
+
+def empty_performance_row(scope: str) -> dict[str, float | str]:
+    return {"Scope": scope, **{phase: 0.0 for phase in PERFORMANCE_PHASES}, "Total": 0.0}
+
+
+def performance_table_rows(performance: dict) -> list[dict]:
+    ticker_rows = list(performance.get("tickers", {}).values())
+    whole = empty_performance_row("Whole Scan")
+    for row in ticker_rows:
+        for phase in PERFORMANCE_PHASES:
+            whole[phase] += float(row.get(phase, 0.0) or 0.0)
+    for phase, seconds in performance.get("whole_only", {}).items():
+        whole[phase] = float(seconds or 0.0)
+    whole["Total"] = float(performance.get("total_elapsed", 0.0) or 0.0)
+    return ticker_rows + [whole]
+
+
 def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
+    scan_started = time.perf_counter()
     trades = []
     ticker_data = []
     condor_diagnostic_rows = []
@@ -346,24 +419,48 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
     event_labels = {}
     event_analyses = {}
     price_moves = {}
+    performance = {
+        "tickers": {},
+        "whole_only": {},
+        "total_elapsed": 0.0,
+        "started_at": scan_started,
+    }
+    event_timing_by_ticker = {}
+    scoring_timing_by_ticker = {}
+    whole_scoring_timing = {"seconds": 0.0}
     progress = st.progress(0, text="Preparing scan")
 
     for index, ticker in enumerate(tickers, start=1):
         progress.progress(
             index / len(tickers), text=f"Fetching {ticker} option data ({index}/{len(tickers)})"
         )
+        ticker_started = time.perf_counter()
+        timing_row = empty_performance_row(ticker)
+        performance["tickers"][ticker] = timing_row
         try:
-            (
-                price,
-                option_chain,
-                earnings_date,
-                volatility_rank,
-                price_move,
-            ) = get_option_chain(
+            cache_call_started = time.monotonic()
+            market_result, cache_created_at = get_cached_option_chain_result(
                 ticker,
-                test_expiration=preferences.test_expiration,
-                nearest_expiration=preferences.nearest_expiration,
+                preferences.test_expiration,
+                preferences.nearest_expiration,
+                preferences.expiration_coverage,
             )
+            market_data_cache_hit = cache_created_at < cache_call_started
+            price = market_result.underlying_price
+            option_chain = market_result.contracts
+            earnings_date = market_result.earnings_date
+            volatility_rank = market_result.volatility_rank
+            price_move = market_result.price_move
+            if not market_data_cache_hit:
+                timing_row["Underlying / History"] = market_result.timings.get(
+                    "underlying_history_data", 0.0
+                )
+                timing_row["Expiration List"] = market_result.timings.get(
+                    "expiration_list_retrieval", 0.0
+                )
+                timing_row["Option Downloads"] = market_result.timings.get(
+                    "option_chain_downloads", 0.0
+                )
             price_moves[ticker] = price_move
             ticker_data.append(
                 {
@@ -373,18 +470,32 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     "Realized Volatility Rank": volatility_rank,
                     **price_move,
                     "Earnings Date": earnings_date.isoformat() if earnings_date else "None",
-                    "Expiration Used": (
+                    "Expiration Coverage": (
                         "5 nearest"
                         if preferences.nearest_expiration
                         else (
                             preferences.test_expiration.isoformat()
                             if preferences.test_expiration is not None
-                            else "All"
+                            else (
+                                "Fast weekly"
+                                if market_result.expiration_coverage
+                                == EXPIRATION_COVERAGE_FAST_WEEKLY
+                                else "Exhaustive"
+                            )
                         )
                     ),
+                    "Fetched Expiration Count": len(market_result.expirations_fetched),
+                    "Fetched Expirations": ", ".join(market_result.expirations_fetched),
+                    "Market Data Cache": "Hit" if market_data_cache_hit else "Miss",
                 }
             )
+            event_started = time.perf_counter()
             event_analysis = get_cached_event_analysis(ticker, preferences.outlook)
+            event_timing_by_ticker[ticker] = (
+                event_timing_by_ticker.get(ticker, 0.0)
+                + time.perf_counter()
+                - event_started
+            )
             event_analyses[ticker] = event_analysis
             event_adjustments[ticker] = event_analysis.adjustment
             event_labels[ticker] = event_analysis.label
@@ -394,16 +505,15 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     "Event Adjustment": event_analysis.adjustment,
                 }
             )
-            condor_diagnostic_rows.append(
-                condor_diagnostics(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
+            condor_result = build_iron_condors_with_diagnostics(
+                option_chain, price, earnings_date, volatility_rank, preferences
             )
-            trades.extend(
-                build_iron_condor(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
+            condor_diagnostic_rows.append(condor_result.diagnostics)
+            trades.extend(condor_result.condors)
+            timing_row["Condor Wings"] = condor_result.timings["wing_construction"]
+            timing_row["Condor Pairing"] = condor_result.timings["pairing"]
+            timing_row["Condor Diagnostics"] = condor_result.timings["diagnostics"]
+            other_strategies_started = time.perf_counter()
             trades.extend(
                 build_call_credit_spreads(
                     option_chain, price, earnings_date, volatility_rank, preferences
@@ -424,14 +534,26 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     option_chain, price, earnings_date, volatility_rank, preferences
                 )
             )
+            timing_row["Other Strategies"] = (
+                time.perf_counter() - other_strategies_started
+            )
             
         except Exception as error:
             errors.append(f"{ticker}: {error}")
+        finally:
+            timing_row["Total"] = time.perf_counter() - ticker_started
 
     progress.empty()
+    scoring_started = time.perf_counter()
     scored_trades, rejected_trades = scan_trades(
-        trades, preferences, event_adjustments, price_moves, event_labels
+        trades,
+        preferences,
+        event_adjustments,
+        price_moves,
+        event_labels,
+        timing_by_ticker=scoring_timing_by_ticker,
     )
+    whole_scoring_timing["seconds"] += time.perf_counter() - scoring_started
     deep_messages = []
     (
         scored_trades,
@@ -447,11 +569,21 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
         event_adjustments,
         event_labels,
         price_moves,
+        event_timing_by_ticker,
+        scoring_timing_by_ticker,
+        whole_scoring_timing,
     )
     if deep_messages:
+        rescoring_started = time.perf_counter()
         scored_trades, rejected_trades = scan_trades(
-            trades, preferences, event_adjustments, price_moves, event_labels
+            trades,
+            preferences,
+            event_adjustments,
+            price_moves,
+            event_labels,
+            timing_by_ticker=scoring_timing_by_ticker,
         )
+        whole_scoring_timing["seconds"] += time.perf_counter() - rescoring_started
         for row in ticker_data:
             event_analysis = event_analyses.get(row["Ticker"])
             if event_analysis is not None:
@@ -466,6 +598,15 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                 )
     for row in ticker_data:
         row.setdefault("News Depth", "Basic")
+    for ticker, timing_row in performance["tickers"].items():
+        timing_row["Event Analysis"] = event_timing_by_ticker.get(ticker, 0.0)
+        timing_row["Filter / Score / Rank"] = scoring_timing_by_ticker.get(
+            ticker, 0.0
+        )
+    performance["whole_only"]["Filter / Score / Rank"] = whole_scoring_timing[
+        "seconds"
+    ]
+    performance["total_elapsed"] = time.perf_counter() - scan_started
     return (
         scored_trades,
         rejected_trades,
@@ -475,6 +616,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
         errors,
         event_analyses,
         price_moves,
+        performance,
     )
 
 
@@ -903,6 +1045,7 @@ def render_scan_output(scan_output):
     prefilter_rows = scan_output.get("prefilter_rows", [])
     prefilter_selected_tickers = scan_output.get("prefilter_selected_tickers", [])
     original_ticker_count = scan_output.get("original_ticker_count", len(ticker_data))
+    scan_performance = scan_output.get("scan_performance", {})
 
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
@@ -1106,6 +1249,21 @@ def render_scan_output(scan_output):
         )
 
     with diagnostics_tab:
+        st.subheader("Scan Performance")
+        if scan_performance:
+            performance_df = pd.DataFrame(performance_table_rows(scan_performance))
+            st.dataframe(
+                performance_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    phase: st.column_config.NumberColumn(format="%.3f s")
+                    for phase in (*PERFORMANCE_PHASES, "Total")
+                },
+            )
+        else:
+            st.info("No performance timing was captured for this scan.")
+
         st.subheader("Execution Selection Diagnostics")
         st.dataframe(
             pd.DataFrame(
@@ -2470,6 +2628,16 @@ with st.sidebar:
     max_risk = st.number_input("Maximum Risk Per Spread", min_value=50, value=500, step=50)
     risk_tolerance = st.selectbox("Risk Tolerance", ["conservative", "moderate", "aggressive"], index=1)
     with st.expander("Advanced Expiration Settings"):
+        expiration_coverage_label = st.selectbox(
+            "Expiration Coverage",
+            ["Fast weekly coverage", "Exhaustive coverage"],
+            index=0,
+            help=(
+                "Fast weekly coverage selects the nearest expiration in each "
+                "seven-day DTE bucket. Exhaustive coverage fetches every "
+                "expiration from 21 to 60 DTE."
+            ),
+        )
         use_nearest_expiration = st.checkbox("Use Nearest Available Expirations")
         use_test_expiration = st.checkbox(
             "Test a Specific Expiration", disabled=use_nearest_expiration
@@ -2478,6 +2646,11 @@ with st.sidebar:
             st.date_input("Test Expiration", min_value=date.today())
             if use_test_expiration
             else None
+        )
+        expiration_coverage = (
+            EXPIRATION_COVERAGE_FAST_WEEKLY
+            if expiration_coverage_label == "Fast weekly coverage"
+            else EXPIRATION_COVERAGE_EXHAUSTIVE
         )
     with st.expander("Broad Universe Prefilter"):
         use_prefilter = st.checkbox(
@@ -2577,6 +2750,7 @@ if scan_button:
         test_expiration=test_expiration,
         nearest_expiration=use_nearest_expiration,
         price_move_mode=price_move_mode,
+        expiration_coverage=expiration_coverage,
     )
     with st.status("Scanning watchlist...", expanded=True) as scan_status:
         prefilter_rows = []
@@ -2631,6 +2805,7 @@ if scan_button:
             errors,
             event_analyses,
             price_moves,
+            scan_performance,
         ) = scan_watchlist(tickers, preferences)
         st.session_state["latest_event_analyses"] = event_analyses
         execution_candidates = select_execution_candidates(scored_trades, limit=3)
@@ -2648,6 +2823,7 @@ if scan_button:
         errors = history_errors + errors + history_save_errors
 
         paper_order_results = []
+        alpaca_started = time.perf_counter()
         if (
             st.session_state.get("results_unlocked")
             and st.session_state.get("auto_paper_trade_scans")
@@ -2690,11 +2866,15 @@ if scan_button:
                     "Message": "Unlock the owner panel before scanning to enable Alpaca paper trading.",
                 }
             ]
+        scan_performance["whole_only"]["Alpaca Preflight / Submission"] = (
+            time.perf_counter() - alpaca_started
+        )
 
         st.write("Reviewing the top 3 candidates with AI...")
         candidate_analyses = {}
         for scored in execution_candidates:
             trade = scored.trade
+            review_started = time.perf_counter()
             candidate_analyses[candidate_analysis_key(scored)] = (
                 get_cached_candidate_analysis(
                     scored,
@@ -2702,6 +2882,22 @@ if scan_button:
                     price_moves.get(trade.ticker),
                 )
             )
+            review_seconds = time.perf_counter() - review_started
+            timing_row = scan_performance["tickers"].get(trade.ticker)
+            if timing_row is not None:
+                timing_row["AI Candidate Review"] += review_seconds
+        scan_performance["whole_only"]["AI Candidate Review"] = sum(
+            float(row.get("AI Candidate Review", 0.0) or 0.0)
+            for row in scan_performance["tickers"].values()
+        )
+        for timing_row in scan_performance["tickers"].values():
+            timing_row["Total"] = sum(
+                float(timing_row.get(phase, 0.0) or 0.0)
+                for phase in PERFORMANCE_PHASES
+            )
+        scan_performance["total_elapsed"] = (
+            time.perf_counter() - scan_performance["started_at"]
+        )
         scan_status.update(label="Scan complete", state="complete", expanded=False)
     st.session_state["last_scan_output"] = {
         "scored_trades": scored_trades,
@@ -2716,6 +2912,7 @@ if scan_button:
         "candidate_analyses": candidate_analyses,
         "history_candidates": history_candidates,
         "paper_order_results": paper_order_results,
+        "scan_performance": scan_performance,
         "prefilter_rows": prefilter_rows,
         "prefilter_selected_tickers": tickers if use_prefilter else [],
         "original_ticker_count": len(original_tickers) if use_prefilter else len(tickers),
