@@ -10,9 +10,11 @@ from alpaca_client import (
     get_alpaca_order,
     get_alpaca_order_by_client_id,
     get_alpaca_positions,
+    spread_width_from_order_legs,
     submit_multileg_order,
 )
 from paper_exit import (
+    calculate_filled_trade_economics,
     closing_legs_from_leg_key,
     evaluate_paper_exit,
     submit_claimed_paper_exit,
@@ -49,6 +51,24 @@ def numeric_value(value) -> float | None:
         return None
 
 
+def filled_economics_values(
+    entry_type: str,
+    spread_width_per_share,
+    opening_filled_avg_price,
+) -> dict:
+    economics = calculate_filled_trade_economics(
+        entry_type,
+        numeric_value(spread_width_per_share),
+        numeric_value(opening_filled_avg_price),
+    )
+    return {
+        "spread_width_per_share": economics.spread_width_per_share,
+        "filled_max_profit_per_share": economics.filled_max_profit_per_share,
+        "filled_max_risk_per_share": economics.filled_max_risk_per_share,
+        "fill_validation_error": economics.validation_error,
+    }
+
+
 def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
     rows = []
     scan_timestamp = datetime.now(timezone.utc)
@@ -68,6 +88,12 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
         if opening_fill is not None:
             opening_fill = abs(opening_fill)
         opening_filled_at = result.get("Opening Filled At")
+        spread_width = numeric_value(result.get("Spread Width Per Share"))
+        fill_economics = filled_economics_values(
+            result.get("Entry Type") or "",
+            spread_width,
+            opening_fill if opening_status == "filled" else None,
+        )
         if (
             opening_status == "filled"
             and opening_fill is not None
@@ -102,6 +128,7 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
                 "opening_order_status": opening_status,
                 "opening_filled_at": opening_filled_at,
                 "opening_filled_avg_price": opening_fill,
+                **fill_economics,
                 "max_profit": result.get("Max Profit"),
                 "max_risk": result.get("Max Risk"),
                 "quantity": result.get("Quantity"),
@@ -121,34 +148,37 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
     try:
         existing_response = (
             supabase.table("alpaca_paper_orders")
-            .select("order_id,client_order_id,leg_key")
+            .select("order_id,client_order_id,leg_key,position_status")
             .execute()
         )
-        existing_keys = {
+        existing_order_keys = {
             value
             for row in existing_response.data
             for value in (
                 row.get("order_id"),
                 row.get("client_order_id"),
-                row.get("leg_key"),
             )
             if value
         }
+        existing_leg_keys = active_leg_keys(existing_response.data)
 
         new_rows = []
         queued_keys = set()
         for row in rows:
-            row_keys = {
-                row.get("order_id"),
-                row.get("client_order_id"),
-                row.get("leg_key"),
-            }
-            row_keys.discard(None)
-
-            if row_keys & existing_keys or row_keys & queued_keys:
+            order_keys = {row.get("order_id"), row.get("client_order_id")}
+            order_keys.discard(None)
+            leg_key = row.get("leg_key")
+            if (
+                order_keys & existing_order_keys
+                or order_keys & queued_keys
+                or leg_key in existing_leg_keys
+                or leg_key in queued_keys
+            ):
                 continue
 
-            queued_keys.update(row_keys)
+            queued_keys.update(order_keys)
+            if leg_key:
+                queued_keys.add(leg_key)
             new_rows.append(row)
 
         if new_rows:
@@ -177,6 +207,7 @@ def fetch_alpaca_paper_leg_keys() -> tuple[set[str], list[str]]:
         response = (
             supabase.table("alpaca_paper_orders")
             .select("leg_key")
+            .in_("position_status", ["pending", "open"])
             .not_.is_("leg_key", "null")
             .execute()
         )
@@ -189,6 +220,15 @@ def fetch_alpaca_paper_leg_keys() -> tuple[set[str], list[str]]:
         return set(), [f"Could not load existing Alpaca paper leg keys: {error}"]
 
 
+def active_leg_keys(order_rows: list[dict]) -> set[str]:
+    return {
+        row["leg_key"]
+        for row in order_rows
+        if row.get("leg_key")
+        and str(row.get("position_status") or "").lower() in {"pending", "open"}
+    }
+
+
 def symbols_from_leg_key(leg_key: str | None) -> list[str]:
     if not leg_key:
         return []
@@ -199,10 +239,35 @@ def symbols_from_leg_key(leg_key: str | None) -> list[str]:
     ]
 
 
+def spread_width_for_tracked_order(order: dict) -> float | None:
+    stored_width = numeric_value(order.get("spread_width_per_share"))
+    if stored_width is not None:
+        return stored_width
+    symbols = symbols_from_leg_key(order.get("leg_key"))
+    if not symbols:
+        return None
+    return spread_width_from_order_legs(
+        [{"symbol": symbol} for symbol in symbols],
+        str(order.get("strategy") or "").lower(),
+    )
+
+
 OPENING_TERMINAL_STATUSES = {"canceled", "rejected", "expired"}
+CLOSE_RETRYABLE_STATUSES = {"rejected", "canceled", "expired"}
+CLOSE_BLOCKING_STATUSES = {
+    "accepted",
+    "new",
+    "pending_new",
+    "partially_filled",
+    "filled",
+    "submitting",
+}
 
 
-def opening_order_update_values(alpaca_order: dict) -> dict:
+def opening_order_update_values(
+    alpaca_order: dict,
+    tracked_order: dict | None = None,
+) -> dict:
     status = str(alpaca_order.get("status") or "unknown").lower()
     filled_price = numeric_value(alpaca_order.get("filled_avg_price"))
     if filled_price is not None:
@@ -214,11 +279,17 @@ def opening_order_update_values(alpaca_order: dict) -> dict:
         "opening_filled_avg_price": filled_price,
     }
     if status == "filled" and filled_price is not None and filled_price > 0:
+        tracked_order = tracked_order or {}
         values.update(
             {
                 "position_status": "open",
                 "entry_timestamp": filled_at,
                 "entry_price": filled_price,
+                **filled_economics_values(
+                    tracked_order.get("entry_type") or "",
+                    spread_width_for_tracked_order(tracked_order),
+                    filled_price,
+                ),
             }
         )
     elif status in OPENING_TERMINAL_STATUSES:
@@ -240,6 +311,32 @@ def paper_order_is_active(order: dict) -> bool:
         and position_status == "open"
         and close_status != "filled"
     )
+
+
+def close_attempt_is_allowed(order: dict, attempt_run_id: str | None = None) -> bool:
+    close_status = str(order.get("close_order_status") or "").lower()
+    if close_status in CLOSE_BLOCKING_STATUSES:
+        return False
+    if close_status and close_status not in CLOSE_RETRYABLE_STATUSES:
+        return False
+    if close_status in CLOSE_RETRYABLE_STATUSES and not bool(
+        order.get("exit_retryable")
+    ):
+        return False
+    if attempt_run_id and order.get("close_attempt_run_id") == attempt_run_id:
+        return False
+    return paper_order_is_active(order)
+
+
+def close_client_order_id_for_attempt(
+    order: dict,
+    attempt_number: int,
+    exit_reason: str,
+) -> str:
+    identity = str(order.get("setup_key") or "unknown")[:12]
+    return (
+        f"close-{identity}-{order.get('id')}-a{attempt_number}-{exit_reason}"
+    )[:48]
 
 
 def active_symbol_order_counts(paper_orders: list[dict]) -> dict[str, int]:
@@ -264,15 +361,28 @@ def paper_exit_decision_for_order(
             current_value_per_share=None,
             policy="none",
         )
+    filled_max_profit = numeric_value(order.get("filled_max_profit_per_share"))
+    if filled_max_profit is None or filled_max_profit <= 0:
+        return evaluate_paper_exit(
+            entry_type=order.get("entry_type") or "",
+            entry_price_per_share=0,
+            max_profit_per_share=0,
+            current_value_per_share=None,
+            policy="none",
+        )
+    close_status = order.get("close_order_status")
+    effective_close_status = (
+        None if close_attempt_is_allowed(order) else close_status
+    )
     return evaluate_paper_exit(
         entry_type=order.get("entry_type") or "",
         entry_price_per_share=abs(
             numeric_value(order.get("opening_filled_avg_price")) or 0
         ),
-        max_profit_per_share=abs(numeric_value(order.get("max_profit")) or 0),
+        max_profit_per_share=abs(filled_max_profit),
         current_value_per_share=current_value_per_share,
         policy=order.get("exit_policy"),
-        close_order_status=order.get("close_order_status"),
+        close_order_status=effective_close_status,
     )
 
 
@@ -335,11 +445,8 @@ def append_alpaca_paper_snapshots() -> list[str]:
             numeric_value(position.get("unrealized_pl")) or 0
             for position in matched_positions
         )
-        opening_fill_price = abs(
-            numeric_value(order.get("opening_filled_avg_price")) or 0
-        )
-        entry_basis = (
-            opening_fill_price
+        risk_basis = (
+            abs(numeric_value(order.get("filled_max_risk_per_share")) or 0)
             * int(order.get("quantity") or 1)
             * CONTRACT_MULTIPLIER
         )
@@ -385,8 +492,8 @@ def append_alpaca_paper_snapshots() -> list[str]:
                 "current_value": round(current_value, 2),
                 "unrealized_pnl": round(unrealized_pnl, 2),
                 "unrealized_pnl_percent": (
-                    round(unrealized_pnl / entry_basis * 100, 2)
-                    if entry_basis > 0
+                    round(unrealized_pnl / risk_basis * 100, 2)
+                    if risk_basis > 0
                     else None
                 ),
                 "matched_legs": len(matched_positions),
@@ -441,14 +548,19 @@ def _submit_paper_exit(
     current_value_per_share: float,
     signal_time: str,
 ) -> list[str]:
-    if order.get("close_order_status") or not paper_order_is_active(order):
+    attempt_run_id = signal_time
+    if not close_attempt_is_allowed(order, attempt_run_id):
         return []
     closing_legs = closing_legs_from_leg_key(order.get("leg_key") or "")
     if not closing_legs:
         return [f"Could not close Alpaca paper order {order.get('order_id')}: missing legs."]
 
-    identity = str(order.get("setup_key") or "unknown")[:16]
-    client_order_id = f"close-{identity}-{order.get('id')}-{exit_reason}"[:48]
+    attempt_number = int(order.get("close_attempt_count") or 0) + 1
+    client_order_id = close_client_order_id_for_attempt(
+        order,
+        attempt_number,
+        exit_reason,
+    )
     claim_errors = []
 
     def claim() -> dict | None:
@@ -460,6 +572,8 @@ def _submit_paper_exit(
                     "p_exit_reason": exit_reason,
                     "p_signal_time": signal_time,
                     "p_close_client_order_id": client_order_id,
+                    "p_attempt_number": attempt_number,
+                    "p_attempt_run_id": attempt_run_id,
                 },
             ).execute()
         except Exception as error:
@@ -494,6 +608,7 @@ def _submit_paper_exit(
                     "close_order_id": close_order.get("id"),
                     "close_order_status": close_order.get("status") or "accepted",
                     "close_order_submitted_at": signal_time,
+                    "exit_retryable": False,
                 }
             )
             .eq("id", claimed_order["id"])
@@ -513,6 +628,7 @@ def _submit_paper_exit(
                     "close_order_status": "rejected",
                     "exit_reason": "order_rejected",
                     "last_exit_error": message,
+                    "exit_retryable": True,
                 }
             )
             .eq("id", claimed_order["id"])
@@ -536,15 +652,41 @@ def _submit_paper_exit(
 def _refresh_paper_opening_order(order: dict) -> tuple[dict, list[str]]:
     status = str(order.get("opening_order_status") or "").lower()
     has_fill = (numeric_value(order.get("opening_filled_avg_price")) or 0) > 0
-    if status in OPENING_TERMINAL_STATUSES or (status == "filled" and has_fill):
+    if status in OPENING_TERMINAL_STATUSES:
         return order, []
+    if status == "filled" and has_fill:
+        if (
+            numeric_value(order.get("filled_max_profit_per_share")) is not None
+            and numeric_value(order.get("filled_max_risk_per_share")) is not None
+        ):
+            return order, []
+        fill_values = filled_economics_values(
+            order.get("entry_type") or "",
+            spread_width_for_tracked_order(order),
+            order.get("opening_filled_avg_price"),
+        )
+        if fill_values["filled_max_profit_per_share"] is None:
+            return order, []
+        try:
+            (
+                supabase.table("alpaca_paper_orders")
+                .update(fill_values)
+                .eq("id", order["id"])
+                .execute()
+            )
+        except Exception as error:
+            return order, [
+                f"Could not save fill economics for opening order "
+                f"{order.get('order_id')}: {error}"
+            ]
+        return {**order, **fill_values}, []
     if not order.get("order_id"):
         return order, ["Could not refresh an Alpaca opening order without an order ID."]
 
     alpaca_order, errors = get_alpaca_order(order["order_id"])
     if errors:
         return order, errors
-    update_values = opening_order_update_values(alpaca_order)
+    update_values = opening_order_update_values(alpaca_order, order)
     try:
         (
             supabase.table("alpaca_paper_orders")
@@ -560,13 +702,14 @@ def _refresh_paper_opening_order(order: dict) -> tuple[dict, list[str]]:
 
 
 def _refresh_paper_close_order(order: dict) -> tuple[dict, list[str]]:
+    tracked_close_status = str(order.get("close_order_status") or "").lower()
     if (
-        str(order.get("close_order_status") or "").lower() == "filled"
+        tracked_close_status == "filled"
         and str(order.get("position_status") or "").lower() == "closed"
     ):
         return order, []
     if (
-        order.get("close_order_status") == "submitting"
+        tracked_close_status == "submitting"
         and not order.get("close_order_id")
         and order.get("close_client_order_id")
     ):
@@ -582,6 +725,7 @@ def _refresh_paper_close_order(order: dict) -> tuple[dict, list[str]]:
                 recovered_order.get("submitted_at") or order.get("exit_signal_time")
             ),
             "last_exit_error": None,
+            "exit_retryable": False,
         }
         try:
             response = (
@@ -607,7 +751,9 @@ def _refresh_paper_close_order(order: dict) -> tuple[dict, list[str]]:
     close_order, errors = get_alpaca_order(order["close_order_id"])
     if errors:
         return order, errors
-    status = close_order.get("status") or order.get("close_order_status")
+    status = str(
+        close_order.get("status") or order.get("close_order_status") or "unknown"
+    ).lower()
     close_fill_price = numeric_value(close_order.get("filled_avg_price"))
     if close_fill_price is not None:
         close_fill_price = abs(close_fill_price)
@@ -615,6 +761,7 @@ def _refresh_paper_close_order(order: dict) -> tuple[dict, list[str]]:
         "close_order_status": status,
         "exit_fill_price": close_fill_price,
         "last_exit_error": None,
+        "exit_retryable": status in CLOSE_RETRYABLE_STATUSES,
     }
     if status == "filled":
         fill_price = close_fill_price or 0
@@ -626,10 +773,13 @@ def _refresh_paper_close_order(order: dict) -> tuple[dict, list[str]]:
             realized_pnl = (entry_price - fill_price) * quantity * CONTRACT_MULTIPLIER
         else:
             realized_pnl = (fill_price - entry_price) * quantity * CONTRACT_MULTIPLIER
-        max_risk = abs(numeric_value(order.get("max_risk")) or 0)
+        max_risk = abs(
+            numeric_value(order.get("filled_max_risk_per_share")) or 0
+        )
         update_values.update(
             {
                 "position_status": "closed",
+                "exit_retryable": False,
                 "exit_fill_time": close_order.get("filled_at") or utc_now_iso(),
                 "realized_pnl": round(realized_pnl, 2),
                 "realized_return_on_risk": (

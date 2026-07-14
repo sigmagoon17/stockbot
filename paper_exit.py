@@ -25,6 +25,52 @@ class PaperExitSubmission:
     errors: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class FilledTradeEconomics:
+    spread_width_per_share: float | None
+    filled_max_profit_per_share: float | None
+    filled_max_risk_per_share: float | None
+    validation_error: str | None
+
+
+def calculate_filled_trade_economics(
+    entry_type: str,
+    spread_width_per_share: float | None,
+    opening_filled_avg_price: float | None,
+) -> FilledTradeEconomics:
+    if spread_width_per_share is None or opening_filled_avg_price is None:
+        return FilledTradeEconomics(spread_width_per_share, None, None, None)
+
+    width = abs(float(spread_width_per_share))
+    fill = abs(float(opening_filled_avg_price))
+    validation_error = None
+    if fill > width:
+        validation_error = (
+            f"Opening fill ${fill:.4f} exceeds ${width:.4f} spread width."
+        )
+
+    if entry_type.lower() == "debit":
+        max_risk = fill
+        max_profit = max(0.0, width - fill)
+    elif entry_type.lower() == "credit":
+        max_profit = fill
+        max_risk = max(0.0, width - fill)
+    else:
+        return FilledTradeEconomics(
+            width,
+            None,
+            None,
+            f"Unknown paper-trade entry type: {entry_type or 'missing'}.",
+        )
+
+    return FilledTradeEconomics(
+        round(width, 4),
+        round(max_profit, 4),
+        round(max_risk, 4),
+        validation_error,
+    )
+
+
 def normalized_exit_policy(policy: str | None) -> str:
     normalized = str(policy or EXIT_NONE).lower().strip()
     return normalized if normalized in EXIT_POLICIES else EXIT_NONE

@@ -107,11 +107,34 @@ def git_commit_sha() -> str | None:
         return None
 
 
+def normalized_scan_time(value) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    raw_value = str(value).strip()
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        return raw_value
+
+
+def legacy_scan_run_id(row: dict) -> str:
+    scan_time = normalized_scan_time(row.get("scan_time"))
+    if scan_time:
+        digest = hashlib.sha256(scan_time.encode()).hexdigest()[:16]
+        return f"legacy-run-{digest}"
+    return f"legacy-row-{row.get('id', 'unknown')}"
+
+
 def normalize_history_row(row: dict) -> dict:
     normalized = dict(row)
     normalized["setup_key"] = setup_key_for_history_row(normalized)
-    if not normalized.get("scan_run_id"):
-        normalized["scan_run_id"] = f"legacy-{normalized.get('id', 'unknown')}"
+    current_scan_run_id = str(normalized.get("scan_run_id") or "")
+    old_row_id = current_scan_run_id.removeprefix("legacy-")
+    if not current_scan_run_id or old_row_id.isdigit() or old_row_id == "unknown":
+        normalized["scan_run_id"] = legacy_scan_run_id(normalized)
     if not normalized.get("scanner_version"):
         normalized["scanner_version"] = "legacy"
     normalized.setdefault("git_commit_sha", None)
@@ -233,7 +256,7 @@ def test_setup_tracking() -> None:
             **values,
         }
     )
-    assert legacy["scan_run_id"] == "legacy-42"
+    assert legacy["scan_run_id"].startswith("legacy-run-")
     assert legacy["setup_key"] == first
     assert legacy["times_recommended"] == 1
     print("Setup/history compatibility tests passed.")
