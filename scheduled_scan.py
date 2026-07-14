@@ -31,6 +31,7 @@ from stock2dupe import (
     get_option_chain,
     scan_trades,
 )
+from stock_universe import prefilter_tickers
 
 
 def select_history_candidates(scored_trades, limit: int = 25, per_ticker: int = 4):
@@ -174,6 +175,35 @@ def main() -> int:
         ).split(",")
         if ticker.strip()
     ]
+    if os.getenv("SCAN_PREFILTER", "").lower() in {"1", "true", "yes"}:
+        selected_tickers, prefilter_results = prefilter_tickers(
+            tickers,
+            max_selected=env_int("SCAN_PREFILTER_MAX_TICKERS", 35),
+            min_price=float(os.getenv("SCAN_PREFILTER_MIN_PRICE", "20")),
+            min_average_volume=env_int("SCAN_PREFILTER_MIN_VOLUME", 1000000),
+            min_volatility_rank=float(
+                os.getenv("SCAN_PREFILTER_MIN_VOL_RANK", "20")
+            ),
+        )
+        print(
+            f"Prefilter selected {len(selected_tickers)} of {len(tickers)} tickers."
+        )
+        for result in sorted(
+            prefilter_results,
+            key=lambda item: item.score,
+            reverse=True,
+        )[:10]:
+            print(
+                f"Prefilter {result.ticker}: "
+                f"{'pass' if result.passed else 'skip'} "
+                f"score {result.score} - {result.reason}"
+            )
+        tickers = selected_tickers
+
+    if not tickers:
+        print("No tickers available after prefilter.")
+        return 1
+
     preferences = ScanPreferences(
         max_risk=float(os.getenv("SCAN_MAX_RISK", "500")),
         outlook=os.getenv("SCAN_OUTLOOK", "neutral"),

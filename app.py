@@ -87,6 +87,7 @@ from stock2dupe import (
     get_option_chain,
     scan_trades,
 )
+from stock_universe import prefilter_tickers
 
 try:
     from event_analysis import (
@@ -510,6 +511,27 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
         event_analyses,
         price_moves,
     )
+
+
+def prefilter_result_rows(results):
+    rows = []
+    for result in results:
+        rows.append(
+            {
+                "Ticker": result.ticker,
+                "Passed": result.passed,
+                "Prefilter Score": result.score,
+                "Price": result.price,
+                "20D Avg Volume": result.average_volume,
+                "Volatility Rank": result.volatility_rank,
+                "1D Move %": result.one_day_move_percent,
+                "5D Move %": result.five_day_move_percent,
+                "Reason": result.reason,
+            }
+        )
+    return rows
+
+
 def expiration_close(ticker: str, expiration: date) -> float | None:
     history = yf.Ticker(ticker).history(
         start=expiration.isoformat(),
@@ -960,13 +982,24 @@ def render_scan_output(scan_output):
     event_analyses = scan_output["event_analyses"]
     history_candidates = scan_output["history_candidates"]
     paper_order_results = scan_output.get("paper_order_results", [])
+    prefilter_rows = scan_output.get("prefilter_rows", [])
+    prefilter_selected_tickers = scan_output.get("prefilter_selected_tickers", [])
+    original_ticker_count = scan_output.get("original_ticker_count", len(ticker_data))
 
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
     metric_candidates.metric("Passing Candidates", len(scored_trades))
     metric_score.metric("Highest Score", f"{top_score}/100" if top_score else "None")
     metric_tracked.metric("Saved to History", len(history_candidates))
-    metric_tickers.metric("Tickers Scanned", len(ticker_data))
+    metric_tickers.metric(
+        "Tickers Scanned",
+        len(ticker_data),
+        delta=(
+            f"from {original_ticker_count}"
+            if prefilter_rows and original_ticker_count != len(ticker_data)
+            else None
+        ),
+    )
 
     if errors:
         for error in errors:
@@ -1089,6 +1122,27 @@ def render_scan_output(scan_output):
                 st.info("No credit spreads passed.")
 
     with market_tab:
+        if prefilter_rows:
+            st.subheader("Broad Universe Prefilter")
+            st.caption(
+                f"Selected {len(prefilter_selected_tickers)} of "
+                f"{original_ticker_count} input tickers for full option-chain scanning."
+            )
+            st.dataframe(
+                pd.DataFrame(prefilter_rows).sort_values(
+                    ["Passed", "Prefilter Score"], ascending=[False, False]
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "20D Avg Volume": st.column_config.NumberColumn(format="%d"),
+                    "Volatility Rank": st.column_config.NumberColumn(format="%.1f"),
+                    "1D Move %": st.column_config.NumberColumn(format="%.2f%%"),
+                    "5D Move %": st.column_config.NumberColumn(format="%.2f%%"),
+                },
+            )
+
         st.subheader("Market Data")
         st.dataframe(
             pd.DataFrame(ticker_data),
@@ -2225,6 +2279,45 @@ with st.sidebar:
             if use_test_expiration
             else None
         )
+    with st.expander("Broad Universe Prefilter"):
+        use_prefilter = st.checkbox(
+            "Prefilter before options scan",
+            value=False,
+            help=(
+                "Use stock-only price, volume, and volatility data to narrow a "
+                "large watchlist before pulling option chains."
+            ),
+        )
+        prefilter_max_tickers = st.number_input(
+            "Max Tickers For Options Scan",
+            min_value=5,
+            max_value=100,
+            value=35,
+            step=5,
+            disabled=not use_prefilter,
+        )
+        prefilter_min_price = st.number_input(
+            "Minimum Stock Price",
+            min_value=1,
+            value=20,
+            step=1,
+            disabled=not use_prefilter,
+        )
+        prefilter_min_volume = st.number_input(
+            "Minimum 20D Avg Volume",
+            min_value=0,
+            value=1_000_000,
+            step=250_000,
+            disabled=not use_prefilter,
+        )
+        prefilter_min_vol_rank = st.number_input(
+            "Minimum Volatility Rank",
+            min_value=0,
+            max_value=100,
+            value=20,
+            step=5,
+            disabled=not use_prefilter,
+        )
     if st.session_state.get("results_unlocked"):
         with st.expander("Alpaca Paper Auto Trading"):
             st.checkbox(
@@ -2262,7 +2355,49 @@ if scan_button:
         nearest_expiration=use_nearest_expiration,
     )
     with st.status("Scanning watchlist...", expanded=True) as scan_status:
-        st.write("Pulling option chains and market data...")
+        prefilter_rows = []
+        original_tickers = tickers
+        if use_prefilter:
+            st.write(
+                f"Prefiltering {len(original_tickers)} tickers before option-chain scan..."
+            )
+            selected_tickers, prefilter_results = prefilter_tickers(
+                original_tickers,
+                max_selected=int(prefilter_max_tickers),
+                min_price=float(prefilter_min_price),
+                min_average_volume=int(prefilter_min_volume),
+                min_volatility_rank=float(prefilter_min_vol_rank),
+            )
+            prefilter_rows = prefilter_result_rows(prefilter_results)
+            if not selected_tickers:
+                st.error("No tickers passed the broad universe prefilter.")
+                st.session_state["last_scan_output"] = {
+                    "scored_trades": [],
+                    "rejected_trades": [],
+                    "trades": [],
+                    "ticker_data": [],
+                    "condor_diagnostics": [],
+                    "errors": ["No tickers passed the broad universe prefilter."],
+                    "event_analyses": {},
+                    "candidate_analyses": {},
+                    "history_candidates": [],
+                    "paper_order_results": [],
+                    "prefilter_rows": prefilter_rows,
+                    "prefilter_selected_tickers": [],
+                    "original_ticker_count": len(original_tickers),
+                }
+                scan_status.update(
+                    label="Scan stopped by prefilter", state="error", expanded=False
+                )
+                st.stop()
+
+            tickers = selected_tickers
+            st.write(
+                f"Prefilter selected {len(tickers)} of {len(original_tickers)} tickers: "
+                + ", ".join(tickers)
+            )
+
+        st.write(f"Pulling option chains and market data for {len(tickers)} tickers...")
         (
             scored_trades,
             rejected_trades,
@@ -2340,6 +2475,9 @@ if scan_button:
         "candidate_analyses": candidate_analyses,
         "history_candidates": history_candidates,
         "paper_order_results": paper_order_results,
+        "prefilter_rows": prefilter_rows,
+        "prefilter_selected_tickers": tickers if use_prefilter else [],
+        "original_ticker_count": len(original_tickers) if use_prefilter else len(tickers),
     }
 
 if st.session_state.get("last_scan_output"):
