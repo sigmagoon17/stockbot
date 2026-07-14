@@ -810,7 +810,7 @@ def apply_normalized_ticker_scores(scored_trades: list[ScoredTrade]) -> list[Sco
     for scored in scored_trades:
         ticker_scores = scores_by_ticker[scored.trade.ticker]
         if len(ticker_scores) == 1:
-            ticker_score = 100
+            ticker_score = 50
         else:
             lower_or_equal_count = sum(
                 score <= scored.total_score for score in ticker_scores
@@ -877,9 +877,10 @@ def remove_similar_spreads(scored_trades: list[ScoredTrade]) -> list[ScoredTrade
 
 def diversify_scored_trades(scored_trades: list[ScoredTrade]) -> list[ScoredTrade]:
     deduped = remove_similar_spreads(scored_trades)
+    normalized = apply_normalized_ticker_scores(deduped)
     best_by_ticker_strategy = {}
 
-    for scored in deduped:
+    for scored in normalized:
         key = (scored.trade.ticker, scored.trade.strategy)
         current_best = best_by_ticker_strategy.get(key)
         if current_best is None or scored.total_score > current_best.total_score:
@@ -1028,7 +1029,6 @@ def scan_trades(
         else:
             rejected.append((trade, reasons))
 
-    passing = apply_normalized_ticker_scores(passing)
     passing.sort(key=lambda scored_trade: scored_trade.total_score, reverse=True)
     return diversify_scored_trades(passing), rejected
 
@@ -1578,6 +1578,186 @@ def sample_trades() -> list[Trade]:
         Trade("COIN", "call credit spread", "2026-08-07", "call",   0.23, 88,  False, 700,  180, 49, 2.10, 2.34, 2.20,   7.80, 245,  30,      286,   296,  4.70,       4.94,       2.50,      2.60,      0.23,        0.14),
         Trade("AMZN", "put credit spread",  "2026-07-17", "put",   -0.14, 41,  False, 350,  70,  24, 0.75, 0.86, 0.80,   4.20, 185,  10,      176,   171,  1.40,       1.49,       0.60,      0.63,     -0.14,       -0.08),
     ]
+
+
+def ranking_test_trade(
+    ticker: str,
+    strategy: str,
+    short_strike: float,
+    long_strike: float,
+    expiration: str = "2026-07-31",
+    option_type: str = "call",
+) -> Trade:
+    return Trade(
+        ticker=ticker,
+        strategy=strategy,
+        expiration=expiration,
+        option_type=option_type,
+        delta=0.2,
+        volatility_rank=55,
+        earnings_before_exp=False,
+        open_interest=1000,
+        volume=500,
+        dte=30,
+        bid=1.0,
+        ask=1.1,
+        credit=1.0,
+        max_risk=4.0,
+        underlying_price=100.0,
+        expected_move=5.0,
+        short_strike=short_strike,
+        long_strike=long_strike,
+        short_bid=1.0,
+        short_ask=1.1,
+        long_bid=0.4,
+        long_ask=0.5,
+        short_delta=0.2,
+        long_delta=0.1,
+    )
+
+
+def ranking_test_scored(
+    ticker: str,
+    strategy: str,
+    score: int,
+    short_strike: float,
+    long_strike: float,
+    expiration: str = "2026-07-31",
+    option_type: str = "call",
+    **trade_updates,
+) -> ScoredTrade:
+    trade = ranking_test_trade(
+        ticker,
+        strategy,
+        short_strike,
+        long_strike,
+        expiration,
+        option_type,
+    )
+    if trade_updates:
+        trade = replace(trade, **trade_updates)
+    return ScoredTrade(
+        trade=trade,
+        risk_level="Moderate",
+        category_scores={},
+        quant_score=score,
+        event_adjustment=0,
+        price_move_adjustment=0,
+        price_move_style="normal",
+        total_score=score,
+        reasons=[],
+        explanation="ranking test",
+    )
+
+
+def test_diversified_ranking_single_candidate_neutral_score() -> None:
+    ranked = diversify_scored_trades(
+        [ranking_test_scored("AAPL", "bull call debit spread", 82, 105, 100)]
+    )
+    assert len(ranked) == 1
+    assert ranked[0].normalized_ticker_score == 50
+
+
+def test_diversified_ranking_tied_scores_share_top_percentile() -> None:
+    ranked = diversify_scored_trades(
+        [
+            ranking_test_scored("AAPL", "bull call debit spread", 80, 105, 100),
+            ranking_test_scored("AAPL", "bear put debit spread", 80, 95, 100, option_type="put"),
+        ]
+    )
+    assert {scored.normalized_ticker_score for scored in ranked} == {100}
+
+
+def test_diversified_ranking_removes_duplicate_spreads() -> None:
+    ranked = diversify_scored_trades(
+        [
+            ranking_test_scored("SPY", "bull call debit spread", 70, 605, 600),
+            ranking_test_scored("SPY", "bull call debit spread", 90, 606, 601),
+            ranking_test_scored("SPY", "bull call debit spread", 75, 607, 602),
+        ]
+    )
+    assert len(ranked) == 1
+    assert ranked[0].total_score == 90
+    assert ranked[0].trade.short_strike == 606
+
+
+def test_diversified_ranking_keeps_several_strategies_for_one_ticker() -> None:
+    ranked = diversify_scored_trades(
+        [
+            ranking_test_scored("NVDA", "bull call debit spread", 88, 210, 205),
+            ranking_test_scored("NVDA", "bear put debit spread", 81, 190, 195, option_type="put"),
+            ranking_test_scored("NVDA", "put credit spread", 76, 180, 175, option_type="put"),
+        ]
+    )
+    assert [scored.trade.strategy for scored in ranked] == [
+        "bull call debit spread",
+        "bear put debit spread",
+        "put credit spread",
+    ]
+
+
+def test_diversified_ranking_keeps_multiple_tickers() -> None:
+    ranked = diversify_scored_trades(
+        [
+            ranking_test_scored("SPY", "bull call debit spread", 86, 605, 600),
+            ranking_test_scored("NVDA", "bull call debit spread", 84, 210, 205),
+            ranking_test_scored("TSLA", "bear put debit spread", 82, 190, 195, option_type="put"),
+        ]
+    )
+    assert [scored.trade.ticker for scored in ranked] == ["SPY", "NVDA", "TSLA"]
+
+
+def test_diversified_ranking_iron_condor_similarity() -> None:
+    first = ranking_test_scored(
+        "SPY",
+        "iron condor",
+        72,
+        600,
+        610,
+        option_type="mixed",
+        put_long_strike=580,
+        put_short_strike=585,
+        call_short_strike=615,
+        call_long_strike=620,
+    )
+    better_duplicate = ranking_test_scored(
+        "SPY",
+        "iron condor",
+        88,
+        601,
+        611,
+        option_type="mixed",
+        put_long_strike=581,
+        put_short_strike=586,
+        call_short_strike=616,
+        call_long_strike=621,
+    )
+    ranked = diversify_scored_trades([first, better_duplicate])
+    assert len(ranked) == 1
+    assert ranked[0].total_score == 88
+
+
+def test_diversified_ranking_highest_score_survives_deduplication() -> None:
+    ranked = diversify_scored_trades(
+        [
+            ranking_test_scored("QQQ", "call credit spread", 78, 505, 510),
+            ranking_test_scored("QQQ", "call credit spread", 91, 506, 511),
+            ranking_test_scored("QQQ", "call credit spread", 83, 507, 512),
+        ]
+    )
+    assert len(ranked) == 1
+    assert ranked[0].total_score == 91
+
+
+def test_diversified_ranking() -> None:
+    test_diversified_ranking_single_candidate_neutral_score()
+    test_diversified_ranking_tied_scores_share_top_percentile()
+    test_diversified_ranking_removes_duplicate_spreads()
+    test_diversified_ranking_keeps_several_strategies_for_one_ticker()
+    test_diversified_ranking_keeps_multiple_tickers()
+    test_diversified_ranking_iron_condor_similarity()
+    test_diversified_ranking_highest_score_survives_deduplication()
+    print("Diversified ranking tests passed.")
 
 
 def test_event_adjustments() -> None:

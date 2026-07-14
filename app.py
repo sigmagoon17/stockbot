@@ -719,7 +719,11 @@ def candidate_column_config():
         ),
         "Ticker Score": st.column_config.NumberColumn(
             "Ticker Score",
-            help="How strong this setup is compared with today's other passing setups for the same ticker.",
+            help=(
+                "Relative only to other deduplicated passing setups for this "
+                "ticker in the current scan. It is not historical strength or "
+                "a prediction of success."
+            ),
             format="%d / 100",
         ),
         "Realized Volatility Rank": st.column_config.NumberColumn(
