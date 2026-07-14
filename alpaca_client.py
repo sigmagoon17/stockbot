@@ -1,3 +1,4 @@
+import math
 import os
 from datetime import date, timedelta
 
@@ -351,6 +352,66 @@ def get_alpaca_positions() -> tuple[list[dict], list[str]]:
     return positions or [], []
 
 
+def nonzero_alpaca_position_quantities(
+    positions: list[dict],
+) -> tuple[dict[str, float], list[str]]:
+    quantities = {}
+    errors = []
+    for position in positions:
+        symbol = str(position.get("symbol") or "").strip().upper()
+        raw_quantity = position.get("qty")
+        if not symbol:
+            errors.append("Alpaca returned a position without an option symbol.")
+            continue
+        try:
+            quantity = float(raw_quantity)
+        except (TypeError, ValueError):
+            errors.append(
+                f"Alpaca returned an invalid position quantity for {symbol}: "
+                f"{raw_quantity!r}."
+            )
+            continue
+        if not math.isfinite(quantity):
+            errors.append(
+                f"Alpaca returned an invalid position quantity for {symbol}: "
+                f"{raw_quantity!r}."
+            )
+            continue
+        if quantity != 0:
+            quantities[symbol] = quantity
+    return quantities, errors
+
+
+def _display_position_quantity(quantity: float) -> str:
+    return f"{quantity:g}"
+
+
+def _position_overlap_message(leg: dict, quantity: float) -> str:
+    symbol = leg["symbol"]
+    required_intent = leg["position_intent"]
+    inferred_intent = None
+    if quantity > 0 and leg.get("side") == "sell":
+        inferred_intent = "sell_to_close"
+    elif quantity < 0 and leg.get("side") == "buy":
+        inferred_intent = "buy_to_close"
+
+    if inferred_intent:
+        explanation = (
+            f"the candidate requires {required_intent} but Alpaca would infer "
+            f"{inferred_intent}"
+        )
+    else:
+        explanation = (
+            f"the candidate requires {required_intent}, and opening another setup "
+            "against an existing broker leg could cause Alpaca to infer a closing intent"
+        )
+    return (
+        f"Skipped because {symbol} already has broker position qty "
+        f"{_display_position_quantity(quantity)}; {explanation}, causing a "
+        "position_intent mismatch."
+    )
+
+
 def get_recent_alpaca_orders(limit: int = 10) -> tuple[list[dict], list[str]]:
     orders, errors = alpaca_request(
         "GET",
@@ -555,6 +616,47 @@ def submit_scored_multileg_orders(
     exit_policy: str = "none",
     scan_run_id: str | None = None,
 ) -> list[dict]:
+    selected_candidates = list(scored_candidates)[:limit]
+    if not selected_candidates:
+        return [
+            {
+                "Candidate": "Latest Scan",
+                "Symbol": "",
+                "Status": "Skipped",
+                "Message": "No candidates were available for paper trading.",
+            }
+        ]
+
+    positions, position_errors = get_alpaca_positions()
+    if position_errors:
+        return [
+            {
+                "Candidate": "Broker Position Safety Check",
+                "Symbol": "",
+                "Status": "Error",
+                "Message": (
+                    "Alpaca position lookup failed; no paper orders were submitted. "
+                    + "; ".join(position_errors)
+                ),
+            }
+        ]
+
+    live_position_quantities, quantity_errors = nonzero_alpaca_position_quantities(
+        positions
+    )
+    if quantity_errors:
+        return [
+            {
+                "Candidate": "Broker Position Safety Check",
+                "Symbol": "",
+                "Status": "Error",
+                "Message": (
+                    "Alpaca position data could not be validated; no paper orders "
+                    "were submitted. " + "; ".join(quantity_errors)
+                ),
+            }
+        ]
+
     recent_orders, recent_errors = get_recent_alpaca_orders(limit=100)
     recent_client_order_ids = {
         order.get("client_order_id")
@@ -572,7 +674,7 @@ def submit_scored_multileg_orders(
         for error in recent_errors
     ]
 
-    selected_candidates = list(scored_candidates)[:limit]
+    reserved_symbols = set()
 
     for scored in selected_candidates:
         trade = scored.trade
@@ -593,6 +695,47 @@ def submit_scored_multileg_orders(
                 }
             )
             continue
+
+        overlapping_leg = next(
+            (
+                leg
+                for leg in legs
+                if leg["symbol"].upper() in live_position_quantities
+            ),
+            None,
+        )
+        if overlapping_leg is not None:
+            symbol = overlapping_leg["symbol"].upper()
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Skipped",
+                    "Message": _position_overlap_message(
+                        overlapping_leg, live_position_quantities[symbol]
+                    ),
+                }
+            )
+            continue
+
+        candidate_symbols = {leg["symbol"].upper() for leg in legs}
+        shared_symbols = candidate_symbols & reserved_symbols
+        if shared_symbols:
+            symbol = sorted(shared_symbols)[0]
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Skipped",
+                    "Message": (
+                        f"Skipped because {symbol} is already reserved by a "
+                        "higher-ranked candidate in this scan; no legs were "
+                        "submitted, preventing a position_intent conflict."
+                    ),
+                }
+            )
+            continue
+        reserved_symbols.update(candidate_symbols)
 
         client_order_id = scan_client_order_id(scored, scan_run_id)
         if client_order_id in recent_client_order_ids:
@@ -666,16 +809,6 @@ def submit_scored_multileg_orders(
                 "Opening Order Status": order.get("status"),
                 "Opening Filled At": order.get("filled_at"),
                 "Opening Filled Avg Price": order.get("filled_avg_price"),
-            }
-        )
-
-    if not selected_candidates:
-        results.append(
-            {
-                "Candidate": "Latest Scan",
-                "Symbol": "",
-                "Status": "Skipped",
-                "Message": "No candidates were available for paper trading.",
             }
         )
 
