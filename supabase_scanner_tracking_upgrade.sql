@@ -52,14 +52,23 @@ alter table public.alpaca_paper_orders
     add column if not exists opening_order_status text,
     add column if not exists opening_filled_at timestamptz,
     add column if not exists opening_filled_avg_price numeric,
+    add column if not exists spread_width_per_share numeric,
+    add column if not exists filled_max_profit_per_share numeric,
+    add column if not exists filled_max_risk_per_share numeric,
+    add column if not exists fill_validation_error text,
     add column if not exists exit_policy text not null default 'none',
-    add column if not exists position_status text not null default 'open',
+    add column if not exists position_status text not null default 'pending',
     add column if not exists exit_signal_time timestamptz,
     add column if not exists exit_reason text,
     add column if not exists close_order_id text,
     add column if not exists close_client_order_id text,
     add column if not exists close_order_status text,
     add column if not exists close_order_submitted_at timestamptz,
+    add column if not exists close_attempt_count integer not null default 0,
+    add column if not exists last_close_attempt_at timestamptz,
+    add column if not exists close_attempt_run_id text,
+    add column if not exists exit_retryable boolean not null default true,
+    add column if not exists close_attempt_history jsonb not null default '[]'::jsonb,
     add column if not exists exit_fill_time timestamptz,
     add column if not exists exit_fill_price numeric,
     add column if not exists realized_pnl numeric,
@@ -67,6 +76,16 @@ alter table public.alpaca_paper_orders
     add column if not exists maximum_favorable_excursion numeric,
     add column if not exists maximum_adverse_excursion numeric,
     add column if not exists last_exit_error text;
+
+alter table public.alpaca_paper_orders
+    alter column position_status set default 'pending';
+
+drop index if exists public.alpaca_paper_orders_leg_key_idx;
+
+create unique index alpaca_paper_orders_leg_key_idx
+    on public.alpaca_paper_orders(leg_key)
+    where leg_key is not null
+      and position_status in ('pending', 'open');
 
 create unique index if not exists alpaca_paper_orders_close_client_order_id_idx
     on public.alpaca_paper_orders(close_client_order_id)
@@ -78,11 +97,17 @@ create index if not exists alpaca_paper_orders_scan_run_id_idx
 create index if not exists alpaca_paper_orders_setup_key_idx
     on public.alpaca_paper_orders(setup_key);
 
+drop function if exists public.claim_alpaca_paper_exit(
+    bigint, text, timestamptz, text
+);
+
 create or replace function public.claim_alpaca_paper_exit(
     p_order_id bigint,
     p_exit_reason text,
     p_signal_time timestamptz,
-    p_close_client_order_id text
+    p_close_client_order_id text,
+    p_attempt_number integer,
+    p_attempt_run_id text
 )
 returns setof public.alpaca_paper_orders
 language plpgsql
@@ -97,19 +122,54 @@ begin
         exit_reason = p_exit_reason,
         close_client_order_id = p_close_client_order_id,
         close_order_status = 'submitting',
+        close_order_id = null,
+        close_order_submitted_at = null,
+        exit_fill_time = null,
+        exit_fill_price = null,
+        close_attempt_history = case
+            when coalesce(close_attempt_count, 0) > 0 then
+                coalesce(close_attempt_history, '[]'::jsonb)
+                || jsonb_build_array(
+                    jsonb_build_object(
+                        'attempt', close_attempt_count,
+                        'order_id', close_order_id,
+                        'client_order_id', close_client_order_id,
+                        'status', close_order_status,
+                        'submitted_at', close_order_submitted_at,
+                        'error', last_exit_error
+                    )
+                )
+            else coalesce(close_attempt_history, '[]'::jsonb)
+        end,
+        close_attempt_count = p_attempt_number,
+        last_close_attempt_at = p_signal_time,
+        close_attempt_run_id = p_attempt_run_id,
+        exit_retryable = false,
         last_exit_error = null
     where id = p_order_id
-      and close_order_status is null
       and position_status = 'open'
       and opening_order_status = 'filled'
       and opening_filled_avg_price is not null
+      and coalesce(close_attempt_count, 0) + 1 = p_attempt_number
+      and close_attempt_run_id is distinct from p_attempt_run_id
+      and (
+          close_order_status is null
+          or (
+              lower(close_order_status) in ('rejected', 'canceled', 'expired')
+              and coalesce(exit_retryable, false)
+          )
+      )
     returning *;
 end;
 $$;
 
-revoke all on function public.claim_alpaca_paper_exit(bigint, text, timestamptz, text)
+revoke all on function public.claim_alpaca_paper_exit(
+    bigint, text, timestamptz, text, integer, text
+)
     from public, anon, authenticated;
-grant execute on function public.claim_alpaca_paper_exit(bigint, text, timestamptz, text)
+grant execute on function public.claim_alpaca_paper_exit(
+    bigint, text, timestamptz, text, integer, text
+)
     to service_role;
 
 alter table public.alpaca_paper_position_snapshots

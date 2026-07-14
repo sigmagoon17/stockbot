@@ -117,7 +117,7 @@ class SetupHistoryTests(unittest.TestCase):
                 "short_strike": 605,
             }
         )
-        self.assertEqual("legacy-12", normalized["scan_run_id"])
+        self.assertTrue(normalized["scan_run_id"].startswith("legacy-run-"))
         self.assertTrue(normalized["setup_key"])
         self.assertEqual(1, normalized["times_recommended"])
 

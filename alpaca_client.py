@@ -240,6 +240,46 @@ def strategy_from_order_legs(legs: list[dict]) -> str:
     return "multi-leg option order"
 
 
+ENTRY_TYPE_BY_STRATEGY = {
+    "bull call debit spread": "debit",
+    "bear put debit spread": "debit",
+    "put credit spread": "credit",
+    "call credit spread": "credit",
+    "iron condor": "credit",
+}
+
+
+def entry_type_for_strategy(strategy: str) -> str | None:
+    return ENTRY_TYPE_BY_STRATEGY.get(str(strategy or "").lower())
+
+
+def spread_width_from_order_legs(legs: list[dict], strategy: str) -> float | None:
+    symbols = [leg.get("symbol", "") for leg in legs if leg.get("symbol")]
+    if len(symbols) == 2:
+        return round(abs(int(symbols[0][-8:]) - int(symbols[1][-8:])) / 1000, 4)
+    if len(symbols) == 4 and strategy == "iron condor":
+        put_strikes = [int(symbol[-8:]) / 1000 for symbol in symbols if symbol[-9] == "P"]
+        call_strikes = [int(symbol[-8:]) / 1000 for symbol in symbols if symbol[-9] == "C"]
+        if len(put_strikes) != 2 or len(call_strikes) != 2:
+            return None
+        return round(
+            max(
+                abs(put_strikes[0] - put_strikes[1]),
+                abs(call_strikes[0] - call_strikes[1]),
+            ),
+            4,
+        )
+    return None
+
+
+def trade_spread_width_per_share(trade) -> float:
+    if trade.strategy == "iron condor":
+        put_width = abs(float(trade.put_short_strike) - float(trade.put_long_strike))
+        call_width = abs(float(trade.call_long_strike) - float(trade.call_short_strike))
+        return round(max(put_width, call_width), 4)
+    return round(abs(float(trade.short_strike) - float(trade.long_strike)), 4)
+
+
 def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
     legs = order.get("legs") or []
     if not legs:
@@ -259,6 +299,7 @@ def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
         return None
 
     first_symbol = normalized_legs[0]["symbol"]
+    strategy = strategy_from_order_legs(normalized_legs)
     return {
         "Candidate": "Alpaca backfill",
         "Symbol": order.get("symbol") or (
@@ -269,11 +310,14 @@ def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
         "Order ID": order.get("id"),
         "Client Order ID": order.get("client_order_id"),
         "Ticker": ticker_from_option_symbol(first_symbol),
-        "Strategy": strategy_from_order_legs(normalized_legs),
+        "Strategy": strategy,
         "Expiration": expiration_from_option_symbol(first_symbol),
         "Setup Score": None,
-        "Entry Type": "credit" if float(order.get("limit_price") or 0) < 0 else "debit",
+        "Entry Type": entry_type_for_strategy(strategy),
         "Limit Price": float(order.get("limit_price") or 0),
+        "Spread Width Per Share": spread_width_from_order_legs(
+            normalized_legs, strategy
+        ),
         "Max Profit": None,
         "Max Risk": None,
         "Quantity": int(float(order.get("qty") or 1)),
@@ -605,6 +649,7 @@ def submit_scored_multileg_orders(
                 "Selection Method": SELECTION_EXECUTION,
                 "Entry Type": trade.entry_type,
                 "Limit Price": limit_price,
+                "Spread Width Per Share": trade_spread_width_per_share(trade),
                 "Max Profit": round(
                     float(
                         trade.max_profit

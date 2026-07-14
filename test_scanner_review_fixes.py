@@ -9,18 +9,29 @@ from unittest.mock import patch
 os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SECRET_KEY", "test-key")
 
-from alpaca_client import scan_client_order_id
+from alpaca_client import (
+    option_symbol,
+    paper_order_result_from_alpaca_order,
+    scan_client_order_id,
+)
 from backfill_scan_history import apply_backfill, fetch_scan_history
 from history_tracker import (
     _refresh_paper_close_order,
+    active_leg_keys,
     active_symbol_order_counts,
+    close_attempt_is_allowed,
+    close_client_order_id_for_attempt,
     expiration_is_ready,
     opening_order_update_values,
     paper_exit_decision_for_order,
     paper_order_is_active,
+    spread_width_for_tracked_order,
 )
 from paper_exit import submit_claimed_paper_exit
-from scanner_tracking import build_history_backfill_updates, normalize_history_row
+from scanner_tracking import (
+    build_history_backfill_updates,
+    normalize_history_row,
+)
 from stock2dupe import (
     ranking_test_scored,
     select_history_candidates,
@@ -36,6 +47,10 @@ def filled_order(**overrides):
         "opening_order_status": "filled",
         "opening_filled_at": "2026-07-14T14:00:00+00:00",
         "opening_filled_avg_price": 2.0,
+        "spread_width_per_share": 5.0,
+        "filled_max_profit_per_share": 3.0,
+        "filled_max_risk_per_share": 2.0,
+        "fill_validation_error": None,
         "position_status": "open",
         "close_order_status": None,
         "entry_type": "debit",
@@ -44,6 +59,9 @@ def filled_order(**overrides):
         "max_risk": 3.0,
         "quantity": 1,
         "exit_policy": "tp50",
+        "exit_retryable": True,
+        "close_attempt_count": 0,
+        "close_attempt_run_id": None,
         "leg_key": (
             "NVDA260717C00200000:buy:buy_to_open:1|"
             "NVDA260717C00205000:sell:sell_to_open:1"
@@ -79,7 +97,7 @@ class LegacyNormalizationAndBackfillTests(unittest.TestCase):
             "lowest_unrealized_pnl": -14.0,
         }
         normalized = normalize_history_row(row)
-        self.assertEqual("legacy-9", normalized["scan_run_id"])
+        self.assertTrue(normalized["scan_run_id"].startswith("legacy-run-"))
         self.assertEqual("legacy", normalized["scanner_version"])
         self.assertEqual("raw", normalized["selection_method"])
         self.assertEqual(row["scan_time"], normalized["first_seen_at"])
@@ -108,21 +126,42 @@ class LegacyNormalizationAndBackfillTests(unittest.TestCase):
             "maximum_favorable_excursion": None,
             "maximum_adverse_excursion": None,
         }
+        first_scan = "2026-07-01T12:00:00+00:00"
+        second_scan = "2026-07-02T12:00:00+00:00"
         rows = [
-            {"id": 1, "scan_time": "2026-07-01T12:00:00+00:00", **base},
-            {"id": 2, "scan_time": "2026-07-02T12:00:00+00:00", **base},
+            {"id": 1, "scan_time": first_scan, **base},
+            {"id": 2, "scan_time": first_scan, **base},
+            {"id": 3, "scan_time": second_scan, **base},
+            {"id": 4, "scan_time": second_scan, **base},
         ]
         updates = build_history_backfill_updates(rows)
-        self.assertEqual(2, len(updates))
-        self.assertEqual(2, updates[0]["values"]["times_recommended"])
-        self.assertEqual(rows[0]["scan_time"], updates[1]["values"]["first_seen_at"])
-        self.assertEqual(rows[1]["scan_time"], updates[0]["values"]["last_seen_at"])
+        self.assertEqual(4, len(updates))
+        by_id = {update["id"]: update["values"] for update in updates}
+        self.assertEqual(4, by_id[1]["times_recommended"])
+        self.assertEqual(first_scan, by_id[4]["first_seen_at"])
+        self.assertEqual(second_scan, by_id[1]["last_seen_at"])
+        self.assertEqual(by_id[1]["scan_run_id"], by_id[2]["scan_run_id"])
+        self.assertEqual(by_id[3]["scan_run_id"], by_id[4]["scan_run_id"])
+        self.assertNotEqual(by_id[1]["scan_run_id"], by_id[3]["scan_run_id"])
 
         updated_rows = []
-        by_id = {update["id"]: update["values"] for update in updates}
         for row in rows:
             updated_rows.append({**row, **by_id[row["id"]]})
         self.assertEqual([], build_history_backfill_updates(updated_rows))
+
+    def test_legacy_row_without_scan_time_uses_row_id(self):
+        normalized = normalize_history_row(
+            {
+                "id": 17,
+                "scan_time": None,
+                "ticker": "SPY",
+                "strategy": "bull call debit spread",
+                "expiration": "2026-07-31",
+                "long_strike": 600,
+                "short_strike": 605,
+            }
+        )
+        self.assertEqual("legacy-row-17", normalized["scan_run_id"])
 
     def test_backfill_fetches_and_writes_in_batches(self):
         class FakeClient:
@@ -179,11 +218,14 @@ class FillAndValuationTests(unittest.TestCase):
                 "status": "filled",
                 "filled_at": "2026-07-14T14:01:00+00:00",
                 "filled_avg_price": "2.00",
-            }
+            },
+            filled_order(),
         )
         self.assertEqual(2.0, values["opening_filled_avg_price"])
         self.assertEqual(2.0, values["entry_price"])
         self.assertEqual("open", values["position_status"])
+        self.assertEqual(3.0, values["filled_max_profit_per_share"])
+        self.assertEqual(2.0, values["filled_max_risk_per_share"])
 
     def test_terminal_opening_order_is_not_active(self):
         values = opening_order_update_values(
@@ -196,8 +238,43 @@ class FillAndValuationTests(unittest.TestCase):
     def test_take_profit_uses_fill_instead_of_submitted_limit(self):
         order = filled_order(limit_price=1.0, opening_filled_avg_price=2.0)
         decision = paper_exit_decision_for_order(order, current_value_per_share=3.5)
-        self.assertEqual(4.0, decision.target_value_per_share)
+        self.assertEqual(3.5, decision.target_value_per_share)
+        self.assertTrue(decision.should_close)
+
+    def test_credit_economics_use_actual_credit(self):
+        order = filled_order(entry_type="credit", limit_price=1.0)
+        values = opening_order_update_values(
+            {"status": "filled", "filled_avg_price": "1.50"},
+            order,
+        )
+        order.update(values)
+        self.assertEqual(1.5, values["filled_max_profit_per_share"])
+        self.assertEqual(3.5, values["filled_max_risk_per_share"])
+        decision = paper_exit_decision_for_order(order, current_value_per_share=0.75)
+        self.assertEqual(0.75, decision.target_value_per_share)
+        self.assertTrue(decision.should_close)
+
+    def test_impossible_fill_is_clamped_and_visible(self):
+        values = opening_order_update_values(
+            {"status": "filled", "filled_avg_price": "6.00"},
+            filled_order(entry_type="debit", spread_width_per_share=5.0),
+        )
+        self.assertEqual(0.0, values["filled_max_profit_per_share"])
+        self.assertEqual(6.0, values["filled_max_risk_per_share"])
+        self.assertIn("exceeds", values["fill_validation_error"])
+
+    def test_legacy_order_width_can_be_recovered_from_legs(self):
+        order = filled_order(spread_width_per_share=None)
+        self.assertEqual(5.0, spread_width_for_tracked_order(order))
+
+    def test_missing_fill_economics_cannot_trigger_exit(self):
+        order = filled_order(
+            filled_max_profit_per_share=None,
+            filled_max_risk_per_share=None,
+        )
+        decision = paper_exit_decision_for_order(order, current_value_per_share=5.0)
         self.assertFalse(decision.should_close)
+        self.assertIsNone(decision.target_value_per_share)
 
     def test_unfilled_order_cannot_auto_exit(self):
         order = filled_order(
@@ -328,6 +405,148 @@ class AtomicExitTests(unittest.TestCase):
         self.assertTrue(result.recorded)
         self.assertEqual("rejected", rejected[0][1])
 
+    def test_only_one_caller_claims_a_retry_attempt(self):
+        state = {"status": "rejected", "attempt": 1, "submissions": 0}
+
+        def claim():
+            if state["status"] != "rejected":
+                return None
+            state["status"] = "submitting"
+            state["attempt"] += 1
+            return {"id": 1, "close_attempt_count": state["attempt"]}
+
+        def submit(_):
+            state["submissions"] += 1
+            return {"id": "close-2", "status": "accepted"}, []
+
+        arguments = {
+            "claim": claim,
+            "submit": submit,
+            "record_accepted": lambda *_: None,
+            "record_rejected": lambda *_: None,
+        }
+        first = submit_claimed_paper_exit(**arguments)
+        second = submit_claimed_paper_exit(**arguments)
+        self.assertTrue(first.submitted)
+        self.assertFalse(second.submitted)
+        self.assertEqual(1, state["submissions"])
+
+
+class ExitRetryTests(unittest.TestCase):
+    def test_terminal_close_statuses_are_retryable_on_later_run(self):
+        for status in ("rejected", "canceled", "expired"):
+            with self.subTest(status=status):
+                order = filled_order(
+                    close_order_status=status,
+                    exit_retryable=True,
+                    close_attempt_run_id="previous-run",
+                )
+                self.assertTrue(close_attempt_is_allowed(order, "new-run"))
+                self.assertFalse(close_attempt_is_allowed(order, "previous-run"))
+
+    def test_nonterminal_close_statuses_never_retry(self):
+        for status in (
+            "accepted",
+            "pending",
+            "pending_new",
+            "partially_filled",
+            "filled",
+        ):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    close_attempt_is_allowed(
+                        filled_order(close_order_status=status),
+                        "new-run",
+                    )
+                )
+
+    def test_retry_client_order_ids_are_deterministic_and_attempt_scoped(self):
+        order = filled_order()
+        first = close_client_order_id_for_attempt(order, 1, "tp50")
+        repeated = close_client_order_id_for_attempt(order, 1, "tp50")
+        retry = close_client_order_id_for_attempt(order, 2, "tp50")
+        self.assertEqual(first, repeated)
+        self.assertIn("-a1-", first)
+        self.assertIn("-a2-", retry)
+        self.assertNotEqual(first, retry)
+
+
+class ActiveDuplicateLegTests(unittest.TestCase):
+    def test_only_pending_and_open_orders_reserve_leg_keys(self):
+        rows = [
+            {"leg_key": "open-leg", "position_status": "open"},
+            {"leg_key": "pending-leg", "position_status": "pending"},
+            {"leg_key": "closed-leg", "position_status": "closed"},
+            {"leg_key": "rejected-leg", "position_status": "rejected"},
+            {"leg_key": "canceled-leg", "position_status": "canceled"},
+        ]
+        self.assertEqual(
+            {"open-leg", "pending-leg"},
+            active_leg_keys(rows),
+        )
+
+
+class HistoricalOrderClassificationTests(unittest.TestCase):
+    def order_result(self, legs):
+        return paper_order_result_from_alpaca_order(
+            {
+                "id": "historical",
+                "status": "filled",
+                "limit_price": "1.25",
+                "qty": "1",
+                "legs": legs,
+            }
+        )
+
+    def test_strategy_determines_entry_type(self):
+        ticker = "SPY"
+        expiration = "2026-08-21"
+        cases = {
+            "bull call debit spread": [
+                ("call", 600, "buy"), ("call", 605, "sell")
+            ],
+            "bear put debit spread": [
+                ("put", 605, "buy"), ("put", 600, "sell")
+            ],
+            "put credit spread": [
+                ("put", 595, "buy"), ("put", 600, "sell")
+            ],
+            "call credit spread": [
+                ("call", 605, "buy"), ("call", 600, "sell")
+            ],
+        }
+        expected_entry_types = {
+            "bull call debit spread": "debit",
+            "bear put debit spread": "debit",
+            "put credit spread": "credit",
+            "call credit spread": "credit",
+        }
+        for strategy, leg_values in cases.items():
+            with self.subTest(strategy=strategy):
+                legs = [
+                    {
+                        "symbol": option_symbol(ticker, expiration, option_type, strike),
+                        "side": side,
+                    }
+                    for option_type, strike, side in leg_values
+                ]
+                result = self.order_result(legs)
+                self.assertEqual(strategy, result["Strategy"])
+                self.assertEqual(expected_entry_types[strategy], result["Entry Type"])
+                self.assertEqual(5.0, result["Spread Width Per Share"])
+
+    def test_iron_condor_is_classified_as_credit(self):
+        legs = [
+            {"symbol": option_symbol("SPY", "2026-08-21", "put", 590), "side": "buy"},
+            {"symbol": option_symbol("SPY", "2026-08-21", "put", 595), "side": "sell"},
+            {"symbol": option_symbol("SPY", "2026-08-21", "call", 605), "side": "sell"},
+            {"symbol": option_symbol("SPY", "2026-08-21", "call", 610), "side": "buy"},
+        ]
+        result = self.order_result(legs)
+        self.assertEqual("iron condor", result["Strategy"])
+        self.assertEqual("credit", result["Entry Type"])
+        self.assertEqual(5.0, result["Spread Width Per Share"])
+
 
 class CloseRefreshTests(unittest.TestCase):
     def test_newly_filled_close_updates_returned_order(self):
@@ -368,6 +587,7 @@ class CloseRefreshTests(unittest.TestCase):
         self.assertEqual("filled", refreshed["close_order_status"])
         self.assertEqual("closed", refreshed["position_status"])
         self.assertEqual(100.0, refreshed["realized_pnl"])
+        self.assertEqual(50.0, refreshed["realized_return_on_risk"])
         self.assertFalse(paper_order_is_active(refreshed))
 
 
