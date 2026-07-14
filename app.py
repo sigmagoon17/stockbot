@@ -105,6 +105,16 @@ st.set_page_config(page_title="Options Scanner", layout="wide")
 
 EVENT_ANALYSIS_SUCCESS_TTL_SECONDS = 6 * 60 * 60
 EVENT_ANALYSIS_FAILURE_TTL_SECONDS = 5 * 60
+DEFAULT_TICKERS = "AAPL, SPY, QQQ, NVDA, MSFT, COHR"
+LARGE_PRESET_TICKERS = (
+    "SPY, QQQ, IWM, SMH, TQQQ, SQQQ, XLF, XLK, XLE, DIA, "
+    "NVDA, TSLA, AAPL, MSFT, META, AMZN, GOOGL, AMD, AVGO, NFLX, "
+    "PLTR, ORCL, TSM, MU, ARM, SMCI, QCOM, ASML, AMAT, LRCX, "
+    "COIN, HOOD, SOFI, JPM, BAC, GS, WFC, SCHW, "
+    "CRWD, PANW, SNOW, SHOP, DDOG, NET, ZS, MDB, "
+    "LLY, UNH, ABBV, ISRG, "
+    "UBER, ABNB, RCL, CAT, GE, XOM, CVX, RIOT, MARA, RKLB"
+)
 
 
 @st.cache_resource
@@ -2241,7 +2251,7 @@ def render_ready_state():
         "the top candidates with AI."
     )
     metric_columns = st.columns(3)
-    metric_columns[0].metric("Default Watchlist", "6 tickers")
+    metric_columns[0].metric("Large Preset", "60 tickers")
     metric_columns[1].metric("Strategies", "5 types")
     metric_columns[2].metric("AI Reviews", "Top 3")
 
@@ -2265,7 +2275,27 @@ st.caption(
 
 with st.sidebar:
     st.header("Scanner")
-    ticker_text = st.text_area("Tickers", "AAPL, SPY, QQQ, NVDA, MSFT, COHR")
+    if "ticker_preset" not in st.session_state:
+        st.session_state["ticker_preset"] = "Default"
+    if "ticker_text_value" not in st.session_state:
+        st.session_state["ticker_text_value"] = DEFAULT_TICKERS
+
+    ticker_preset = st.selectbox(
+        "Ticker Preset",
+        ["Default", "Large Preset", "Custom"],
+        key="ticker_preset",
+        help="Use the large preset with the broad universe prefilter turned on.",
+    )
+    preset_value = (
+        LARGE_PRESET_TICKERS if ticker_preset == "Large Preset" else DEFAULT_TICKERS
+    )
+    if ticker_preset != "Custom":
+        st.session_state["ticker_text_value"] = preset_value
+    ticker_text = st.text_area(
+        "Tickers",
+        key="ticker_text_value",
+        height=150 if ticker_preset == "Large Preset" else 120,
+    )
     outlook = st.selectbox("Outlook", ["neutral", "bullish", "bearish", "income"])
     max_risk = st.number_input("Maximum Risk Per Spread", min_value=50, value=500, step=50)
     risk_tolerance = st.selectbox("Risk Tolerance", ["conservative", "moderate", "aggressive"], index=1)
