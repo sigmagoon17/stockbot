@@ -30,9 +30,7 @@ from stock2dupe import (
     condor_diagnostics,
     get_option_chain,
     scan_trades,
-    select_execution_candidates,
 )
-from scanner_tracking import new_scan_run_id
 from stock_universe import prefilter_tickers
 
 
@@ -210,7 +208,6 @@ def main() -> int:
         max_risk=float(os.getenv("SCAN_MAX_RISK", "500")),
         outlook=os.getenv("SCAN_OUTLOOK", "neutral"),
         risk_tolerance=os.getenv("SCAN_RISK_TOLERANCE", "moderate"),
-        price_move_mode=os.getenv("PRICE_MOVE_MODE", "Full"),
     )
     trades = []
     event_analyses = {}
@@ -289,31 +286,21 @@ def main() -> int:
             trades, preferences, event_adjustments, price_moves, event_labels
         )
 
-    execution_candidates = select_execution_candidates(scored_trades, limit=3)
     history_candidates = select_history_candidates(scored_trades)
-    scan_run_id = new_scan_run_id()
     errors.extend(
-        append_scan_history(
-            history_candidates,
-            event_analyses,
-            price_moves,
-            execution_candidates=execution_candidates,
-            scan_run_id=scan_run_id,
-        )
+        append_scan_history(history_candidates, event_analyses, price_moves)
     )
     if os.getenv("ALPACA_AUTO_PAPER_TRADE", "").lower() in {"1", "true", "yes"}:
         if submit_scored_multileg_orders is None:
             print("Warning: Alpaca paper trading helper is unavailable.")
         else:
             paper_candidates, duplicate_results = top_unplaced_paper_candidates(
-                execution_candidates, limit=3
+                scored_trades, limit=3
             )
             paper_results = submit_scored_multileg_orders(
                 paper_candidates,
                 quantity=env_int("ALPACA_PAPER_TRADE_QUANTITY", 1),
                 limit=3,
-                exit_policy=os.getenv("ALPACA_PAPER_EXIT_POLICY", "none"),
-                scan_run_id=scan_run_id,
             )
             paper_results = duplicate_results + paper_results
             errors.extend(append_alpaca_paper_orders(paper_results))

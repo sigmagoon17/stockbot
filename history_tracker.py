@@ -6,22 +6,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from supabase import create_client
 
-from alpaca_client import (
-    get_alpaca_order,
-    get_alpaca_positions,
-    submit_multileg_order,
-)
-from paper_exit import closing_legs_from_leg_key, evaluate_paper_exit
-from scanner_tracking import (
-    SCANNER_VERSION,
-    SELECTION_DIVERSIFIED,
-    SELECTION_EXECUTION,
-    git_commit_sha,
-    new_scan_run_id,
-    normalize_history_row,
-    setup_key_for_trade,
-    utc_now_iso,
-)
+from alpaca_client import get_alpaca_positions
 from stock2dupe import CONTRACT_MULTIPLIER
 
 
@@ -60,31 +45,20 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
             {
                 "scan_time": current_time,
                 "scan_time_est": current_time_est,
-                "entry_timestamp": current_time,
                 "order_id": result.get("Order ID"),
                 "client_order_id": result.get("Client Order ID"),
                 "ticker": result.get("Ticker"),
                 "strategy": result.get("Strategy"),
                 "expiration": result.get("Expiration"),
                 "setup_score": result.get("Setup Score"),
-                "ticker_score": result.get("Ticker Score"),
-                "quant_score": result.get("Quant Score"),
-                "setup_key": result.get("Setup Key"),
-                "scan_run_id": result.get("Scan Run ID"),
-                "execution_rank": result.get("Execution Rank"),
-                "selection_method": result.get("Selection Method"),
                 "entry_type": result.get("Entry Type"),
                 "limit_price": result.get("Limit Price"),
-                "entry_price": result.get("Limit Price"),
-                "max_profit": result.get("Max Profit"),
-                "max_risk": result.get("Max Risk"),
                 "quantity": result.get("Quantity"),
                 "order_class": result.get("Order Class"),
                 "symbol": result.get("Symbol"),
                 "status": result.get("Status"),
                 "message": result.get("Message"),
                 "leg_key": result.get("Leg Key"),
-                "exit_policy": result.get("Exit Policy") or "none",
             }
         )
 
@@ -194,18 +168,8 @@ def append_alpaca_paper_snapshots() -> list[str]:
         ZoneInfo("America/New_York")
     ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
     rows = []
-    pnl_extreme_updates = []
-    symbol_order_counts = {}
-    for paper_order in paper_orders:
-        for symbol in set(symbols_from_leg_key(paper_order.get("leg_key"))):
-            symbol_order_counts[symbol] = symbol_order_counts.get(symbol, 0) + 1
 
     for order in paper_orders:
-        if order.get("close_order_id"):
-            errors.extend(_refresh_paper_close_order(order))
-            if order.get("close_order_status") == "filled":
-                continue
-
         symbols = symbols_from_leg_key(order.get("leg_key"))
         if not symbols:
             continue
@@ -227,35 +191,6 @@ def append_alpaca_paper_snapshots() -> list[str]:
             abs(numeric_value(order.get("limit_price")) or 0)
             * int(order.get("quantity") or 1)
             * CONTRACT_MULTIPLIER
-        )
-        quantity = int(order.get("quantity") or 1)
-        all_legs_matched = len(matched_positions) == len(symbols)
-        ambiguous_allocation = any(
-            symbol_order_counts.get(symbol, 0) > 1 for symbol in symbols
-        )
-        current_value_per_share = (
-            round(abs(current_value) / (quantity * CONTRACT_MULTIPLIER), 4)
-            if all_legs_matched and not ambiguous_allocation and quantity > 0
-            else None
-        )
-        exit_decision = evaluate_paper_exit(
-            entry_type=order.get("entry_type") or "",
-            entry_price_per_share=abs(numeric_value(order.get("limit_price")) or 0),
-            max_profit_per_share=abs(numeric_value(order.get("max_profit")) or 0),
-            current_value_per_share=current_value_per_share,
-            policy=order.get("exit_policy"),
-            close_order_status=order.get("close_order_status"),
-        )
-        previous_mfe = numeric_value(order.get("maximum_favorable_excursion"))
-        previous_mae = numeric_value(order.get("maximum_adverse_excursion"))
-        mfe = unrealized_pnl if previous_mfe is None else max(previous_mfe, unrealized_pnl)
-        mae = unrealized_pnl if previous_mae is None else min(previous_mae, unrealized_pnl)
-        pnl_extreme_updates.append(
-            {
-                "id": order.get("id"),
-                "maximum_favorable_excursion": round(mfe, 2),
-                "maximum_adverse_excursion": round(mae, 2),
-            }
         )
 
         rows.append(
@@ -281,170 +216,17 @@ def append_alpaca_paper_snapshots() -> list[str]:
                 "matched_legs": len(matched_positions),
                 "total_legs": len(symbols),
                 "leg_key": order.get("leg_key"),
-                "exit_policy": order.get("exit_policy") or "none",
-                "target_value_per_share": exit_decision.target_value_per_share,
-                "current_value_per_share": current_value_per_share,
-                "exit_signal": exit_decision.exit_reason or "hold",
             }
         )
-
-        if exit_decision.should_close:
-            errors.extend(
-                _submit_paper_exit(
-                    order,
-                    exit_decision.exit_reason,
-                    current_value_per_share,
-                    snapshot_time,
-                )
-            )
 
     if not rows:
         return []
 
     try:
         supabase.table("alpaca_paper_position_snapshots").insert(rows).execute()
+        return []
     except Exception as error:
         return [f"Could not save Alpaca paper position snapshots: {error}"]
-
-    for update in pnl_extreme_updates:
-        try:
-            (
-                supabase.table("alpaca_paper_orders")
-                .update(
-                    {
-                        "maximum_favorable_excursion": update["maximum_favorable_excursion"],
-                        "maximum_adverse_excursion": update["maximum_adverse_excursion"],
-                    }
-                )
-                .eq("id", update["id"])
-                .execute()
-            )
-        except Exception as error:
-            errors.append(f"Could not update paper P/L extremes: {error}")
-    return errors
-
-
-def _submit_paper_exit(
-    order: dict,
-    exit_reason: str,
-    current_value_per_share: float,
-    signal_time: str,
-) -> list[str]:
-    if order.get("close_order_status"):
-        return []
-    closing_legs = closing_legs_from_leg_key(order.get("leg_key") or "")
-    if not closing_legs:
-        return [f"Could not close Alpaca paper order {order.get('order_id')}: missing legs."]
-
-    client_order_id = f"close-{order.get('order_id')}-{exit_reason}"[:48]
-    try:
-        (
-            supabase.table("alpaca_paper_orders")
-            .update(
-                {
-                    "exit_signal_time": signal_time,
-                    "exit_reason": exit_reason,
-                    "close_client_order_id": client_order_id,
-                    "close_order_status": "submitting",
-                    "last_exit_error": None,
-                }
-            )
-            .eq("id", order["id"])
-            .is_("close_order_status", "null")
-            .execute()
-        )
-    except Exception as error:
-        return [f"Could not reserve paper exit for order {order.get('order_id')}: {error}"]
-
-    close_order, submit_errors = submit_multileg_order(
-        closing_legs,
-        quantity=int(order.get("quantity") or 1),
-        limit_price=max(0.01, round(current_value_per_share, 2)),
-        client_order_id=client_order_id,
-    )
-    if submit_errors:
-        message = "; ".join(submit_errors)
-        try:
-            (
-                supabase.table("alpaca_paper_orders")
-                .update(
-                    {
-                        "close_order_status": "rejected",
-                        "exit_reason": "order_rejected",
-                        "last_exit_error": message,
-                    }
-                )
-                .eq("id", order["id"])
-                .execute()
-            )
-        except Exception:
-            pass
-        return [f"Paper exit rejected for order {order.get('order_id')}: {message}"]
-
-    try:
-        (
-            supabase.table("alpaca_paper_orders")
-            .update(
-                {
-                    "close_order_id": close_order.get("id"),
-                    "close_order_status": close_order.get("status") or "accepted",
-                    "close_order_submitted_at": signal_time,
-                }
-            )
-            .eq("id", order["id"])
-            .execute()
-        )
-    except Exception as error:
-        return [f"Paper exit submitted but could not be recorded: {error}"]
-    return []
-
-
-def _refresh_paper_close_order(order: dict) -> list[str]:
-    close_order, errors = get_alpaca_order(order["close_order_id"])
-    if errors:
-        return errors
-    status = close_order.get("status") or order.get("close_order_status")
-    update_values = {
-        "close_order_status": status,
-        "exit_fill_price": numeric_value(close_order.get("filled_avg_price")),
-        "last_exit_error": None,
-    }
-    if status == "filled":
-        fill_price = numeric_value(close_order.get("filled_avg_price")) or 0
-        entry_price = abs(numeric_value(order.get("limit_price")) or 0)
-        quantity = int(order.get("quantity") or 1)
-        if order.get("entry_type") == "credit":
-            realized_pnl = (entry_price - fill_price) * quantity * CONTRACT_MULTIPLIER
-        else:
-            realized_pnl = (fill_price - entry_price) * quantity * CONTRACT_MULTIPLIER
-        max_risk = abs(numeric_value(order.get("max_risk")) or 0)
-        update_values.update(
-            {
-                "position_status": "closed",
-                "exit_fill_time": close_order.get("filled_at") or utc_now_iso(),
-                "realized_pnl": round(realized_pnl, 2),
-                "realized_return_on_risk": (
-                    round(realized_pnl / (max_risk * quantity * CONTRACT_MULTIPLIER) * 100, 2)
-                    if max_risk > 0
-                    else None
-                ),
-            }
-        )
-    elif status in {"rejected", "canceled", "expired"}:
-        update_values["last_exit_error"] = (
-            close_order.get("reject_reason") or f"Closing order ended with status {status}."
-        )
-
-    try:
-        (
-            supabase.table("alpaca_paper_orders")
-            .update(update_values)
-            .eq("id", order["id"])
-            .execute()
-        )
-        return []
-    except Exception as error:
-        return [f"Could not refresh Alpaca close order {order['close_order_id']}: {error}"]
 
 
 def fetch_alpaca_paper_snapshots(limit: int = 500) -> tuple[list[dict], list[str]]:
@@ -461,90 +243,26 @@ def fetch_alpaca_paper_snapshots(limit: int = 500) -> tuple[list[dict], list[str
         return [], [f"Could not load Alpaca paper position snapshots: {error}"]
 
 
-def append_scan_history(
-    scored_trades,
-    event_analyses=None,
-    price_moves=None,
-    execution_candidates=None,
-    scan_run_id=None,
-):
+def append_scan_history(scored_trades, event_analyses=None, price_moves=None):
     event_analyses = event_analyses or {}
     price_moves = price_moves or {}
     rows = []
-    execution_candidates = execution_candidates or []
-    scan_run_id = scan_run_id or new_scan_run_id()
-    commit_sha = git_commit_sha()
     scan_timestamp = datetime.now(timezone.utc)
     current_time = scan_timestamp.isoformat()
     current_time_est = scan_timestamp.astimezone(
         ZoneInfo("America/New_York")
     ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
-    execution_ranks = {
-        setup_key_for_trade(scored.trade): scored.execution_rank or rank
-        for rank, scored in enumerate(execution_candidates, start=1)
-    }
-    setup_keys = [setup_key_for_trade(scored.trade) for scored in scored_trades]
-    existing_by_setup = {}
-    if setup_keys:
-        try:
-            existing_rows = (
-                supabase.table("scan_history")
-                .select("setup_key,scan_time,first_seen_at,last_seen_at,times_recommended")
-                .in_("setup_key", list(set(setup_keys)))
-                .execute()
-                .data
-            )
-            for existing in existing_rows:
-                key = existing.get("setup_key")
-                if not key:
-                    continue
-                state = existing_by_setup.setdefault(
-                    key,
-                    {"count": 0, "first_seen_at": existing.get("scan_time")},
-                )
-                state["count"] += 1
-                first_seen = existing.get("first_seen_at") or existing.get("scan_time")
-                if first_seen and (
-                    not state.get("first_seen_at") or first_seen < state["first_seen_at"]
-                ):
-                    state["first_seen_at"] = first_seen
-        except Exception as error:
-            return [
-                "Could not read setup history metadata. Run "
-                f"supabase_scanner_tracking_upgrade.sql first: {error}"
-            ]
-
     for scored in scored_trades:
         trade = scored.trade
-        setup_key = setup_key_for_trade(trade)
-        prior = existing_by_setup.get(setup_key, {})
-        times_recommended = int(prior.get("count", 0)) + 1
-        first_seen_at = prior.get("first_seen_at") or current_time
-        execution_rank = execution_ranks.get(setup_key)
         event_analysis = event_analyses.get(trade.ticker)
         price_move = price_moves.get(trade.ticker, {})
         rows.append(
             {
                 "scan_time": current_time,
                 "scan_time_est": current_time_est,
-                "scan_run_id": scan_run_id,
-                "setup_key": setup_key,
-                "scanner_version": SCANNER_VERSION,
-                "git_commit_sha": commit_sha,
-                "raw_rank": scored.raw_rank,
-                "diversified_rank": scored.diversified_rank,
-                "execution_rank": execution_rank,
-                "execution_selected": execution_rank is not None,
-                "selection_method": (
-                    SELECTION_EXECUTION if execution_rank is not None else SELECTION_DIVERSIFIED
-                ),
-                "first_seen_at": first_seen_at,
-                "last_seen_at": current_time,
-                "times_recommended": times_recommended,
                 "ticker": trade.ticker,
                 "strategy": trade.strategy,
                 "expiration": trade.expiration,
-                "option_type": trade.option_type,
                 "long_strike": round(trade.long_strike, 2),
                 "short_strike": round(trade.short_strike, 2),
                 "put_short_strike": (
@@ -574,10 +292,7 @@ def append_scan_history(
                 "max_profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
                 "quant_score": scored.quant_score,
                 "event_adjustment": scored.event_adjustment,
-                "raw_price_move_adjustment": scored.raw_price_move_adjustment,
-                "effective_price_move_adjustment": scored.effective_price_move_adjustment,
-                "price_move_adjustment": scored.effective_price_move_adjustment,
-                "base_score_without_price_move": scored.base_score_without_price_move,
+                "price_move_adjustment": scored.price_move_adjustment,
                 "move_setup": scored.price_move_style,
                 "event_label": (
                     event_analysis.label if event_analysis is not None else None
@@ -600,53 +315,45 @@ def append_scan_history(
                 "expiration_status": "open",
                 "expiration_close": None,
                 "expiration_pnl": None,
-                "entry_timestamp": current_time,
-                "entry_price": round(
-                    (
-                        trade.max_risk
-                        if trade.entry_type == "debit"
-                        else trade.credit
-                    )
-                    * CONTRACT_MULTIPLIER,
-                    2,
-                ),
-                "exit_timestamp": None,
-                "exit_price": None,
-                "exit_reason": None,
-                "realized_pnl": None,
-                "realized_return_on_risk": None,
-                "closing_underlying_price": None,
-                "days_held": None,
-                "maximum_favorable_excursion": None,
-                "maximum_adverse_excursion": None,
-                "last_update_error": None,
-                "update_retryable": False,
             }
         )
 
     if not rows:
         return []
 
-    try:
-        supabase.table("scan_history").insert(rows).execute()
-    except Exception as error:
-        return [f"Could not save scan history: {error}"]
+    def candidate_key(row):
+        return (
+            row["ticker"],
+            row["strategy"],
+            row["expiration"],
+            row["long_strike"],
+            row["short_strike"],
+            row["entry_type"],
+        )
 
+    try:
+        existing_rows = (
+            supabase.table("scan_history")
+            .select("ticker,strategy,expiration,long_strike,short_strike,entry_type")
+            .gte("scan_time", date.today().isoformat())
+            .execute()
+            .data
+        )
+    except Exception as error:
+        return [f"Could not check existing scan history: {error}"]
+    existing_keys = {candidate_key(row) for row in existing_rows}
+    new_rows = []
     for row in rows:
+        key = candidate_key(row)
+        if key not in existing_keys:
+            new_rows.append(row)
+            existing_keys.add(key)
+
+    if new_rows:
         try:
-            (
-                supabase.table("scan_history")
-                .update(
-                    {
-                        "last_seen_at": current_time,
-                        "times_recommended": row["times_recommended"],
-                    }
-                )
-                .eq("setup_key", row["setup_key"])
-                .execute()
-            )
+            supabase.table("scan_history").insert(new_rows).execute()
         except Exception as error:
-            return [f"Saved scan occurrence but could not update setup frequency: {error}"]
+            return [f"Could not save scan history: {error}"]
 
     return []
 
@@ -932,8 +639,6 @@ def append_trade_snapshots() -> list[str]:
                     {
                         "highest_unrealized_pnl": update["highest_unrealized_pnl"],
                         "lowest_unrealized_pnl": update["lowest_unrealized_pnl"],
-                        "maximum_favorable_excursion": update["highest_unrealized_pnl"],
-                        "maximum_adverse_excursion": update["lowest_unrealized_pnl"],
                     }
                 )
                 .eq("id", update["id"])
@@ -1293,7 +998,7 @@ def update_expired_history(include_today: bool = False) -> list[str]:
         query = (
             supabase.table("scan_history")
             .select("*")
-            .in_("expiration_status", ["open", "expiration_update_failed"])
+            .eq("expiration_status", "open")
         )
         if include_today:
             query = query.lte("expiration", date.today().isoformat())
@@ -1311,31 +1016,22 @@ def update_expired_history(include_today: bool = False) -> list[str]:
                 closing_prices[price_key] = expiration_close(*price_key)
             closing_price = closing_prices[price_key]
         except Exception as error:
-            message = f"Could not update {row['ticker']} expiration result: {error}"
-            errors.append(message)
-            _mark_expiration_update_failed(row, message)
+            errors.append(f"Could not update {row['ticker']} expiration result: {error}")
             continue
 
         if closing_price is None:
-            message = (
-                f"Could not update {row['ticker']} expiration result: "
-                "closing market data is unavailable."
-            )
-            errors.append(message)
-            _mark_expiration_update_failed(row, message)
             continue
 
         try:
             pnl = expiration_pnl(row, closing_price)
         except (TypeError, ValueError) as error:
-            message = f"Could not calculate {row['ticker']} expiration P/L: {error}"
-            errors.append(message)
-            _mark_expiration_update_failed(row, message)
+            errors.append(f"Could not calculate {row['ticker']} expiration P/L: {error}")
             continue
 
-        update_values = expiration_result_values(
-            row, expiration, closing_price, pnl
-        )
+        update_values = {
+            "expiration_close": closing_price,
+            "expiration_status": "manual review" if pnl is None else "expired",
+        }
         if pnl is not None:
             update_values["expiration_pnl"] = pnl
 
@@ -1352,101 +1048,6 @@ def update_expired_history(include_today: bool = False) -> list[str]:
     return errors
 
 
-def _mark_expiration_update_failed(row: dict, message: str) -> None:
-    try:
-        (
-            supabase.table("scan_history")
-            .update(expiration_failure_values(message))
-            .eq("id", row["id"])
-            .execute()
-        )
-    except Exception:
-        pass
-
-
-def expiration_failure_values(message: str) -> dict:
-    return {
-        "expiration_status": "expiration_update_failed",
-        "exit_reason": "data_unavailable",
-        "last_update_error": message,
-        "update_retryable": True,
-    }
-
-
-def expiration_result_values(
-    row: dict,
-    expiration: date,
-    closing_price: float,
-    pnl: float | None,
-) -> dict:
-    entry_price = numeric_value(row.get("entry_price"))
-    if entry_price is None:
-        entry_price = (
-            numeric_value(row.get("max_risk"))
-            if row.get("entry_type") == "debit"
-            else numeric_value(row.get("credit"))
-        )
-    max_risk = numeric_value(row.get("max_risk")) or 0
-    entry_timestamp = row.get("entry_timestamp") or row.get("scan_time")
-    try:
-        entry_date = datetime.fromisoformat(entry_timestamp.replace("Z", "+00:00")).date()
-        days_held = max(0, (expiration - entry_date).days)
-    except (AttributeError, TypeError, ValueError):
-        days_held = None
-    exit_price = None
-    if pnl is not None and entry_price is not None:
-        if row.get("entry_type") == "debit":
-            exit_price = round(entry_price + pnl, 2)
-        else:
-            exit_price = round(entry_price - pnl, 2)
-    return {
-        "expiration_close": closing_price,
-        "closing_underlying_price": closing_price,
-        "expiration_status": "manual review" if pnl is None else "expired",
-        "starting_status": "closed" if pnl is not None else "manual review",
-        "exit_timestamp": datetime.combine(
-            expiration, datetime.min.time(), tzinfo=timezone.utc
-        ).isoformat(),
-        "exit_price": exit_price,
-        "exit_reason": "expiration" if pnl is not None else "data_unavailable",
-        "realized_pnl": pnl,
-        "realized_return_on_risk": (
-            round(pnl / max_risk * 100, 2)
-            if pnl is not None and max_risk > 0
-            else None
-        ),
-        "days_held": days_held,
-        "maximum_favorable_excursion": row.get("highest_unrealized_pnl"),
-        "maximum_adverse_excursion": row.get("lowest_unrealized_pnl"),
-        "last_update_error": None,
-        "update_retryable": False,
-    }
-
-
-def test_expiration_tracking_values() -> None:
-    row = {
-        "entry_type": "debit",
-        "entry_price": 200,
-        "max_risk": 200,
-        "scan_time": "2026-07-01T12:00:00+00:00",
-        "highest_unrealized_pnl": 80,
-        "lowest_unrealized_pnl": -25,
-    }
-    completed = expiration_result_values(row, date(2026, 7, 31), 150, 100)
-    assert completed["expiration_status"] == "expired"
-    assert completed["starting_status"] == "closed"
-    assert completed["exit_reason"] == "expiration"
-    assert completed["realized_return_on_risk"] == 50
-    assert completed["maximum_favorable_excursion"] == 80
-    assert completed["maximum_adverse_excursion"] == -25
-
-    failed = expiration_failure_values("quote unavailable")
-    assert failed["expiration_status"] == "expiration_update_failed"
-    assert failed["update_retryable"] is True
-    assert failed["last_update_error"] == "quote unavailable"
-    print("Expiration tracking tests passed.")
-
-
 def fetch_completed_history() -> tuple[list[dict], list[str]]:
     try:
         response = (
@@ -1456,7 +1057,7 @@ def fetch_completed_history() -> tuple[list[dict], list[str]]:
             .order("expiration", desc=True)
             .execute()
         )
-        return [normalize_history_row(row) for row in response.data], []
+        return response.data, []
     except Exception as error:
         return [], [f"Could not load results from Supabase: {error}"]
 
@@ -1466,12 +1067,12 @@ def fetch_open_history(limit: int = 100) -> tuple[list[dict], list[str]]:
         response = (
             supabase.table("scan_history")
             .select("*")
-            .in_("expiration_status", ["open", "expiration_update_failed"])
+            .eq("expiration_status", "open")
             .order("scan_time", desc=True)
             .limit(limit)
             .execute()
         )
-        return [normalize_history_row(row) for row in response.data], []
+        return response.data, []
     except Exception as error:
         return [], [f"Could not load open candidates from Supabase: {error}"]
 
@@ -1483,40 +1084,13 @@ def close_candidate(
     note: str,
 ) -> list[str]:
     try:
-        response = (
-            supabase.table("scan_history")
-            .select("max_risk,entry_timestamp,scan_time")
-            .eq("id", record_id)
-            .limit(1)
-            .execute()
-        )
-        row = response.data[0] if response.data else {}
-        max_risk = numeric_value(row.get("max_risk")) or 0
-        entry_timestamp = row.get("entry_timestamp") or row.get("scan_time")
-        try:
-            entry_date = datetime.fromisoformat(entry_timestamp.replace("Z", "+00:00")).date()
-            days_held = max(0, (close_date - entry_date).days)
-        except (AttributeError, TypeError, ValueError):
-            days_held = None
         (
             supabase.table("scan_history")
             .update(
                 {
                     "expiration_status": "closed early",
-                    "starting_status": "closed",
                     "actual_close_date": close_date.isoformat(),
                     "actual_realized_pnl": round(realized_pnl, 2),
-                    "exit_timestamp": datetime.combine(
-                        close_date, datetime.min.time(), tzinfo=timezone.utc
-                    ).isoformat(),
-                    "exit_reason": "manual",
-                    "realized_pnl": round(realized_pnl, 2),
-                    "realized_return_on_risk": (
-                        round(realized_pnl / max_risk * 100, 2)
-                        if max_risk > 0
-                        else None
-                    ),
-                    "days_held": days_held,
                     "close_note": note.strip() or None,
                 }
             )

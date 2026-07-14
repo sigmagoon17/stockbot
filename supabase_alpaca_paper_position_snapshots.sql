@@ -17,11 +17,7 @@ create table if not exists public.alpaca_paper_position_snapshots (
     unrealized_pnl_percent numeric,
     matched_legs integer,
     total_legs integer,
-    leg_key text,
-    exit_policy text,
-    target_value_per_share numeric,
-    current_value_per_share numeric,
-    exit_signal text
+    leg_key text
 );
 
 create index if not exists alpaca_paper_position_snapshots_time_idx
