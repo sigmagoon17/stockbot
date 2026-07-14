@@ -930,6 +930,18 @@ def render_scan_output(scan_output):
             width="stretch",
             hide_index=True,
         )
+        api_errors = [
+            result
+            for result in paper_order_results
+            if result.get("Status") == "Error" and result.get("Message")
+        ]
+        if api_errors:
+            with st.expander("Full Alpaca API error details"):
+                for index, result in enumerate(api_errors, start=1):
+                    st.markdown(
+                        f"**{index}. {result.get('Candidate', 'Alpaca request')}**"
+                    )
+                    st.code(str(result["Message"]), language=None, wrap_lines=True)
 
     candidate_analyses = scan_output.get("candidate_analyses", {})
     if candidate_analyses:
