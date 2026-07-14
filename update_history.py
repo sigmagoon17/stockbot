@@ -2,7 +2,7 @@ from history_tracker import update_expired_history
 
 
 def main():
-    errors = update_expired_history(include_today=True)
+    errors = update_expired_history()
     if errors:
         for error in errors:
             print(error)

@@ -110,35 +110,96 @@ def git_commit_sha() -> str | None:
 def normalize_history_row(row: dict) -> dict:
     normalized = dict(row)
     normalized["setup_key"] = setup_key_for_history_row(normalized)
-    normalized.setdefault("scan_run_id", f"legacy-{normalized.get('id', 'unknown')}")
-    normalized.setdefault("scanner_version", "legacy")
+    if not normalized.get("scan_run_id"):
+        normalized["scan_run_id"] = f"legacy-{normalized.get('id', 'unknown')}"
+    if not normalized.get("scanner_version"):
+        normalized["scanner_version"] = "legacy"
     normalized.setdefault("git_commit_sha", None)
     normalized.setdefault("raw_rank", None)
     normalized.setdefault("diversified_rank", None)
     normalized.setdefault("execution_rank", None)
     normalized.setdefault("execution_selected", False)
-    normalized.setdefault("selection_method", SELECTION_RAW)
-    normalized.setdefault("first_seen_at", normalized.get("scan_time"))
-    normalized.setdefault("last_seen_at", normalized.get("scan_time"))
-    normalized.setdefault("times_recommended", 1)
-    normalized.setdefault("entry_timestamp", normalized.get("scan_time"))
+    if not normalized.get("selection_method"):
+        normalized["selection_method"] = SELECTION_RAW
+    if normalized.get("first_seen_at") is None:
+        normalized["first_seen_at"] = normalized.get("scan_time")
+    if normalized.get("last_seen_at") is None:
+        normalized["last_seen_at"] = normalized.get("scan_time")
+    if normalized.get("times_recommended") is None:
+        normalized["times_recommended"] = 1
+    if normalized.get("entry_timestamp") is None:
+        normalized["entry_timestamp"] = normalized.get("scan_time")
     normalized.setdefault("entry_price", None)
     normalized.setdefault("exit_timestamp", None)
     normalized.setdefault("exit_price", None)
     normalized.setdefault("exit_reason", None)
-    normalized.setdefault("realized_pnl", normalized.get("actual_realized_pnl"))
+    if normalized.get("realized_pnl") is None:
+        normalized["realized_pnl"] = normalized.get("actual_realized_pnl")
     normalized.setdefault("realized_return_on_risk", None)
     normalized.setdefault("closing_underlying_price", normalized.get("expiration_close"))
     normalized.setdefault("days_held", None)
-    normalized.setdefault(
-        "maximum_favorable_excursion", normalized.get("highest_unrealized_pnl")
-    )
-    normalized.setdefault(
-        "maximum_adverse_excursion", normalized.get("lowest_unrealized_pnl")
-    )
+    if normalized.get("maximum_favorable_excursion") is None:
+        normalized["maximum_favorable_excursion"] = normalized.get(
+            "highest_unrealized_pnl"
+        )
+    if normalized.get("maximum_adverse_excursion") is None:
+        normalized["maximum_adverse_excursion"] = normalized.get(
+            "lowest_unrealized_pnl"
+        )
     normalized.setdefault("last_update_error", None)
     normalized.setdefault("update_retryable", False)
     return normalized
+
+
+def build_history_backfill_updates(rows: list[dict]) -> list[dict]:
+    normalized_rows = [normalize_history_row(row) for row in rows]
+    setup_stats = {}
+
+    for row in normalized_rows:
+        setup_key = row["setup_key"]
+        scan_time = row.get("scan_time")
+        state = setup_stats.setdefault(
+            setup_key,
+            {"first_seen_at": scan_time, "last_seen_at": scan_time, "count": 0},
+        )
+        state["count"] += 1
+        if scan_time and (
+            not state["first_seen_at"] or scan_time < state["first_seen_at"]
+        ):
+            state["first_seen_at"] = scan_time
+        if scan_time and (
+            not state["last_seen_at"] or scan_time > state["last_seen_at"]
+        ):
+            state["last_seen_at"] = scan_time
+
+    updates = []
+    for original, normalized in zip(rows, normalized_rows):
+        stats = setup_stats[normalized["setup_key"]]
+        desired = {
+            "setup_key": normalized["setup_key"],
+            "scan_run_id": normalized["scan_run_id"],
+            "scanner_version": normalized["scanner_version"],
+            "selection_method": normalized["selection_method"],
+            "first_seen_at": stats["first_seen_at"],
+            "last_seen_at": stats["last_seen_at"],
+            "times_recommended": stats["count"],
+            "entry_timestamp": normalized["entry_timestamp"],
+            "maximum_favorable_excursion": normalized.get(
+                "maximum_favorable_excursion"
+            ),
+            "maximum_adverse_excursion": normalized.get(
+                "maximum_adverse_excursion"
+            ),
+        }
+        changed = {
+            field: value
+            for field, value in desired.items()
+            if original.get(field) != value
+        }
+        if changed:
+            updates.append({"id": original.get("id"), "values": changed})
+
+    return updates
 
 
 def utc_now_iso() -> str:

@@ -1,5 +1,4 @@
 import os
-from collections import Counter
 
 try:
     from alpaca_client import (
@@ -31,45 +30,10 @@ from stock2dupe import (
     get_option_chain,
     scan_trades,
     select_execution_candidates,
+    select_history_candidates,
 )
 from scanner_tracking import new_scan_run_id
 from stock_universe import prefilter_tickers
-
-
-def select_history_candidates(scored_trades, limit: int = 25, per_ticker: int = 4):
-    selected = []
-    selected_ids = set()
-    selected_by_strategy = Counter()
-    selected_by_ticker = Counter()
-
-    for scored in scored_trades:
-        strategy = scored.trade.strategy
-        if selected_by_strategy[strategy] >= 1:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        selected_by_strategy[strategy] += 1
-
-    for scored in scored_trades:
-        ticker = scored.trade.ticker
-        if id(scored) in selected_ids or selected_by_ticker[ticker] >= per_ticker:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        selected_by_ticker[ticker] += 1
-        if len(selected) == limit:
-            return selected
-
-    for scored in scored_trades:
-        if id(scored) in selected_ids:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        if len(selected) == limit:
-            break
-
-    return selected
-
 
 def selected_deep_analysis_tickers(
     scored_trades,
@@ -217,7 +181,7 @@ def main() -> int:
     event_adjustments = {}
     event_labels = {}
     price_moves = {}
-    errors = update_expired_history(include_today=True)
+    errors = update_expired_history()
 
     for ticker in tickers:
         try:

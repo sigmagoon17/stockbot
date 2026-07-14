@@ -49,6 +49,9 @@ alter table public.alpaca_paper_orders
     add column if not exists max_risk numeric,
     add column if not exists entry_timestamp timestamptz,
     add column if not exists entry_price numeric,
+    add column if not exists opening_order_status text,
+    add column if not exists opening_filled_at timestamptz,
+    add column if not exists opening_filled_avg_price numeric,
     add column if not exists exit_policy text not null default 'none',
     add column if not exists position_status text not null default 'open',
     add column if not exists exit_signal_time timestamptz,
@@ -74,6 +77,40 @@ create index if not exists alpaca_paper_orders_scan_run_id_idx
 
 create index if not exists alpaca_paper_orders_setup_key_idx
     on public.alpaca_paper_orders(setup_key);
+
+create or replace function public.claim_alpaca_paper_exit(
+    p_order_id bigint,
+    p_exit_reason text,
+    p_signal_time timestamptz,
+    p_close_client_order_id text
+)
+returns setof public.alpaca_paper_orders
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    return query
+    update public.alpaca_paper_orders
+    set
+        exit_signal_time = p_signal_time,
+        exit_reason = p_exit_reason,
+        close_client_order_id = p_close_client_order_id,
+        close_order_status = 'submitting',
+        last_exit_error = null
+    where id = p_order_id
+      and close_order_status is null
+      and position_status = 'open'
+      and opening_order_status = 'filled'
+      and opening_filled_avg_price is not null
+    returning *;
+end;
+$$;
+
+revoke all on function public.claim_alpaca_paper_exit(bigint, text, timestamptz, text)
+    from public, anon, authenticated;
+grant execute on function public.claim_alpaca_paper_exit(bigint, text, timestamptz, text)
+    to service_role;
 
 alter table public.alpaca_paper_position_snapshots
     add column if not exists exit_policy text,
