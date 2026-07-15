@@ -17,13 +17,13 @@ from alpaca_client import (
 try:
     from alpaca_client import (
         leg_key_from_legs,
-        submit_multileg_order,
+        submit_manual_multileg_order,
         submit_scored_multileg_orders,
         trade_multileg_order_details,
     )
 except ImportError:
     leg_key_from_legs = None
-    submit_multileg_order = None
+    submit_manual_multileg_order = None
     submit_scored_multileg_orders = None
     trade_multileg_order_details = None
 from history_tracker import (
@@ -2554,7 +2554,7 @@ def render_alpaca_account_status():
     if not scan_output or not scan_output.get("scored_trades"):
         st.info("Run a scan first, then come back here to paper trade a candidate.")
         return
-    if submit_multileg_order is None or trade_multileg_order_details is None:
+    if submit_manual_multileg_order is None or trade_multileg_order_details is None:
         st.warning(
             "Alpaca multi-leg order helpers are unavailable while the app finishes redeploying."
         )
@@ -2609,13 +2609,15 @@ def render_alpaca_account_status():
         if confirmation.strip().upper() != "PAPER":
             st.error("Type PAPER before submitting the paper order.")
             return
-        order, submit_errors = submit_multileg_order(
+        order, submit_errors, skip_message = submit_manual_multileg_order(
             legs,
             quantity=int(quantity),
             limit_price=float(limit_price),
             client_order_id=f"manual-{paper_trade_key(selected_scored)}",
         )
-        if submit_errors:
+        if skip_message:
+            st.warning(skip_message)
+        elif submit_errors:
             for error in submit_errors:
                 st.error(error)
         else:

@@ -3,7 +3,9 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from alpaca_client import (
+    get_alpaca_opening_preflight_state,
     option_symbol,
+    submit_manual_multileg_order,
     submit_scored_multileg_orders,
     trade_multileg_order_details,
 )
@@ -80,6 +82,7 @@ class AlpacaPositionPreflightTests(unittest.TestCase):
                 return_value=(positions or [], position_errors or []),
             ) as get_positions,
             patch("alpaca_client.get_recent_alpaca_orders", return_value=([], [])),
+            patch("alpaca_client.get_open_alpaca_orders", return_value=([], [])),
             patch("alpaca_client.submit_multileg_order", side_effect=submit),
         ):
             results = submit_scored_multileg_orders(
@@ -200,6 +203,104 @@ class AlpacaPositionPreflightTests(unittest.TestCase):
         self.assertEqual(
             ["buy_to_open", "sell_to_open", "sell_to_open", "buy_to_open"],
             [leg["position_intent"] for leg in condor_legs],
+        )
+
+    def run_manual(
+        self,
+        candidate,
+        positions=None,
+        position_errors=None,
+        open_orders=None,
+        open_order_errors=None,
+    ):
+        legs, limit_price, _ = trade_multileg_order_details(candidate)
+        with (
+            patch(
+                "alpaca_client.get_alpaca_positions",
+                return_value=(positions or [], position_errors or []),
+            ),
+            patch(
+                "alpaca_client.get_open_alpaca_orders",
+                return_value=(open_orders or [], open_order_errors or []),
+            ),
+            patch(
+                "alpaca_client.submit_multileg_order",
+                return_value=({"id": "paper-order", "status": "accepted"}, []),
+            ) as submit,
+        ):
+            result = submit_manual_multileg_order(
+                legs, 1, limit_price, "manual-offline-test"
+            )
+        return result, submit
+
+    def test_manual_owned_short_leg_is_skipped_without_submission(self):
+        candidate = debit_candidate()
+        short_symbol = option_symbol("SPY", "2026-08-21", "call", 605)
+        (order, errors, message), submit = self.run_manual(
+            candidate, positions=[{"symbol": short_symbol, "qty": "1"}]
+        )
+        self.assertIsNone(order)
+        self.assertEqual([], errors)
+        self.assertIn(short_symbol, message)
+        self.assertIn("sell_to_close", message)
+        submit.assert_not_called()
+
+    def test_manual_and_automatic_conflict_messages_match(self):
+        candidate = debit_candidate()
+        short_symbol = option_symbol("SPY", "2026-08-21", "call", 605)
+        positions = [{"symbol": short_symbol, "qty": "1"}]
+        automatic, _ = self.run_batch([candidate], positions)
+        (_, _, manual_message), _ = self.run_manual(candidate, positions=positions)
+        self.assertEqual(automatic[0]["Message"], manual_message)
+
+    def test_manual_zero_quantity_does_not_block(self):
+        symbol = option_symbol("SPY", "2026-08-21", "call", 605)
+        (order, errors, message), submit = self.run_manual(
+            debit_candidate(), positions=[{"symbol": symbol, "qty": "0"}]
+        )
+        self.assertEqual("paper-order", order["id"])
+        self.assertEqual([], errors)
+        self.assertIsNone(message)
+        submit.assert_called_once()
+
+    def test_manual_malformed_quantity_fails_closed(self):
+        symbol = option_symbol("SPY", "2026-08-21", "call", 605)
+        (order, errors, message), submit = self.run_manual(
+            debit_candidate(), positions=[{"symbol": symbol, "qty": "many"}]
+        )
+        self.assertIsNone(order)
+        self.assertIsNone(message)
+        self.assertIn("could not be validated", errors[0])
+        submit.assert_not_called()
+
+    def test_manual_open_order_leg_is_skipped(self):
+        symbol = option_symbol("SPY", "2026-08-21", "call", 605)
+        (order, errors, message), submit = self.run_manual(
+            debit_candidate(), open_orders=[{"legs": [{"symbol": symbol}]}]
+        )
+        self.assertIsNone(order)
+        self.assertEqual([], errors)
+        self.assertIn("open Alpaca order", message)
+        submit.assert_not_called()
+
+    def test_manual_order_lookup_failure_fails_closed(self):
+        (order, errors, message), submit = self.run_manual(
+            debit_candidate(), open_order_errors=["unavailable"]
+        )
+        self.assertIsNone(order)
+        self.assertIsNone(message)
+        self.assertIn("open-order lookup failed", errors[0])
+        submit.assert_not_called()
+
+    def test_preflight_uses_only_paper_order_submitter(self):
+        with patch("alpaca_client.alpaca_request") as request:
+            request.side_effect = [([], []), ([], [])]
+            state, errors = get_alpaca_opening_preflight_state()
+        self.assertEqual([], errors)
+        self.assertEqual({}, state["position_quantities"])
+        self.assertEqual(set(), state["open_order_symbols"])
+        self.assertEqual(
+            ["GET", "GET"], [call.args[0] for call in request.call_args_list]
         )
 
 
