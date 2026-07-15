@@ -358,6 +358,9 @@ def nonzero_alpaca_position_quantities(
     quantities = {}
     errors = []
     for position in positions:
+        if not isinstance(position, dict):
+            errors.append("Alpaca returned malformed position data.")
+            continue
         symbol = str(position.get("symbol") or "").strip().upper()
         raw_quantity = position.get("qty")
         if not symbol:
@@ -410,6 +413,113 @@ def _position_overlap_message(leg: dict, quantity: float) -> str:
         f"{_display_position_quantity(quantity)}; {explanation}, causing a "
         "position_intent mismatch."
     )
+
+
+def get_open_alpaca_orders() -> tuple[list[dict], list[str]]:
+    orders, errors = alpaca_request(
+        "GET",
+        "/v2/orders",
+        params={
+            "status": "open",
+            "limit": 500,
+            "direction": "desc",
+            "nested": "true",
+        },
+    )
+    if errors:
+        return [], errors
+    return orders or [], []
+
+
+def alpaca_open_order_symbols(
+    orders: list[dict],
+) -> tuple[set[str], list[str]]:
+    symbols = set()
+    errors = []
+    for order in orders:
+        if not isinstance(order, dict):
+            errors.append("Alpaca returned malformed open-order data.")
+            continue
+        order_legs = order.get("legs")
+        if order_legs is None:
+            order_legs = [order]
+        if not isinstance(order_legs, list):
+            errors.append("Alpaca returned malformed open-order leg data.")
+            continue
+        for leg in order_legs:
+            if not isinstance(leg, dict):
+                errors.append("Alpaca returned malformed open-order leg data.")
+                continue
+            symbol = str(leg.get("symbol") or "").strip().upper()
+            if not symbol:
+                errors.append("Alpaca returned an open order without an option symbol.")
+                continue
+            symbols.add(symbol)
+    return symbols, errors
+
+
+def get_alpaca_opening_preflight_state() -> tuple[dict | None, list[str]]:
+    positions, position_errors = get_alpaca_positions()
+    if position_errors:
+        return None, [
+            "Alpaca position lookup failed; no paper orders were submitted. "
+            + "; ".join(position_errors)
+        ]
+    position_quantities, quantity_errors = nonzero_alpaca_position_quantities(
+        positions
+    )
+    if quantity_errors:
+        return None, [
+            "Alpaca position data could not be validated; no paper orders were "
+            "submitted. " + "; ".join(quantity_errors)
+        ]
+
+    open_orders, order_errors = get_open_alpaca_orders()
+    if order_errors:
+        return None, [
+            "Alpaca open-order lookup failed; no paper orders were submitted. "
+            + "; ".join(order_errors)
+        ]
+    open_order_symbols, symbol_errors = alpaca_open_order_symbols(open_orders)
+    if symbol_errors:
+        return None, [
+            "Alpaca open-order data could not be validated; no paper orders were "
+            "submitted. " + "; ".join(symbol_errors)
+        ]
+    return {
+        "position_quantities": position_quantities,
+        "open_order_symbols": open_order_symbols,
+    }, []
+
+
+def opening_legs_conflict_message(
+    legs: list[dict],
+    preflight_state: dict,
+    reserved_symbols: set[str] | None = None,
+) -> tuple[str | None, str | None]:
+    position_quantities = preflight_state["position_quantities"]
+    open_order_symbols = preflight_state["open_order_symbols"]
+    reserved_symbols = reserved_symbols or set()
+
+    for leg in legs:
+        symbol = str(leg.get("symbol") or "").strip().upper()
+        if symbol in position_quantities:
+            normalized_leg = {**leg, "symbol": symbol}
+            return symbol, _position_overlap_message(
+                normalized_leg, position_quantities[symbol]
+            )
+        if symbol in open_order_symbols:
+            return symbol, (
+                f"Skipped because {symbol} is already reserved by an open Alpaca "
+                "order; no legs were submitted, preventing a position_intent conflict."
+            )
+        if symbol in reserved_symbols:
+            return symbol, (
+                f"Skipped because {symbol} is already reserved by a higher-ranked "
+                "candidate in this scan; no legs were submitted, preventing a "
+                "position_intent conflict."
+            )
+    return None, None
 
 
 def get_recent_alpaca_orders(limit: int = 10) -> tuple[list[dict], list[str]]:
@@ -609,6 +719,29 @@ def submit_multileg_order(
     return order, []
 
 
+def submit_manual_multileg_order(
+    legs: list[dict],
+    quantity: int,
+    limit_price: float,
+    client_order_id: str | None = None,
+) -> tuple[dict | None, list[str], str | None]:
+    preflight_state, preflight_errors = get_alpaca_opening_preflight_state()
+    if preflight_errors:
+        return None, preflight_errors, None
+
+    _, conflict_message = opening_legs_conflict_message(legs, preflight_state)
+    if conflict_message:
+        return None, [], conflict_message
+
+    order, errors = submit_multileg_order(
+        legs,
+        quantity=quantity,
+        limit_price=limit_price,
+        client_order_id=client_order_id,
+    )
+    return order, errors, None
+
+
 def submit_scored_multileg_orders(
     scored_candidates,
     quantity: int = 1,
@@ -627,33 +760,14 @@ def submit_scored_multileg_orders(
             }
         ]
 
-    positions, position_errors = get_alpaca_positions()
-    if position_errors:
+    preflight_state, preflight_errors = get_alpaca_opening_preflight_state()
+    if preflight_errors:
         return [
             {
                 "Candidate": "Broker Position Safety Check",
                 "Symbol": "",
                 "Status": "Error",
-                "Message": (
-                    "Alpaca position lookup failed; no paper orders were submitted. "
-                    + "; ".join(position_errors)
-                ),
-            }
-        ]
-
-    live_position_quantities, quantity_errors = nonzero_alpaca_position_quantities(
-        positions
-    )
-    if quantity_errors:
-        return [
-            {
-                "Candidate": "Broker Position Safety Check",
-                "Symbol": "",
-                "Status": "Error",
-                "Message": (
-                    "Alpaca position data could not be validated; no paper orders "
-                    "were submitted. " + "; ".join(quantity_errors)
-                ),
+                "Message": "; ".join(preflight_errors),
             }
         ]
 
@@ -696,45 +810,21 @@ def submit_scored_multileg_orders(
             )
             continue
 
-        overlapping_leg = next(
-            (
-                leg
-                for leg in legs
-                if leg["symbol"].upper() in live_position_quantities
-            ),
-            None,
+        symbol, conflict_message = opening_legs_conflict_message(
+            legs, preflight_state, reserved_symbols
         )
-        if overlapping_leg is not None:
-            symbol = overlapping_leg["symbol"].upper()
+        if conflict_message:
             results.append(
                 {
                     "Candidate": candidate_label,
                     "Symbol": symbol,
                     "Status": "Skipped",
-                    "Message": _position_overlap_message(
-                        overlapping_leg, live_position_quantities[symbol]
-                    ),
+                    "Message": conflict_message,
                 }
             )
             continue
 
         candidate_symbols = {leg["symbol"].upper() for leg in legs}
-        shared_symbols = candidate_symbols & reserved_symbols
-        if shared_symbols:
-            symbol = sorted(shared_symbols)[0]
-            results.append(
-                {
-                    "Candidate": candidate_label,
-                    "Symbol": symbol,
-                    "Status": "Skipped",
-                    "Message": (
-                        f"Skipped because {symbol} is already reserved by a "
-                        "higher-ranked candidate in this scan; no legs were "
-                        "submitted, preventing a position_intent conflict."
-                    ),
-                }
-            )
-            continue
         reserved_symbols.update(candidate_symbols)
 
         client_order_id = scan_client_order_id(scored, scan_run_id)

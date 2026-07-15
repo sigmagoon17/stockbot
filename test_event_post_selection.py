@@ -177,6 +177,7 @@ class PostSelectionEventTests(unittest.TestCase):
 
         with (
             patch("alpaca_client.get_alpaca_positions", return_value=([], [])),
+            patch("alpaca_client.get_open_alpaca_orders", return_value=([], [])),
             patch("alpaca_client.get_recent_alpaca_orders", return_value=([], [])),
             patch("alpaca_client.submit_multileg_order", side_effect=submit),
         ):
