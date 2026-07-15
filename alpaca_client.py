@@ -760,12 +760,52 @@ def submit_multileg_order(
     return order, []
 
 
+def validate_manual_limit_price(
+    entry_type: str,
+    limit_price,
+    spread_width_per_share,
+) -> list[str]:
+    normalized_entry_type = str(entry_type or "").strip().lower()
+    if normalized_entry_type not in {"debit", "credit"}:
+        return [f"Unsupported manual entry type: {entry_type!r}."]
+
+    try:
+        width = float(spread_width_per_share)
+    except (TypeError, ValueError):
+        return ["Manual spread width must be a finite number greater than $0.00."]
+    if not math.isfinite(width) or width <= 0:
+        return ["Manual spread width must be a finite number greater than $0.00."]
+
+    entry_label = normalized_entry_type.title()
+    range_message = (
+        f"{entry_label} limit must be greater than $0.00 and less than the "
+        f"${width:.2f} spread width."
+    )
+    try:
+        price = float(limit_price)
+    except (TypeError, ValueError):
+        return [range_message]
+    if not math.isfinite(price) or price <= 0 or price >= width:
+        return [range_message]
+    return []
+
+
 def submit_manual_multileg_order(
     legs: list[dict],
     quantity: int,
     limit_price: float,
     client_order_id: str | None = None,
+    expected_entry_type: str | None = None,
+    expected_spread_width: float | None = None,
 ) -> tuple[dict | None, list[str], str | None]:
+    if expected_entry_type is not None or expected_spread_width is not None:
+        limit_errors = validate_manual_limit_price(
+            expected_entry_type,
+            limit_price,
+            expected_spread_width,
+        )
+        if limit_errors:
+            return None, limit_errors, None
     leg_errors = validate_opening_option_legs(legs)
     if leg_errors:
         return None, leg_errors, None

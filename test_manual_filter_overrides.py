@@ -1,5 +1,6 @@
 import hashlib
 import inspect
+import ast
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -9,7 +10,9 @@ from types import SimpleNamespace
 from alpaca_client import (
     option_symbol,
     submit_manual_multileg_order,
+    submit_scored_multileg_orders,
     trade_multileg_order_details,
+    validate_manual_limit_price,
 )
 from stock2dupe import (
     ScanPreferences,
@@ -252,6 +255,87 @@ class ManualOverridePaperSafetyTests(unittest.TestCase):
         self.assertIsNone(message)
         self.assertIn("not using the paper endpoint", errors[0])
 
+    def test_manual_limit_price_boundaries(self):
+        accepted = (
+            ("debit", 1.50, 5.0),
+            ("debit", 4.99, 5.0),
+            ("credit", 1.00, 5.0),
+        )
+        rejected = (
+            ("debit", 5.00, 5.0),
+            ("debit", 5.01, 5.0),
+            ("credit", 5.00, 5.0),
+        )
+        for entry_type, limit_price, width in accepted:
+            with self.subTest(entry_type=entry_type, limit_price=limit_price):
+                self.assertEqual(
+                    [], validate_manual_limit_price(entry_type, limit_price, width)
+                )
+        for entry_type, limit_price, width in rejected:
+            with self.subTest(entry_type=entry_type, limit_price=limit_price):
+                errors = validate_manual_limit_price(
+                    entry_type, limit_price, width
+                )
+                self.assertEqual(1, len(errors))
+                self.assertIn("less than the $5.00 spread width", errors[0])
+
+    def test_invalid_manual_limit_values_are_rejected(self):
+        for invalid in (None, "bad", 0, -1, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=invalid):
+                self.assertTrue(validate_manual_limit_price("debit", invalid, 5.0))
+        self.assertTrue(validate_manual_limit_price("unsupported", 1.0, 5.0))
+        for invalid_width in (None, "bad", 0, -1, float("nan"), float("inf")):
+            with self.subTest(width=invalid_width):
+                self.assertTrue(
+                    validate_manual_limit_price("credit", 1.0, invalid_width)
+                )
+
+    def test_invalid_limit_stops_before_broker_and_submit(self):
+        legs, _, _ = trade_multileg_order_details(self.candidate())
+        with (
+            patch("alpaca_client.get_alpaca_positions") as positions,
+            patch("alpaca_client.get_open_alpaca_orders") as open_orders,
+            patch("alpaca_client.submit_multileg_order") as submit,
+        ):
+            order, errors, message = submit_manual_multileg_order(
+                legs,
+                1,
+                5.0,
+                "override-test",
+                expected_entry_type="debit",
+                expected_spread_width=5.0,
+            )
+        positions.assert_not_called()
+        open_orders.assert_not_called()
+        submit.assert_not_called()
+        self.assertIsNone(order)
+        self.assertIsNone(message)
+        self.assertIn("less than the $5.00 spread width", errors[0])
+
+    def test_valid_limit_reaches_existing_manual_preflight(self):
+        legs, _, _ = trade_multileg_order_details(self.candidate())
+        with (
+            patch("alpaca_client.get_alpaca_positions", return_value=([], [])) as positions,
+            patch("alpaca_client.get_open_alpaca_orders", return_value=([], [])),
+            patch(
+                "alpaca_client.submit_multileg_order",
+                return_value=({"id": "paper-only", "status": "accepted"}, []),
+            ) as submit,
+        ):
+            order, errors, message = submit_manual_multileg_order(
+                legs,
+                1,
+                1.5,
+                "override-test",
+                expected_entry_type="debit",
+                expected_spread_width=5.0,
+            )
+        positions.assert_called_once_with()
+        submit.assert_called_once()
+        self.assertEqual("paper-only", order["id"])
+        self.assertEqual([], errors)
+        self.assertIsNone(message)
+
 
 class IsolationTests(unittest.TestCase):
     def test_automatic_submitter_has_no_override_parameter(self):
@@ -267,6 +351,47 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(
             "ed3a5fcaa302fa80d10776c753bef3fbf816330d3081c80ae1d4a6f4fb13b64e",
             digest,
+        )
+
+    def test_automatic_submission_does_not_use_manual_limit_validation(self):
+        source = inspect.getsource(submit_scored_multileg_orders)
+        self.assertNotIn("validate_manual_limit_price", source)
+
+    def test_ui_limit_rejection_returns_before_submit_and_history(self):
+        tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "render_manual_override_paper_form"
+        )
+        calls = {
+            node.func.id: node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in {
+                "validate_manual_limit_price",
+                "submit_manual_multileg_order",
+                "append_alpaca_paper_orders",
+            }
+        }
+        validation_guard = next(
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "limit_errors"
+        )
+        self.assertTrue(
+            any(isinstance(node, ast.Return) for node in validation_guard.body)
+        )
+        self.assertLess(
+            calls["validate_manual_limit_price"],
+            calls["submit_manual_multileg_order"],
+        )
+        self.assertLess(
+            calls["submit_manual_multileg_order"],
+            calls["append_alpaca_paper_orders"],
         )
 
 

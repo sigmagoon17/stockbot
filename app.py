@@ -1,6 +1,7 @@
 from collections import Counter
 from datetime import date, datetime, timezone
 import hmac
+import math
 import os
 import pandas as pd
 import streamlit as st
@@ -20,6 +21,7 @@ try:
         submit_manual_multileg_order,
         submit_scored_multileg_orders,
         trade_multileg_order_details,
+        validate_manual_limit_price,
         validate_opening_option_legs,
     )
 except ImportError:
@@ -27,6 +29,7 @@ except ImportError:
     submit_manual_multileg_order = None
     submit_scored_multileg_orders = None
     trade_multileg_order_details = None
+    validate_manual_limit_price = None
     validate_opening_option_legs = None
 from history_tracker import (
     add_manual_position,
@@ -2348,6 +2351,7 @@ def render_manual_override_paper_form(scan_output, paper_endpoint: bool):
     if (
         submit_manual_multileg_order is None
         or trade_multileg_order_details is None
+        or validate_manual_limit_price is None
         or validate_opening_option_legs is None
     ):
         st.error("Manual paper-order safety helpers are unavailable.")
@@ -2468,12 +2472,38 @@ def render_manual_override_paper_form(scan_output, paper_endpoint: bool):
     if legs:
         st.dataframe(pd.DataFrame(legs), width="stretch", hide_index=True)
 
+    try:
+        manual_spread_width = float(spread_width(trade))
+    except (TypeError, ValueError, OverflowError):
+        manual_spread_width = math.nan
+    width_supports_limit = (
+        math.isfinite(manual_spread_width) and manual_spread_width > 0.01
+    )
+    if not width_supports_limit:
+        st.error(
+            "Manual submission is disabled because the spread width does not "
+            "support a limit between $0.00 and the spread width."
+        )
+    maximum_limit_price = (
+        max(
+            0.01,
+            math.floor((manual_spread_width - 1e-9) * 100) / 100,
+        )
+        if width_supports_limit
+        else 0.01
+    )
+    default_limit_price = min(
+        max(round(float(suggested_limit_price), 2), 0.01),
+        maximum_limit_price,
+    )
+
     can_submit = (
         decision.allowed
         and not leg_errors
         and paper_endpoint
         and not duplicate_errors
         and not duplicate_leg_key
+        and width_supports_limit
     )
     with st.form("manual_rejected_override_order_form"):
         order_columns = st.columns(2)
@@ -2483,8 +2513,10 @@ def render_manual_override_paper_form(scan_output, paper_endpoint: bool):
         limit_price = order_columns[1].number_input(
             "Override Limit Price",
             min_value=0.01,
-            value=max(round(float(suggested_limit_price), 2), 0.01),
+            max_value=maximum_limit_price,
+            value=default_limit_price,
             step=0.01,
+            disabled=not width_supports_limit,
         )
         override_confirmation = st.text_input("Type OVERRIDE")
         paper_confirmation = st.text_input("Type PAPER")
@@ -2502,6 +2534,16 @@ def render_manual_override_paper_form(scan_output, paper_endpoint: bool):
         st.error("Type PAPER exactly before submitting.")
         return
 
+    limit_errors = validate_manual_limit_price(
+        trade.entry_type,
+        limit_price,
+        manual_spread_width,
+    )
+    if limit_errors:
+        for error in limit_errors:
+            st.error(error)
+        return
+
     override_key = f"override-{paper_trade_key(original_scored)}"
     submitted_override_keys = st.session_state.setdefault(
         "manual_override_order_keys", set()
@@ -2515,6 +2557,8 @@ def render_manual_override_paper_form(scan_output, paper_endpoint: bool):
         quantity=int(quantity),
         limit_price=float(limit_price),
         client_order_id=override_key,
+        expected_entry_type=trade.entry_type,
+        expected_spread_width=manual_spread_width,
     )
     if skip_message:
         st.warning(skip_message)
@@ -2551,7 +2595,7 @@ def render_manual_override_paper_form(scan_output, paper_endpoint: bool):
                 "Selection Method": "manual_override",
                 "Entry Type": trade.entry_type,
                 "Limit Price": float(limit_price),
-                "Spread Width Per Share": spread_width(trade),
+                "Spread Width Per Share": manual_spread_width,
                 "Max Profit": (
                     trade.max_profit if trade.entry_type == "debit" else trade.credit
                 ),
