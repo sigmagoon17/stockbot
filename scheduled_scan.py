@@ -1,5 +1,6 @@
 import os
 import time
+from types import SimpleNamespace
 
 try:
     from alpaca_client import (
@@ -11,7 +12,7 @@ except ImportError:
     leg_key_from_legs = None
     submit_scored_multileg_orders = None
     trade_multileg_order_details = None
-from event_analysis import get_deep_event_analysis, get_event_analysis
+from event_analysis import analyze_candidate_setup, get_deep_event_analysis
 from history_tracker import (
     append_alpaca_paper_orders,
     append_alpaca_paper_snapshots,
@@ -34,35 +35,48 @@ from stock2dupe import (
     select_execution_candidates,
     select_history_candidates,
 )
-from scanner_tracking import new_scan_run_id
+from scanner_post_selection import analyze_top_candidates
+from scanner_tracking import new_scan_run_id, setup_key_for_trade
 from stock_universe import prefilter_tickers
 
-def selected_deep_analysis_tickers(
-    scored_trades,
-    price_moves,
-    max_tickers: int = 5,
-    top_trade_count: int = 10,
-):
-    selected = []
 
-    for scored in scored_trades[:top_trade_count]:
-        ticker = scored.trade.ticker
-        if scored.total_score >= 70 and ticker not in selected:
-            selected.append(ticker)
-
-    unusual_movers = sorted(
-        price_moves.items(),
-        key=lambda item: abs(float(item[1].get("Move vs 20D Vol", 0) or 0)),
-        reverse=True,
+def unavailable_scheduled_event(ticker, error):
+    return SimpleNamespace(
+        adjustment=0,
+        confidence="low",
+        label="neutral",
+        summary=f"Scheduled event analysis was unavailable for {ticker}.",
+        headlines_used=[],
+        available=False,
     )
-    for ticker, move in unusual_movers:
-        move_multiple = abs(float(move.get("Move vs 20D Vol", 0) or 0))
-        if move_multiple >= 1.5 and ticker not in selected:
-            selected.append(ticker)
-        if len(selected) >= max_tickers:
-            break
 
-    return selected[:max_tickers]
+
+def unavailable_scheduled_review(scored, error):
+    return SimpleNamespace(
+        verdict="watch",
+        confidence="low",
+        summary=f"Scheduled candidate review was unavailable for {scored.trade.ticker}.",
+        strengths=[],
+        risks=[],
+        action="Review the quantitative setup manually.",
+        available=False,
+    )
+
+
+def analyze_execution_candidates(execution_candidates, preferences, price_moves):
+    return analyze_top_candidates(
+        execution_candidates,
+        price_moves,
+        load_ticker_event=lambda ticker: get_deep_event_analysis(
+            ticker, preferences.outlook
+        ),
+        review_candidate=lambda scored, event_analysis, price_move: (
+            analyze_candidate_setup(scored, event_analysis, price_move)
+        ),
+        candidate_key=lambda scored: setup_key_for_trade(scored.trade),
+        unavailable_event=unavailable_scheduled_event,
+        unavailable_review=unavailable_scheduled_review,
+    )
 
 
 def env_int(name: str, default: int) -> int:
@@ -196,8 +210,6 @@ def main() -> int:
     )
     trades = []
     event_analyses = {}
-    event_adjustments = {}
-    event_labels = {}
     price_moves = {}
     errors = update_expired_history()
     scan_started = time.perf_counter()
@@ -214,10 +226,6 @@ def main() -> int:
                 ticker,
                 expiration_coverage=preferences.expiration_coverage,
             )
-            event_analysis = get_event_analysis(ticker, preferences.outlook)
-            event_analyses[ticker] = event_analysis
-            event_adjustments[ticker] = event_analysis.adjustment
-            event_labels[ticker] = event_analysis.label
             price_moves[ticker] = price_move
             condor_result = build_iron_condors_with_diagnostics(
                 option_chain, price, earnings_date, volatility_rank, preferences
@@ -253,26 +261,37 @@ def main() -> int:
         except Exception as error:
             errors.append(f"{ticker}: {error}")
 
-    scored_trades, _ = scan_trades(
-        trades, preferences, event_adjustments, price_moves, event_labels
-    )
-    deep_tickers = selected_deep_analysis_tickers(scored_trades, price_moves)
-    for ticker in deep_tickers:
-        deep_analysis = get_deep_event_analysis(ticker, preferences.outlook)
-        event_analyses[ticker] = deep_analysis
-        event_adjustments[ticker] = deep_analysis.adjustment
-        event_labels[ticker] = deep_analysis.label
-        print(
-            f"{ticker}: deep news analysis {deep_analysis.label} "
-            f"({deep_analysis.adjustment:+d})"
-        )
-
-    if deep_tickers:
-        scored_trades, _ = scan_trades(
-            trades, preferences, event_adjustments, price_moves, event_labels
-        )
-
+    scored_trades, _ = scan_trades(trades, preferences, {}, price_moves, {})
     execution_candidates = select_execution_candidates(scored_trades, limit=3)
+    post_selection_analysis = analyze_execution_candidates(
+        execution_candidates,
+        preferences,
+        price_moves,
+    )
+    event_analyses = post_selection_analysis.event_analyses
+    for ticker, analysis in event_analyses.items():
+        print(
+            f"{ticker}: supplemental event analysis {analysis.label} "
+            f"({analysis.adjustment:+d})"
+        )
+    for scored in execution_candidates:
+        candidate_analysis = post_selection_analysis.candidate_analyses.get(
+            setup_key_for_trade(scored.trade)
+        )
+        if candidate_analysis is not None:
+            print(
+                f"{scored.trade.ticker}: candidate review "
+                f"{candidate_analysis.verdict} ({candidate_analysis.confidence})"
+            )
+    diagnostics = post_selection_analysis.diagnostics
+    print(
+        "Post-selection AI: "
+        f"{diagnostics['execution_candidates']} candidates, "
+        f"{diagnostics['unique_candidate_tickers']} unique tickers, "
+        f"{diagnostics['ticker_event_calls']} event calls, "
+        f"{diagnostics['candidate_review_calls']} candidate reviews."
+    )
+
     history_candidates = select_history_candidates(scored_trades)
     scan_run_id = new_scan_run_id()
     errors.extend(
