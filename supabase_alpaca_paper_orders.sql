@@ -3,20 +3,57 @@ create table if not exists public.alpaca_paper_orders (
     created_at timestamptz not null default now(),
     scan_time timestamptz not null,
     scan_time_est text,
+    scan_run_id text,
+    setup_key text,
+    execution_rank integer,
+    selection_method text,
     order_id text,
     client_order_id text,
     ticker text,
     strategy text,
     expiration date,
     setup_score integer,
+    ticker_score integer,
+    quant_score integer,
     entry_type text,
     limit_price numeric,
+    max_profit numeric,
+    max_risk numeric,
+    entry_timestamp timestamptz,
+    entry_price numeric,
+    opening_order_status text,
+    opening_filled_at timestamptz,
+    opening_filled_avg_price numeric,
+    spread_width_per_share numeric,
+    filled_max_profit_per_share numeric,
+    filled_max_risk_per_share numeric,
+    fill_validation_error text,
     quantity integer,
     order_class text,
     symbol text,
     status text,
     message text,
-    leg_key text
+    leg_key text,
+    exit_policy text not null default 'none',
+    position_status text not null default 'pending',
+    exit_signal_time timestamptz,
+    exit_reason text,
+    close_order_id text,
+    close_client_order_id text,
+    close_order_status text,
+    close_order_submitted_at timestamptz,
+    close_attempt_count integer not null default 0,
+    last_close_attempt_at timestamptz,
+    close_attempt_run_id text,
+    exit_retryable boolean not null default true,
+    close_attempt_history jsonb not null default '[]'::jsonb,
+    exit_fill_time timestamptz,
+    exit_fill_price numeric,
+    realized_pnl numeric,
+    realized_return_on_risk numeric,
+    maximum_favorable_excursion numeric,
+    maximum_adverse_excursion numeric,
+    last_exit_error text
 );
 
 create index if not exists alpaca_paper_orders_scan_time_idx
@@ -26,6 +63,13 @@ create unique index if not exists alpaca_paper_orders_client_order_id_idx
     on public.alpaca_paper_orders(client_order_id)
     where client_order_id is not null;
 
-create unique index if not exists alpaca_paper_orders_leg_key_idx
+drop index if exists public.alpaca_paper_orders_leg_key_idx;
+
+create unique index alpaca_paper_orders_leg_key_idx
     on public.alpaca_paper_orders(leg_key)
-    where leg_key is not null;
+    where leg_key is not null
+      and position_status in ('pending', 'open');
+
+create unique index if not exists alpaca_paper_orders_close_client_order_id_idx
+    on public.alpaca_paper_orders(close_client_order_id)
+    where close_client_order_id is not null;

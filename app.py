@@ -4,10 +4,7 @@ import hmac
 import os
 import pandas as pd
 import streamlit as st
-import datetime
-import supabase
 import time
-import yfinance as yf
 from types import SimpleNamespace
 
 from alpaca_client import (
@@ -77,15 +74,33 @@ except ImportError:
 
 from stock2dupe import (
     CONTRACT_MULTIPLIER,
+    EXPIRATION_COVERAGE_EXHAUSTIVE,
+    EXPIRATION_COVERAGE_FAST_WEEKLY,
     ScanPreferences,
     build_call_credit_spreads,
-    build_iron_condor,
+    build_iron_condors_with_diagnostics,
     build_put_credit_spreads,
     build_bull_call_debit_spread,
     build_bear_put_debit_spread,
-    condor_diagnostics,
-    get_option_chain,
+    get_option_chain_result,
+    execution_selection_diagnostics,
     scan_trades,
+    select_execution_candidates,
+    select_history_candidates,
+    strategy_direction,
+)
+from scanner_tracking import new_scan_run_id
+from scanner_post_selection import (
+    BEAR_PUT_DEBIT_SPREADS,
+    BULL_CALL_DEBIT_SPREADS,
+    CALL_CREDIT_SPREADS,
+    IRON_CONDORS,
+    PUT_CREDIT_SPREADS,
+    STRATEGY_LABELS,
+    STRATEGY_OPTIONS,
+    analyze_top_candidates,
+    run_selected_strategy_builders,
+    validate_strategy_selection,
 )
 from stock_universe import prefilter_tickers
 
@@ -93,13 +108,14 @@ try:
     from event_analysis import (
         analyze_candidate_setup,
         get_deep_event_analysis,
-        get_event_analysis,
+        neutral_event_analysis,
+        unavailable_candidate_analysis,
     )
 except ImportError:
-    from event_analysis import get_event_analysis
-
     analyze_candidate_setup = None
     get_deep_event_analysis = None
+    neutral_event_analysis = None
+    unavailable_candidate_analysis = None
 
 st.set_page_config(page_title="Options Scanner", layout="wide")
 
@@ -117,9 +133,22 @@ LARGE_PRESET_TICKERS = (
 )
 
 
-@st.cache_resource
-def event_analysis_cache():
-    return {}
+@st.cache_data(ttl=120, show_spinner=False)
+def get_cached_option_chain_result(
+    ticker: str,
+    test_expiration,
+    nearest_expiration: bool,
+    expiration_coverage: str,
+):
+    return (
+        get_option_chain_result(
+            ticker,
+            test_expiration=test_expiration,
+            nearest_expiration=nearest_expiration,
+            expiration_coverage=expiration_coverage,
+        ),
+        time.monotonic(),
+    )
 
 
 @st.cache_resource
@@ -132,37 +161,32 @@ def deep_event_analysis_cache():
     return {}
 
 
-def get_cached_event_analysis(ticker: str, outlook: str):
-    cache = event_analysis_cache()
-    cache_key = (ticker, outlook)
-    now = time.monotonic()
-    cached = cache.get(cache_key)
-    if cached and now - cached["created_at"] < cached["ttl"]:
-        return cached["analysis"]
-
-    analysis = get_event_analysis(ticker, outlook)
-    cache[cache_key] = {
-        "analysis": analysis,
-        "created_at": now,
-        "ttl": (
-            EVENT_ANALYSIS_SUCCESS_TTL_SECONDS
-            if analysis.available
-            else EVENT_ANALYSIS_FAILURE_TTL_SECONDS
-        ),
-    }
-    return analysis
-
-
-def get_cached_deep_event_analysis(ticker: str, outlook: str):
+def get_cached_deep_event_analysis(
+    ticker: str,
+    outlook: str,
+    include_cache_status: bool = False,
+):
     if get_deep_event_analysis is None:
-        return get_cached_event_analysis(ticker, outlook)
+        analysis = SimpleNamespace(
+            adjustment=0,
+            confidence="low",
+            label="neutral",
+            summary=f"Deep event analysis was unavailable for {ticker}.",
+            headlines_used=[],
+            available=False,
+        )
+        return (analysis, "miss") if include_cache_status else analysis
 
     cache = deep_event_analysis_cache()
     cache_key = (ticker, outlook)
     now = time.monotonic()
     cached = cache.get(cache_key)
     if cached and now - cached["created_at"] < cached["ttl"]:
-        return cached["analysis"]
+        return (
+            (cached["analysis"], "hit")
+            if include_cache_status
+            else cached["analysis"]
+        )
 
     analysis = get_deep_event_analysis(ticker, outlook)
     cache[cache_key] = {
@@ -174,7 +198,7 @@ def get_cached_deep_event_analysis(ticker: str, outlook: str):
             else EVENT_ANALYSIS_FAILURE_TTL_SECONDS
         ),
     }
-    return analysis
+    return (analysis, "miss") if include_cache_status else analysis
 
 
 def candidate_analysis_key(scored):
@@ -193,10 +217,21 @@ def candidate_analysis_key(scored):
     )
 
 
-def get_cached_candidate_analysis(scored, event_analysis, price_move):
+def get_cached_candidate_analysis(
+    scored,
+    event_analysis,
+    price_move,
+    include_cache_status: bool = False,
+):
     cache = candidate_analysis_cache()
-    cache_key = candidate_analysis_key(scored)
-    if cache_key not in cache:
+    cache_key = (
+        candidate_analysis_key(scored),
+        getattr(event_analysis, "label", "neutral"),
+        getattr(event_analysis, "adjustment", 0),
+        getattr(event_analysis, "summary", ""),
+    )
+    cache_status = "hit" if cache_key in cache else "miss"
+    if cache_status == "miss":
         if analyze_candidate_setup is None:
             cache[cache_key] = SimpleNamespace(
                 verdict="watch",
@@ -211,119 +246,257 @@ def get_cached_candidate_analysis(scored, event_analysis, price_move):
             cache[cache_key] = analyze_candidate_setup(
                 scored, event_analysis, price_move
             )
-    return cache[cache_key]
-
-
-def selected_deep_analysis_tickers(
-    scored_trades,
-    price_moves,
-    max_tickers: int = 5,
-    top_trade_count: int = 10,
-):
-    selected = []
-
-    for scored in scored_trades[:top_trade_count]:
-        ticker = scored.trade.ticker
-        if scored.total_score >= 70 and ticker not in selected:
-            selected.append(ticker)
-
-    unusual_movers = sorted(
-        price_moves.items(),
-        key=lambda item: abs(float(item[1].get("Move vs 20D Vol", 0) or 0)),
-        reverse=True,
+    return (
+        (cache[cache_key], cache_status)
+        if include_cache_status
+        else cache[cache_key]
     )
-    for ticker, move in unusual_movers:
-        move_multiple = abs(float(move.get("Move vs 20D Vol", 0) or 0))
-        if move_multiple >= 1.5 and ticker not in selected:
-            selected.append(ticker)
-        if len(selected) >= max_tickers:
-            break
-
-    return selected[:max_tickers]
 
 
-def apply_deep_event_analysis(
-    scored_trades,
-    trades,
-    preferences,
-    event_analyses,
-    event_adjustments,
-    event_labels,
-    price_moves,
-):
-    deep_tickers = selected_deep_analysis_tickers(scored_trades, price_moves)
-    if not deep_tickers:
-        return scored_trades, event_analyses, event_adjustments, event_labels, []
-
-    messages = []
-    for ticker in deep_tickers:
-        deep_analysis = get_cached_deep_event_analysis(ticker, preferences.outlook)
-        event_analyses[ticker] = deep_analysis
-        event_adjustments[ticker] = deep_analysis.adjustment
-        event_labels[ticker] = deep_analysis.label
-        messages.append(
-            f"{ticker}: deep news analysis {deep_analysis.label} "
-            f"({deep_analysis.adjustment:+d})"
+def unavailable_top_candidate_event(ticker, error):
+    if neutral_event_analysis is not None:
+        return neutral_event_analysis(
+            ticker,
+            [],
+            "Top-candidate event analysis was unavailable for {ticker}.",
+            available=False,
         )
-
-    rescored_trades, _ = scan_trades(
-        trades, preferences, event_adjustments, price_moves, event_labels
+    return SimpleNamespace(
+        adjustment=0,
+        confidence="low",
+        label="neutral",
+        summary=f"Top-candidate event analysis was unavailable for {ticker}.",
+        headlines_used=[],
+        available=False,
     )
-    return rescored_trades, event_analyses, event_adjustments, event_labels, messages
+
+
+def unavailable_top_candidate_review(scored, error):
+    summary = f"AI candidate review was unavailable for {scored.trade.ticker}."
+    if unavailable_candidate_analysis is not None:
+        return unavailable_candidate_analysis(summary)
+    return SimpleNamespace(
+        verdict="watch",
+        confidence="low",
+        summary=summary,
+        strengths=[],
+        risks=[],
+        action="Review the scanner numbers manually before acting.",
+        available=False,
+    )
+
+
+def analyze_execution_candidates(execution_candidates, preferences, price_moves):
+    return analyze_top_candidates(
+        execution_candidates,
+        price_moves,
+        load_ticker_event=lambda ticker: get_cached_deep_event_analysis(
+            ticker,
+            preferences.outlook,
+            include_cache_status=True,
+        ),
+        review_candidate=lambda scored, event_analysis, price_move: (
+            get_cached_candidate_analysis(
+                scored,
+                event_analysis,
+                price_move,
+                include_cache_status=True,
+            )
+        ),
+        candidate_key=candidate_analysis_key,
+        unavailable_event=unavailable_top_candidate_event,
+        unavailable_review=unavailable_top_candidate_review,
+    )
 
 
 st.markdown(
     """
     <style>
+        :root {
+            --bg-main: #0b1220;
+            --bg-panel: #111a2b;
+            --bg-panel-2: #162338;
+            --bg-card: #15243a;
+            --bg-input: #0f1727;
+            --bg-accent-soft: #102844;
+            --border: #253551;
+            --border-strong: #36507b;
+            --text-main: #ecf3ff;
+            --text-muted: #9caecf;
+            --text-soft: #7f93b8;
+            --accent: #63b3ff;
+            --accent-strong: #2f8fff;
+            --accent-deep: #1e6fe0;
+            --success: #5ad7a3;
+        }
         .stApp {
-            background: #f6f8f6;
-            color: #15221e;
+            background:
+                radial-gradient(circle at top left, rgba(47, 143, 255, 0.12), transparent 24%),
+                linear-gradient(180deg, #09111d 0%, #0b1220 38%, #0d1626 100%);
+            color: var(--text-main);
         }
         .block-container {
             max-width: 1440px;
             padding-top: 2rem;
             padding-bottom: 2.5rem;
         }
+        h1, h2, h3, h4, h5, h6 {
+            color: var(--text-main) !important;
+            letter-spacing: 0;
+        }
+        p, li, span, div {
+            color: inherit;
+        }
+        [data-testid="stCaptionContainer"] {
+            color: var(--text-muted) !important;
+        }
         [data-testid="stSidebar"] {
-            background: #eef2ef;
-            border-right: 1px solid #d8e0db;
+            background:
+                linear-gradient(180deg, rgba(20, 32, 52, 0.98) 0%, rgba(12, 20, 34, 0.98) 100%);
+            border-right: 1px solid var(--border);
+            box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.03);
+        }
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] .stMarkdown,
+        [data-testid="stSidebar"] .stCaption,
+        [data-testid="stSidebar"] [data-testid="stExpander"] summary,
+        [data-testid="stSidebar"] [data-testid="stSelectbox"] label,
+        [data-testid="stSidebar"] [data-testid="stTextArea"] label,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] label {
+            color: var(--text-main) !important;
+            font-weight: 600;
+        }
+        [data-testid="stSidebar"] [data-testid="collapsedControl"] svg,
+        [data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] svg,
+        [data-testid="stSidebar"] [data-testid="stExpander"] summary svg {
+            fill: var(--text-muted) !important;
+            color: var(--text-muted) !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="select"] > div,
+        [data-testid="stSidebar"] [data-testid="stTextArea"] textarea,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] input,
+        [data-testid="stSidebar"] [data-testid="stTextInput"] input {
+            background: var(--bg-input) !important;
+            color: var(--text-main) !important;
+            border: 1px solid var(--border) !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="select"] svg,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] button,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] button svg {
+            color: var(--text-muted) !important;
+            fill: var(--text-muted) !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stTextArea"] textarea::placeholder,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] input::placeholder,
+        [data-testid="stSidebar"] [data-testid="stTextInput"] input::placeholder {
+            color: var(--text-soft) !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stExpander"] {
+            background: rgba(15, 23, 39, 0.7);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+        }
+        [data-testid="stSidebar"] [data-testid="stExpander"] details {
+            background: transparent;
+        }
+        [data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {
+            background: rgba(99, 179, 255, 0.06);
         }
         [data-testid="stMetric"] {
-            background: #ffffff;
-            border: 1px solid #d8e0db;
-            border-radius: 6px;
-            padding: 0.7rem 0.85rem;
+            background: linear-gradient(180deg, rgba(21, 36, 58, 0.96) 0%, rgba(17, 26, 43, 0.96) 100%);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 0.9rem 1rem;
+            box-shadow: 0 10px 24px rgba(3, 8, 16, 0.22);
         }
         [data-testid="stMetricLabel"] {
-            color: #53645c;
+            color: var(--text-muted) !important;
         }
         [data-testid="stMetricValue"] {
-            color: #0c604e;
+            color: var(--accent) !important;
         }
         div.stButton > button,
         div.stDownloadButton > button {
-            border-radius: 6px;
+            border-radius: 12px;
             font-weight: 600;
+            transition: all 0.18s ease;
         }
         div.stButton > button[kind="primary"] {
-            background: #000080;
-            border-color: #000080;
+            background: linear-gradient(135deg, var(--accent-deep) 0%, var(--accent-strong) 100%);
+            border: 1px solid rgba(99, 179, 255, 0.35);
+            color: #f6fbff;
+            box-shadow: 0 10px 26px rgba(30, 111, 224, 0.3);
         }
         div.stButton > button[kind="primary"]:hover {
-            background: #123499;
-            border-color: #123499;
+            background: linear-gradient(135deg, #2878eb 0%, #58b0ff 100%);
+            border-color: rgba(99, 179, 255, 0.5);
+            transform: translateY(-1px);
+        }
+        div.stButton > button:not([kind="primary"]),
+        div.stDownloadButton > button {
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+        }
+        div.stButton > button:not([kind="primary"]):hover,
+        div.stDownloadButton > button:hover {
+            border-color: var(--border-strong);
+            background: var(--bg-panel-2);
         }
         [data-baseweb="tab-list"] {
             gap: 1.25rem;
-            border-bottom: 1px solid #d8e0db;
+            border-bottom: 1px solid var(--border);
         }
         [data-baseweb="tab"] {
             height: 42px;
             padding: 0 0.2rem;
             font-weight: 600;
+            color: var(--text-muted) !important;
         }
         [data-baseweb="tab-highlight"] {
-            background-color: #0c604e;
+            background-color: var(--accent-strong);
+        }
+        [data-baseweb="tab"][aria-selected="true"] {
+            color: var(--text-main) !important;
+        }
+        [data-testid="stAlert"] {
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            background: rgba(16, 40, 68, 0.9);
+            color: var(--text-main);
+        }
+        [data-testid="stStatusWidget"] {
+            background: rgba(17, 26, 43, 0.94);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+        }
+        [data-testid="stStatusWidget"] * {
+            color: var(--text-main) !important;
+        }
+        [data-testid="stToolbar"] {
+            background: transparent;
+        }
+        [data-testid="stHeader"] {
+            background: rgba(9, 17, 29, 0.92);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        section[data-testid="stSidebar"] .stButton button[kind="secondary"] {
+            background: var(--bg-panel);
+            color: var(--text-main);
+        }
+        [data-testid="stSidebar"] .stButton button {
+            width: 100%;
+        }
+        [data-testid="stSidebar"] [data-testid="baseButton-secondary"] {
+            border-color: var(--border);
+        }
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] .stCaption {
+            color: var(--text-muted) !important;
+        }
+        [data-testid="stSidebarNav"] {
+            background: transparent;
         }
     </style>
     """,
@@ -335,70 +508,93 @@ def select_top_candidates(scored_trades, limit: int | None = 50):
     return scored_trades[:limit] if limit is not None else scored_trades
 
 
-def select_history_candidates(
-    scored_trades, limit: int = 25, per_ticker: int = 4, per_strategy: int = 1
+PERFORMANCE_PHASES = (
+    "Underlying / History",
+    "Expiration List",
+    "Option Downloads",
+    "Top Candidate Ticker Event Analysis",
+    "Condor Wings",
+    "Condor Pairing",
+    "Condor Diagnostics",
+    "Other Strategies",
+    "Filter / Score / Rank",
+    "Top Candidate AI Review",
+    "Alpaca Preflight / Submission",
+)
+
+
+def empty_performance_row(scope: str) -> dict[str, float | str]:
+    return {"Scope": scope, **{phase: 0.0 for phase in PERFORMANCE_PHASES}, "Total": 0.0}
+
+
+def performance_table_rows(performance: dict) -> list[dict]:
+    ticker_rows = list(performance.get("tickers", {}).values())
+    whole = empty_performance_row("Whole Scan")
+    for row in ticker_rows:
+        for phase in PERFORMANCE_PHASES:
+            whole[phase] += float(row.get(phase, 0.0) or 0.0)
+    for phase, seconds in performance.get("whole_only", {}).items():
+        whole[phase] = float(seconds or 0.0)
+    whole["Total"] = float(performance.get("total_elapsed", 0.0) or 0.0)
+    return ticker_rows + [whole]
+
+
+def scan_watchlist(
+    tickers: list[str],
+    preferences: ScanPreferences,
+    selected_strategies=None,
 ):
-    selected = []
-    selected_ids = set()
-    selected_by_strategy = Counter()
-
-    # Reserve history slots for each strategy before filling by overall rank.
-    for scored in scored_trades:
-        strategy = scored.trade.strategy
-        if selected_by_strategy[strategy] >= per_strategy:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        selected_by_strategy[strategy] += 1
-        if len(selected) == limit:
-            return selected
-
-    for scored in select_top_candidates(scored_trades):
-        if id(scored) in selected_ids:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        if len(selected) == limit:
-            return selected
-
-    for scored in scored_trades:
-        if id(scored) in selected_ids:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        if len(selected) == limit:
-            break
-
-    return selected
-
-
-def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
+    validate_strategy_selection(selected_strategies)
+    scan_started = time.perf_counter()
     trades = []
     ticker_data = []
     condor_diagnostic_rows = []
     errors = []
-    event_adjustments = {}
-    event_labels = {}
+    event_adjustments = {ticker: 0 for ticker in tickers}
+    event_labels = {ticker: "neutral" for ticker in tickers}
     event_analyses = {}
     price_moves = {}
+    performance = {
+        "tickers": {},
+        "whole_only": {},
+        "total_elapsed": 0.0,
+        "started_at": scan_started,
+    }
+    scoring_timing_by_ticker = {}
+    whole_scoring_timing = {"seconds": 0.0}
     progress = st.progress(0, text="Preparing scan")
 
     for index, ticker in enumerate(tickers, start=1):
         progress.progress(
             index / len(tickers), text=f"Fetching {ticker} option data ({index}/{len(tickers)})"
         )
+        ticker_started = time.perf_counter()
+        timing_row = empty_performance_row(ticker)
+        performance["tickers"][ticker] = timing_row
         try:
-            (
-                price,
-                option_chain,
-                earnings_date,
-                volatility_rank,
-                price_move,
-            ) = get_option_chain(
+            cache_call_started = time.monotonic()
+            market_result, cache_created_at = get_cached_option_chain_result(
                 ticker,
-                test_expiration=preferences.test_expiration,
-                nearest_expiration=preferences.nearest_expiration,
+                preferences.test_expiration,
+                preferences.nearest_expiration,
+                preferences.expiration_coverage,
             )
+            market_data_cache_hit = cache_created_at < cache_call_started
+            price = market_result.underlying_price
+            option_chain = market_result.contracts
+            earnings_date = market_result.earnings_date
+            volatility_rank = market_result.volatility_rank
+            price_move = market_result.price_move
+            if not market_data_cache_hit:
+                timing_row["Underlying / History"] = market_result.timings.get(
+                    "underlying_history_data", 0.0
+                )
+                timing_row["Expiration List"] = market_result.timings.get(
+                    "expiration_list_retrieval", 0.0
+                )
+                timing_row["Option Downloads"] = market_result.timings.get(
+                    "option_chain_downloads", 0.0
+                )
             price_moves[ticker] = price_move
             ticker_data.append(
                 {
@@ -408,99 +604,129 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
                     "Realized Volatility Rank": volatility_rank,
                     **price_move,
                     "Earnings Date": earnings_date.isoformat() if earnings_date else "None",
-                    "Expiration Used": (
+                    "Expiration Coverage": (
                         "5 nearest"
                         if preferences.nearest_expiration
                         else (
                             preferences.test_expiration.isoformat()
                             if preferences.test_expiration is not None
-                            else "All"
+                            else (
+                                "Fast weekly"
+                                if market_result.expiration_coverage
+                                == EXPIRATION_COVERAGE_FAST_WEEKLY
+                                else "Exhaustive"
+                            )
                         )
                     ),
+                    "Fetched Expiration Count": len(market_result.expirations_fetched),
+                    "Fetched Expirations": ", ".join(market_result.expirations_fetched),
+                    "Market Data Cache": "Hit" if market_data_cache_hit else "Miss",
+                    "Event Label": "Neutral",
+                    "Supplemental Event Adjustment": 0,
+                    "News Depth": "Not analyzed",
                 }
             )
-            event_analysis = get_cached_event_analysis(ticker, preferences.outlook)
-            event_analyses[ticker] = event_analysis
-            event_adjustments[ticker] = event_analysis.adjustment
-            event_labels[ticker] = event_analysis.label
-            ticker_data[-1].update(
+            strategy_timings = {}
+
+            def timed_strategy_build(strategy, builder):
+                builder_started = time.perf_counter()
+                result = builder()
+                strategy_timings[strategy] = time.perf_counter() - builder_started
+                return result
+
+            built_strategies = run_selected_strategy_builders(
+                selected_strategies,
                 {
-                    "Event Label": event_analysis.label.title(),
-                    "Event Adjustment": event_analysis.adjustment,
-                }
+                    IRON_CONDORS: lambda: timed_strategy_build(
+                        IRON_CONDORS,
+                        lambda: build_iron_condors_with_diagnostics(
+                            option_chain,
+                            price,
+                            earnings_date,
+                            volatility_rank,
+                            preferences,
+                        ),
+                    ),
+                    CALL_CREDIT_SPREADS: lambda: timed_strategy_build(
+                        CALL_CREDIT_SPREADS,
+                        lambda: build_call_credit_spreads(
+                            option_chain, price, earnings_date, volatility_rank, preferences
+                        ),
+                    ),
+                    PUT_CREDIT_SPREADS: lambda: timed_strategy_build(
+                        PUT_CREDIT_SPREADS,
+                        lambda: build_put_credit_spreads(
+                            option_chain, price, earnings_date, volatility_rank, preferences
+                        ),
+                    ),
+                    BULL_CALL_DEBIT_SPREADS: lambda: timed_strategy_build(
+                        BULL_CALL_DEBIT_SPREADS,
+                        lambda: build_bull_call_debit_spread(
+                            option_chain, price, earnings_date, volatility_rank, preferences
+                        ),
+                    ),
+                    BEAR_PUT_DEBIT_SPREADS: lambda: timed_strategy_build(
+                        BEAR_PUT_DEBIT_SPREADS,
+                        lambda: build_bear_put_debit_spread(
+                            option_chain, price, earnings_date, volatility_rank, preferences
+                        ),
+                    ),
+                },
             )
-            condor_diagnostic_rows.append(
-                condor_diagnostics(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
-            trades.extend(
-                build_iron_condor(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
-            trades.extend(
-                build_call_credit_spreads(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
-            trades.extend(
-                build_put_credit_spreads(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
-            trades.extend(
-                build_bull_call_debit_spread(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
-            trades.extend(
-                build_bear_put_debit_spread(
-                    option_chain, price, earnings_date, volatility_rank, preferences
+            condor_result = built_strategies.get(IRON_CONDORS)
+            if condor_result is not None:
+                condor_diagnostic_rows.append(condor_result.diagnostics)
+                trades.extend(condor_result.condors)
+                timing_row["Condor Wings"] = condor_result.timings[
+                    "wing_construction"
+                ]
+                timing_row["Condor Pairing"] = condor_result.timings["pairing"]
+                timing_row["Condor Diagnostics"] = condor_result.timings[
+                    "diagnostics"
+                ]
+            for strategy in (
+                CALL_CREDIT_SPREADS,
+                PUT_CREDIT_SPREADS,
+                BULL_CALL_DEBIT_SPREADS,
+                BEAR_PUT_DEBIT_SPREADS,
+            ):
+                trades.extend(built_strategies.get(strategy, []))
+            timing_row["Other Strategies"] = (
+                sum(
+                    strategy_timings.get(strategy, 0.0)
+                    for strategy in (
+                        CALL_CREDIT_SPREADS,
+                        PUT_CREDIT_SPREADS,
+                        BULL_CALL_DEBIT_SPREADS,
+                        BEAR_PUT_DEBIT_SPREADS,
+                    )
                 )
             )
             
         except Exception as error:
             errors.append(f"{ticker}: {error}")
+        finally:
+            timing_row["Total"] = time.perf_counter() - ticker_started
 
     progress.empty()
+    scoring_started = time.perf_counter()
     scored_trades, rejected_trades = scan_trades(
-        trades, preferences, event_adjustments, price_moves, event_labels
-    )
-    deep_messages = []
-    (
-        scored_trades,
-        event_analyses,
-        event_adjustments,
-        event_labels,
-        deep_messages,
-    ) = apply_deep_event_analysis(
-        scored_trades,
         trades,
         preferences,
-        event_analyses,
         event_adjustments,
-        event_labels,
         price_moves,
+        event_labels,
+        timing_by_ticker=scoring_timing_by_ticker,
     )
-    if deep_messages:
-        scored_trades, rejected_trades = scan_trades(
-            trades, preferences, event_adjustments, price_moves, event_labels
+    whole_scoring_timing["seconds"] += time.perf_counter() - scoring_started
+    for ticker, timing_row in performance["tickers"].items():
+        timing_row["Filter / Score / Rank"] = scoring_timing_by_ticker.get(
+            ticker, 0.0
         )
-        for row in ticker_data:
-            event_analysis = event_analyses.get(row["Ticker"])
-            if event_analysis is not None:
-                row["Event Label"] = event_analysis.label.title()
-                row["Event Adjustment"] = event_analysis.adjustment
-                row["News Depth"] = (
-                    "Deep"
-                    if row["Ticker"] in {
-                        message.split(":", 1)[0] for message in deep_messages
-                    }
-                    else row.get("News Depth", "Basic")
-                )
-    for row in ticker_data:
-        row.setdefault("News Depth", "Basic")
+    performance["whole_only"]["Filter / Score / Rank"] = whole_scoring_timing[
+        "seconds"
+    ]
+    performance["total_elapsed"] = time.perf_counter() - scan_started
     return (
         scored_trades,
         rejected_trades,
@@ -510,6 +736,7 @@ def scan_watchlist(tickers: list[str], preferences: ScanPreferences):
         errors,
         event_analyses,
         price_moves,
+        performance,
     )
 
 
@@ -530,113 +757,6 @@ def prefilter_result_rows(results):
             }
         )
     return rows
-
-
-def expiration_close(ticker: str, expiration: date) -> float | None:
-    history = yf.Ticker(ticker).history(
-        start=expiration.isoformat(),
-        end=(expiration + datetime.timedelta(days=1)).isoformat(),
-        auto_adjust=False,
-    )
-    if history.empty:
-        return None
-    return round(float(history["Close"].iloc[-1]), 2)
-
-
-def expiration_pnl(row, closing_price: float) -> float | None:
-    strategy = row["strategy"]
-    long_strike = float(row["long_strike"])
-    short_strike = float(row["short_strike"])
-    width = abs(long_strike - short_strike)
-    max_risk = float(row["max_risk"])
-
-    if strategy == "bull call debit spread":
-        spread_value = max(0, min(closing_price - long_strike, width))
-        return round(spread_value * CONTRACT_MULTIPLIER - max_risk, 2)
-    if strategy == "bear put debit spread":
-        spread_value = max(0, min(long_strike - closing_price, width))
-        return round(spread_value * CONTRACT_MULTIPLIER - max_risk, 2)
-
-    credit = float(row["credit"])
-    if strategy == "put credit spread":
-        spread_loss = max(0, min(short_strike - closing_price, width))
-        return round(credit - spread_loss * CONTRACT_MULTIPLIER, 2)
-    if strategy == "call credit spread":
-        spread_loss = max(0, min(closing_price - short_strike, width))
-        return round(credit - spread_loss * CONTRACT_MULTIPLIER, 2)
-    if strategy == "iron condor":
-        put_short = float(row["put_short_strike"])
-        put_long = float(row["put_long_strike"])
-        call_short = float(row["call_short_strike"])
-        call_long = float(row["call_long_strike"])
-
-        put_width = put_short - put_long
-        call_width = call_long - call_short
-
-        put_loss = max(0, min(put_short - closing_price, put_width))
-        call_loss = max(0, min(closing_price - call_short, call_width))
-
-        credit = float(row["credit"])
-        return round(
-            credit - (put_loss + call_loss) * CONTRACT_MULTIPLIER,
-            2,
-        )
-    return None
-
-
-def update_expired_history() -> list[str]:
-    errors = []
-    closing_prices = {}
-    try:
-        response = (
-            supabase.table("scan_history")
-            .select("*")
-            .eq("expiration_status", "open")
-            .lt("expiration", date.today().isoformat())
-            .execute()
-        )
-    except Exception as error:
-        return [f"Could not read expiration results from Supabase: {error}"]
-
-    for row in response.data:
-        expiration = date.fromisoformat(row["expiration"])
-
-        price_key = (row["ticker"], expiration)
-        try:
-            if price_key not in closing_prices:
-                closing_prices[price_key] = expiration_close(*price_key)
-            closing_price = closing_prices[price_key]
-        except Exception as error:
-            errors.append(f"Could not update {row['ticker']} expiration result: {error}")
-            continue
-
-        if closing_price is None:
-            continue
-
-        pnl = expiration_pnl(row, closing_price)
-        if pnl is None:
-            update_values = {
-                "expiration_close": closing_price,
-                "expiration_status": "manual review",
-            }
-        else:
-            update_values = {
-                "expiration_close": closing_price,
-                "expiration_status": "expired",
-                "expiration_pnl": pnl,
-            }
-
-        try:
-            (
-                supabase.table("scan_history")
-                .update(update_values)
-                .eq("id", row["id"])
-                .execute()
-            )
-        except Exception as error:
-            errors.append(f"Could not save {row['ticker']} expiration result: {error}")
-
-    return errors
 
 
 def candidate_row(scored):
@@ -664,11 +784,12 @@ def candidate_row(scored):
             else None
         ),
         "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
-        "Setup Score": scored.total_score,
+        "Selection Score": scored.total_score,
         "Ticker Score": scored.normalized_ticker_score,
         "Quant Score": scored.quant_score,
-        "Event Adjustment": scored.event_adjustment,
-        "Price Move Adjustment": scored.price_move_adjustment,
+        "Price Move Adjustment": scored.effective_price_move_adjustment,
+        "Raw Price Move Adjustment": scored.raw_price_move_adjustment,
+        "Base Score Without Price Move": scored.base_score_without_price_move,
         "Move Setup": scored.price_move_style,
         "Risk Level": scored.risk_level,
         "Realized Volatility Rank": round(trade.volatility_rank, 1),
@@ -677,6 +798,27 @@ def candidate_row(scored):
 
 def candidate_rows(scored_trades):
     return [candidate_row(scored) for scored in select_top_candidates(scored_trades)]
+
+
+def execution_candidate_rows(scored_trades):
+    rows = []
+    for rank, scored in enumerate(scored_trades, start=1):
+        trade = scored.trade
+        rows.append(
+            {
+                "Rank": scored.execution_rank or rank,
+                "Ticker": trade.ticker,
+                "Strategy": trade.strategy.title(),
+                "Direction": strategy_direction(trade.strategy).title(),
+                "Selection Score": scored.total_score,
+                "Ticker Score": scored.normalized_ticker_score,
+                "Quant Score": scored.quant_score,
+                "Price-Move Adjustment": scored.effective_price_move_adjustment,
+                "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
+                "Expiration": trade.expiration,
+            }
+        )
+    return rows
 
 
 def candidate_column_config():
@@ -693,25 +835,33 @@ def candidate_column_config():
         "Max Risk": st.column_config.NumberColumn(
             "Max Risk", help="Maximum loss per spread at expiration.", format="$%.2f"
         ),
-        "Setup Score": st.column_config.NumberColumn(
-            "Setup Score",
-            help="Final score after quant rules, event analysis, and recent price movement.",
+        "Selection Score": st.column_config.NumberColumn(
+            "Selection Score",
+            help=(
+                "Quantitative score used to select and rank candidates before "
+                "post-selection AI event analysis."
+            ),
             format="%d / 100",
         ),
         "Quant Score": st.column_config.NumberColumn(
             "Quant Score",
-            help="Score from the scanner's mathematical filters before event analysis.",
+            help="Score from the scanner's mathematical categories.",
             format="%d / 100",
-        ),
-        "Event Adjustment": st.column_config.NumberColumn(
-            "Event Adjustment",
-            help="Score change from the event-analysis layer. It is zero until event analysis is connected.",
-            format="%d",
         ),
         "Price Move Adjustment": st.column_config.NumberColumn(
             "Price Move Adjustment",
             help="Score change from recent stock movement. Directional strategies get credit when the move agrees with them and lose points when it does not.",
             format="%d",
+        ),
+        "Raw Price Move Adjustment": st.column_config.NumberColumn(
+            "Raw Price Move Adjustment",
+            help="Unmodified recent-price signal before the configured experiment mode.",
+            format="%d",
+        ),
+        "Base Score Without Price Move": st.column_config.NumberColumn(
+            "Base Score Without Price Move",
+            help="Quant score plus event adjustment before any recent-price signal.",
+            format="%d / 100",
         ),
         "Move Setup": st.column_config.TextColumn(
             "Move Setup",
@@ -749,6 +899,8 @@ def paper_trade_scan_candidates(
     scored_candidates,
     quantity: int,
     limit: int,
+    exit_policy: str = "none",
+    scan_run_id: str | None = None,
 ) -> list[dict]:
     paper_traded_keys = st.session_state.setdefault("paper_traded_scan_keys", set())
     fresh_candidates = []
@@ -777,6 +929,8 @@ def paper_trade_scan_candidates(
             fresh_candidates,
             quantity=quantity,
             limit=limit,
+            exit_policy=exit_policy,
+            scan_run_id=scan_run_id,
         )
 
     if not fresh_candidates and not skipped_results:
@@ -906,7 +1060,14 @@ def grouped_alpaca_spread_rows(positions: list[dict], paper_history: list[dict])
                 "Expiration": order.get("expiration"),
                 "Score": order.get("setup_score"),
                 "Entry Type": order.get("entry_type"),
-                "Limit": order.get("limit_price"),
+                "Submitted Limit": order.get("limit_price"),
+                "Actual Fill": order.get("opening_filled_avg_price"),
+                "Spread Width": order.get("spread_width_per_share"),
+                "Planned Max Profit": order.get("max_profit"),
+                "Planned Max Risk": order.get("max_risk"),
+                "Filled Max Profit": order.get("filled_max_profit_per_share"),
+                "Filled Max Risk": order.get("filled_max_risk_per_share"),
+                "Fill Validation": order.get("fill_validation_error"),
                 "Qty": order.get("quantity"),
                 "Current Value": round(current_value, 2),
                 "Unrealized P/L": round(unrealized_pnl, 2),
@@ -939,10 +1100,9 @@ def debit_candidate_rows(scored_trades):
                 "Short Strike": trade.short_strike,
                 "Debit": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "Max Profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
-                "Setup Score": scored.total_score,
+                "Selection Score": scored.total_score,
                 "Ticker Score": scored.normalized_ticker_score,
                 "Quant Score": scored.quant_score,
-                "Event Adjustment": scored.event_adjustment,
                 "Price Move Adjustment": scored.price_move_adjustment,
                 "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
@@ -970,10 +1130,9 @@ def credit_candidate_rows(scored_trades):
                 "Long Strike": trade.long_strike,
                 "Credit": round(trade.credit * CONTRACT_MULTIPLIER, 2),
                 "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
-                "Setup Score": scored.total_score,
+                "Selection Score": scored.total_score,
                 "Ticker Score": scored.normalized_ticker_score,
                 "Quant Score": scored.quant_score,
-                "Event Adjustment": scored.event_adjustment,
                 "Price Move Adjustment": scored.price_move_adjustment,
                 "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
@@ -986,6 +1145,9 @@ def credit_candidate_rows(scored_trades):
 
 def render_scan_output(scan_output):
     scored_trades = scan_output["scored_trades"]
+    execution_candidates = scan_output.get("execution_candidates") or (
+        select_execution_candidates(scored_trades, limit=3)
+    )
     rejected_trades = scan_output["rejected_trades"]
     trades = scan_output["trades"]
     ticker_data = scan_output["ticker_data"]
@@ -997,11 +1159,14 @@ def render_scan_output(scan_output):
     prefilter_rows = scan_output.get("prefilter_rows", [])
     prefilter_selected_tickers = scan_output.get("prefilter_selected_tickers", [])
     original_ticker_count = scan_output.get("original_ticker_count", len(ticker_data))
+    scan_performance = scan_output.get("scan_performance", {})
 
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
     metric_candidates.metric("Passing Candidates", len(scored_trades))
-    metric_score.metric("Highest Score", f"{top_score}/100" if top_score else "None")
+    metric_score.metric(
+        "Highest Selection Score", f"{top_score}/100" if top_score else "None"
+    )
     metric_tracked.metric("Saved to History", len(history_candidates))
     metric_tickers.metric(
         "Tickers Scanned",
@@ -1024,11 +1189,23 @@ def render_scan_output(scan_output):
             width="stretch",
             hide_index=True,
         )
+        api_errors = [
+            result
+            for result in paper_order_results
+            if result.get("Status") == "Error" and result.get("Message")
+        ]
+        if api_errors:
+            with st.expander("Full Alpaca API error details"):
+                for index, result in enumerate(api_errors, start=1):
+                    st.markdown(
+                        f"**{index}. {result.get('Candidate', 'Alpaca request')}**"
+                    )
+                    st.code(str(result["Message"]), language=None, wrap_lines=True)
 
     candidate_analyses = scan_output.get("candidate_analyses", {})
     if candidate_analyses:
         st.subheader("AI Review Of Top Candidates")
-        for index, scored in enumerate(scored_trades[:3], start=1):
+        for index, scored in enumerate(execution_candidates, start=1):
             trade = scored.trade
             analysis = candidate_analyses.get(candidate_analysis_key(scored))
             if analysis is None:
@@ -1055,6 +1232,26 @@ def render_scan_output(scan_output):
     )
 
     with candidates_tab:
+        st.subheader("Execution Top 3")
+        st.caption(
+            "These are the distinct-ticker candidates used for AI review and "
+            "Alpaca paper auto-trading. The full table below keeps the best setup "
+            "for every ticker and strategy."
+        )
+        execution_rows = execution_candidate_rows(execution_candidates)
+        if execution_rows:
+            st.dataframe(
+                pd.DataFrame(execution_rows),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    **candidate_column_config(),
+                    "Max Risk": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+        else:
+            st.info("No distinct-ticker execution candidates passed the filters.")
+
         st.subheader("Top Candidates")
         candidates = candidate_rows(scored_trades)
         if candidates:
@@ -1080,16 +1277,16 @@ def render_scan_output(scan_output):
                 trade = scored.trade
                 with st.expander(
                     f"{trade.ticker} | {trade.strategy.title()} | "
-                    f"Score {scored.total_score}/100"
+                    f"Selection Score {scored.total_score}/100"
                 ):
                     st.write(scored.explanation)
                     event_analysis = event_analyses.get(trade.ticker)
                     if event_analysis:
-                        st.subheader("AI Event View")
+                        st.subheader("Post-Selection AI Event View")
                         event_label, event_adjustment, event_confidence = st.columns(3)
                         event_label.metric("Event Label", event_analysis.label.title())
                         event_adjustment.metric(
-                            "Event Adjustment",
+                            "Supplemental Event Adjustment",
                             f"{event_analysis.adjustment:+d}",
                         )
                         event_confidence.metric(
@@ -1109,7 +1306,7 @@ def render_scan_output(scan_output):
         debit_column, credit_column = st.columns(2)
         with debit_column:
             st.subheader("Best Debit Spreads")
-            debit_candidates = debit_candidate_rows(scored_trades)
+            debit_candidates = debit_candidate_rows(execution_candidates)
             if debit_candidates:
                 st.dataframe(
                     pd.DataFrame(debit_candidates),
@@ -1122,7 +1319,7 @@ def render_scan_output(scan_output):
 
         with credit_column:
             st.subheader("Best Credit Spreads")
-            credit_candidates = credit_candidate_rows(scored_trades)
+            credit_candidates = credit_candidate_rows(execution_candidates)
             if credit_candidates:
                 st.dataframe(
                     pd.DataFrame(credit_candidates),
@@ -1168,6 +1365,72 @@ def render_scan_output(scan_output):
         )
 
     with diagnostics_tab:
+        st.subheader("Scan Performance")
+        if scan_performance:
+            performance_df = pd.DataFrame(performance_table_rows(scan_performance))
+            st.dataframe(
+                performance_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    phase: st.column_config.NumberColumn(format="%.3f s")
+                    for phase in (*PERFORMANCE_PHASES, "Total")
+                },
+            )
+            analysis_diagnostics = scan_performance.get(
+                "analysis_diagnostics", {}
+            )
+            if analysis_diagnostics:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Execution Candidates": analysis_diagnostics.get(
+                                    "execution_candidates", 0
+                                ),
+                                "Unique Candidate Tickers": analysis_diagnostics.get(
+                                    "unique_candidate_tickers", 0
+                                ),
+                                "Ticker Event Calls": analysis_diagnostics.get(
+                                    "ticker_event_calls", 0
+                                ),
+                                "Candidate Review Calls": analysis_diagnostics.get(
+                                    "candidate_review_calls", 0
+                                ),
+                                "Event Cache Hits": analysis_diagnostics.get(
+                                    "ticker_event_cache_hits", 0
+                                ),
+                                "Event Cache Misses": analysis_diagnostics.get(
+                                    "ticker_event_cache_misses", 0
+                                ),
+                                "Review Cache Hits": analysis_diagnostics.get(
+                                    "candidate_review_cache_hits", 0
+                                ),
+                                "Review Cache Misses": analysis_diagnostics.get(
+                                    "candidate_review_cache_misses", 0
+                                ),
+                            }
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+        else:
+            st.info("No performance timing was captured for this scan.")
+
+        st.subheader("Execution Selection Diagnostics")
+        st.dataframe(
+            pd.DataFrame(
+                execution_selection_diagnostics(
+                    scored_trades,
+                    execution_candidates,
+                    requested_limit=3,
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
         st.subheader("Condor Diagnostics")
         if condor_diagnostic_rows:
             st.dataframe(
@@ -1175,15 +1438,29 @@ def render_scan_output(scan_output):
                     [
                         {
                             "Ticker": row.ticker,
-                            "Put Spreads Built": row.put_spreads_built,
-                            "Call Spreads Built": row.call_spreads_built,
-                            "Qualified Puts": row.qualified_puts,
-                            "Qualified Calls": row.qualified_calls,
-                            "Pairs Checked": row.pairs_checked,
-                            "Matching Expirations": row.matching_expiration_pairs,
-                            "Valid Strike Order": row.valid_order_pairs,
-                            "Condors Built": row.built_condors,
-                            "Main Blocker": row.top_reason,
+                            "Raw Put Wings": row.raw_put_wings_built,
+                            "Raw Call Wings": row.raw_call_wings_built,
+                            "Put Liquidity Rejects": row.put_wings_rejected_for_liquidity,
+                            "Call Liquidity Rejects": row.call_wings_rejected_for_liquidity,
+                            "Delta Rejects": row.wings_rejected_for_delta,
+                            "Estimated Quote Rejects": row.wings_rejected_for_estimated_quotes,
+                            "Put Expirations": row.eligible_put_expirations,
+                            "Call Expirations": row.eligible_call_expirations,
+                            "Shared Expirations": row.expirations_with_both_sides,
+                            "Pairs Attempted": row.pairs_attempted,
+                            "Expiration Mismatches": row.pairs_rejected_for_mismatched_expiration,
+                            "Strike Overlaps": row.pairs_rejected_for_strike_overlap,
+                            "Condors Built": row.condors_built,
+                            "Nonpositive Credit": row.condors_rejected_for_nonpositive_combined_credit,
+                            "Max Risk Rejects": row.condors_rejected_for_max_risk,
+                            "Credit/Width Rejects": row.condors_rejected_for_combined_credit_to_width,
+                            "Put Move Rejects": row.condors_rejected_for_put_expected_move,
+                            "Call Move Rejects": row.condors_rejected_for_call_expected_move,
+                            "Four-Leg Quote Rejects": row.condors_rejected_for_bid_ask_width,
+                            "Passed Final Filters": row.condors_passing_final_filters,
+                            "Best Passing Score": row.highest_passing_condor_score,
+                            "Best Built Score": row.highest_built_condor_score,
+                            "Primary Blocker": row.primary_blocker,
                         }
                         for row in condor_diagnostic_rows
                     ]
@@ -1295,27 +1572,48 @@ def ticker_rejection_rows(trades, rejected_trades, scored_trades):
 
 
 def outcome_summary(results, group_column: str, label: str):
-    summary = (
-        results.groupby(group_column, observed=True, as_index=False)
-        .agg(
-            Candidates=("id", "count"),
-            Win_Rate=("Outcome P/L", lambda pnl: (pnl > 0).mean() * 100),
-            Average_PnL=("Outcome P/L", "mean"),
-            Total_PnL=("Outcome P/L", "sum"),
-        )
-        .rename(
-            columns={
-                group_column: label,
-                "Win_Rate": "Win Rate",
-                "Average_PnL": "Average P/L",
-                "Total_PnL": "Total P/L",
+    rows = []
+    for group_value, group in results.groupby(group_column, observed=True, dropna=False):
+        pnl = pd.to_numeric(group["Outcome P/L"], errors="coerce").dropna()
+        return_on_risk = pd.to_numeric(
+            group["Realized Return On Risk"], errors="coerce"
+        ).dropna()
+        wins = pnl[pnl > 0].sum()
+        losses = abs(pnl[pnl < 0].sum())
+        sample_size = len(pnl)
+        rows.append(
+            {
+                label: "Not recorded" if pd.isna(group_value) else group_value,
+                "Recommendation Occurrences": sample_size,
+                "Unique Setups": group["setup_key"].nunique(dropna=True),
+                "Sample Status": (
+                    "insufficient sample" if sample_size < 10 else "usable sample"
+                ),
+                "Win Rate": round((pnl > 0).mean() * 100, 1) if sample_size else None,
+                "Average Return On Risk": round(return_on_risk.mean(), 2)
+                if not return_on_risk.empty
+                else None,
+                "Median Return On Risk": round(return_on_risk.median(), 2)
+                if not return_on_risk.empty
+                else None,
+                "Profit Factor": round(wins / losses, 2) if losses > 0 else None,
+                "Average P/L": round(pnl.mean(), 2) if sample_size else None,
+                "Median P/L": round(pnl.median(), 2) if sample_size else None,
+                "Median MFE": round(
+                    pd.to_numeric(
+                        group["maximum_favorable_excursion"], errors="coerce"
+                    ).median(),
+                    2,
+                ),
+                "Median MAE": round(
+                    pd.to_numeric(
+                        group["maximum_adverse_excursion"], errors="coerce"
+                    ).median(),
+                    2,
+                ),
             }
         )
-    )
-    summary["Win Rate"] = summary["Win Rate"].round(1)
-    summary["Average P/L"] = summary["Average P/L"].round(2)
-    summary["Total P/L"] = summary["Total P/L"].round(2)
-    return summary
+    return pd.DataFrame(rows)
 
 
 def render_results():
@@ -1356,6 +1654,8 @@ def render_results():
         open_candidates = open_candidates.reindex(
             columns=[
                 "Scan Time",
+                "scan_run_id",
+                "setup_key",
                 "ticker",
                 "strategy",
                 "expiration",
@@ -1373,6 +1673,11 @@ def render_results():
                 "move_setup",
                 "event_label",
                 "event_confidence",
+                "execution_selected",
+                "execution_rank",
+                "times_recommended",
+                "expiration_status",
+                "last_update_error",
             ]
         ).rename(
             columns={
@@ -1392,6 +1697,13 @@ def render_results():
                 "move_setup": "Move Setup",
                 "event_label": "Event Label",
                 "event_confidence": "Event Confidence",
+                "scan_run_id": "Scan Run ID",
+                "setup_key": "Setup Key",
+                "execution_selected": "Execution Selected",
+                "execution_rank": "Execution Rank",
+                "times_recommended": "Times Recommended",
+                "expiration_status": "Outcome Status",
+                "last_update_error": "Tracking Error",
             }
         )
         st.dataframe(
@@ -1483,10 +1795,38 @@ def render_results():
         return
 
     results = pd.DataFrame(result_rows)
-    results["expiration_pnl"] = pd.to_numeric(results["expiration_pnl"])
-    results["actual_realized_pnl"] = pd.to_numeric(results["actual_realized_pnl"])
-    results["Outcome P/L"] = results["actual_realized_pnl"].fillna(
-        results["expiration_pnl"]
+    for column in (
+        "realized_pnl",
+        "actual_realized_pnl",
+        "expiration_pnl",
+        "realized_return_on_risk",
+        "max_risk",
+        "setup_score",
+        "quant_score",
+        "event_adjustment",
+        "effective_price_move_adjustment",
+        "dte",
+        "volatility_rank",
+        "maximum_favorable_excursion",
+        "maximum_adverse_excursion",
+    ):
+        if column not in results:
+            results[column] = None
+        results[column] = pd.to_numeric(results[column], errors="coerce")
+    if "setup_key" not in results:
+        results["setup_key"] = results["id"].map(lambda value: f"legacy-{value}")
+    results["setup_key"] = results["setup_key"].fillna(
+        results["id"].map(lambda value: f"legacy-{value}")
+    )
+    results["Outcome P/L"] = results["realized_pnl"].fillna(
+        results["actual_realized_pnl"]
+    ).fillna(results["expiration_pnl"])
+    results["Realized Return On Risk"] = results["realized_return_on_risk"]
+    missing_return = results["Realized Return On Risk"].isna() & (results["max_risk"] > 0)
+    results.loc[missing_return, "Realized Return On Risk"] = (
+        results.loc[missing_return, "Outcome P/L"]
+        / results.loc[missing_return, "max_risk"]
+        * 100
     )
 
     completed_count = len(results)
@@ -1498,6 +1838,15 @@ def render_results():
     metric_columns[1].metric("Win Rate", f"{win_rate:.1f}%")
     metric_columns[2].metric("Average Outcome P/L", f"${average_pnl:.2f}")
     metric_columns[3].metric("Total Outcome P/L", f"${total_pnl:.2f}")
+
+    count_columns = st.columns(2)
+    count_columns[0].metric("Recommendation Occurrences", completed_count)
+    count_columns[1].metric("Unique Setups", results["setup_key"].nunique())
+    st.caption(
+        "Occurrences count every scan recommendation. Unique setups collapse "
+        "repeated recommendations with the same expiration and legs. Groups with "
+        "fewer than 10 closed trades are marked insufficient sample."
+    )
 
     results["Score Band"] = pd.cut(
         results["setup_score"],
@@ -1524,6 +1873,80 @@ def render_results():
     ] = "Positive"
     event_results = outcome_summary(
         results, "Event Adjustment Group", "Event Adjustment"
+    )
+    results["Quant Score Band"] = pd.cut(
+        results["quant_score"],
+        bins=[-1, 59, 69, 79, 89, 100],
+        labels=["Below 60", "60-69", "70-79", "80-89", "90-100"],
+    )
+    results["DTE Band"] = pd.cut(
+        results["dte"],
+        bins=[-1, 20, 30, 45, 60, 10000],
+        labels=["0-20", "21-30", "31-45", "46-60", "61+"],
+    )
+    results["Realized Volatility Rank Band"] = pd.cut(
+        results["volatility_rank"],
+        bins=[-1, 34, 49, 64, 79, 100],
+        labels=["Below 35", "35-49", "50-64", "65-79", "80-100"],
+    )
+    results["Event Adjustment Band"] = pd.cut(
+        results["event_adjustment"],
+        bins=[-100, -1, 0, 1, 100],
+        labels=["Negative", "Neutral", "Slight positive", "Positive"],
+    )
+    results["Price-Move Adjustment Band"] = pd.cut(
+        results["effective_price_move_adjustment"],
+        bins=[-100, -1, 0, 1, 3, 100],
+        labels=["Negative", "Neutral", "+1", "+2 to +3", "Above +3"],
+    )
+    for column, fallback in (
+        ("move_setup", "Not recorded"),
+        ("scanner_version", "legacy"),
+        ("selection_method", "raw"),
+    ):
+        if column not in results:
+            results[column] = fallback
+        results[column] = results[column].fillna(fallback)
+
+    analytics_segments = {
+        "Ticker": ("ticker", "Ticker"),
+        "Strategy": ("strategy", "Strategy"),
+        "Setup Score Band": ("Score Band", "Setup Score Band"),
+        "Quant Score Band": ("Quant Score Band", "Quant Score Band"),
+        "Event Adjustment": ("Event Adjustment Band", "Event Adjustment"),
+        "Price-Move Adjustment": (
+            "Price-Move Adjustment Band",
+            "Price-Move Adjustment",
+        ),
+        "Move Classification": ("move_setup", "Move Classification"),
+        "DTE": ("DTE Band", "DTE"),
+        "Realized Volatility Rank": (
+            "Realized Volatility Rank Band",
+            "Realized Volatility Rank",
+        ),
+        "Scanner Version": ("scanner_version", "Scanner Version"),
+        "Selection Method": ("selection_method", "Selection Method"),
+    }
+    st.subheader("Closed Outcome Analytics")
+    selected_segment = st.selectbox(
+        "Analyze closed results by",
+        list(analytics_segments),
+        key="closed_analytics_segment",
+    )
+    group_column, group_label = analytics_segments[selected_segment]
+    st.dataframe(
+        outcome_summary(results, group_column, group_label),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
+            "Average Return On Risk": st.column_config.NumberColumn(format="%.2f%%"),
+            "Median Return On Risk": st.column_config.NumberColumn(format="%.2f%%"),
+            "Average P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Median P/L": st.column_config.NumberColumn(format="$%.2f"),
+            "Median MFE": st.column_config.NumberColumn(format="$%.2f"),
+            "Median MAE": st.column_config.NumberColumn(format="$%.2f"),
+        },
     )
     if "unusual_move" not in results:
         results["unusual_move"] = None
@@ -1867,7 +2290,13 @@ def render_alpaca_account_status():
             width="stretch",
             hide_index=True,
             column_config={
-                "Limit": st.column_config.NumberColumn(format="$%.2f"),
+                "Submitted Limit": st.column_config.NumberColumn(format="$%.2f"),
+                "Actual Fill": st.column_config.NumberColumn(format="$%.2f"),
+                "Spread Width": st.column_config.NumberColumn(format="$%.2f"),
+                "Planned Max Profit": st.column_config.NumberColumn(format="$%.2f"),
+                "Planned Max Risk": st.column_config.NumberColumn(format="$%.2f"),
+                "Filled Max Profit": st.column_config.NumberColumn(format="$%.2f"),
+                "Filled Max Risk": st.column_config.NumberColumn(format="$%.2f"),
                 "Current Value": st.column_config.NumberColumn(format="$%.2f"),
                 "Unrealized P/L": st.column_config.NumberColumn(format="$%.2f"),
             },
@@ -1953,6 +2382,10 @@ def render_alpaca_account_status():
                     "current_value",
                     "unrealized_pnl",
                     "unrealized_pnl_percent",
+                    "exit_policy",
+                    "target_value_per_share",
+                    "current_value_per_share",
+                    "exit_signal",
                     "matched_legs",
                     "total_legs",
                 ]
@@ -1965,6 +2398,10 @@ def render_alpaca_account_status():
                     "current_value": "Current Value",
                     "unrealized_pnl": "Unrealized P/L",
                     "unrealized_pnl_percent": "Unrealized P/L %",
+                    "exit_policy": "Exit Policy",
+                    "target_value_per_share": "TP Target / Share",
+                    "current_value_per_share": "Current / Share",
+                    "exit_signal": "Exit Signal",
                     "matched_legs": "Matched Legs",
                     "total_legs": "Total Legs",
                 }
@@ -1975,6 +2412,8 @@ def render_alpaca_account_status():
                 "Current Value": st.column_config.NumberColumn(format="$%.2f"),
                 "Unrealized P/L": st.column_config.NumberColumn(format="$%.2f"),
                 "Unrealized P/L %": st.column_config.NumberColumn(format="%.2f%%"),
+                "TP Target / Share": st.column_config.NumberColumn(format="$%.2f"),
+                "Current / Share": st.column_config.NumberColumn(format="$%.2f"),
             },
         )
     else:
@@ -2044,6 +2483,47 @@ def render_alpaca_account_status():
             .sort_values("Orders", ascending=False)
         )
         st.bar_chart(strategy_counts.set_index("strategy"), height=240)
+        st.dataframe(
+            paper_history_df.reindex(
+                columns=[
+                    "scan_time_est",
+                    "ticker",
+                    "strategy",
+                    "setup_score",
+                    "execution_rank",
+                    "exit_policy",
+                    "status",
+                    "position_status",
+                    "close_order_status",
+                    "exit_reason",
+                    "exit_fill_price",
+                    "realized_pnl",
+                    "last_exit_error",
+                ]
+            ).rename(
+                columns={
+                    "scan_time_est": "Scan Time",
+                    "ticker": "Ticker",
+                    "strategy": "Strategy",
+                    "setup_score": "Setup Score",
+                    "execution_rank": "Execution Rank",
+                    "exit_policy": "Exit Policy",
+                    "status": "Entry Status",
+                    "position_status": "Position Status",
+                    "close_order_status": "Close Status",
+                    "exit_reason": "Exit Reason",
+                    "exit_fill_price": "Exit Fill",
+                    "realized_pnl": "Realized P/L",
+                    "last_exit_error": "Exit Error",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Exit Fill": st.column_config.NumberColumn(format="$%.2f"),
+                "Realized P/L": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
     else:
         st.info(
             "No Alpaca paper orders have been logged yet. Run the SQL file and then scan with paper auto trading enabled."
@@ -2158,7 +2638,7 @@ def render_alpaca_account_status():
                         "Ticker": selected_trade.ticker,
                         "Strategy": selected_trade.strategy,
                         "Expiration": selected_trade.expiration,
-                        "Setup Score": selected_scored.total_score,
+                        "Selection Score": selected_scored.total_score,
                         "Entry Type": selected_trade.entry_type,
                         "Limit Price": float(limit_price),
                         "Quantity": int(quantity),
@@ -2301,7 +2781,23 @@ with st.sidebar:
     outlook = st.selectbox("Outlook", ["neutral", "bullish", "bearish", "income"])
     max_risk = st.number_input("Maximum Risk Per Spread", min_value=50, value=500, step=50)
     risk_tolerance = st.selectbox("Risk Tolerance", ["conservative", "moderate", "aggressive"], index=1)
+    selected_strategies = st.multiselect(
+        "Strategies",
+        list(STRATEGY_OPTIONS),
+        default=list(STRATEGY_OPTIONS),
+        format_func=lambda strategy_id: STRATEGY_LABELS[strategy_id],
+    )
     with st.expander("Advanced Expiration Settings"):
+        expiration_coverage_label = st.selectbox(
+            "Expiration Coverage",
+            ["Fast weekly coverage", "Exhaustive coverage"],
+            index=0,
+            help=(
+                "Fast weekly coverage selects the nearest expiration in each "
+                "seven-day DTE bucket. Exhaustive coverage fetches every "
+                "expiration from 21 to 60 DTE."
+            ),
+        )
         use_nearest_expiration = st.checkbox("Use Nearest Available Expirations")
         use_test_expiration = st.checkbox(
             "Test a Specific Expiration", disabled=use_nearest_expiration
@@ -2310,6 +2806,11 @@ with st.sidebar:
             st.date_input("Test Expiration", min_value=date.today())
             if use_test_expiration
             else None
+        )
+        expiration_coverage = (
+            EXPIRATION_COVERAGE_FAST_WEEKLY
+            if expiration_coverage_label == "Fast weekly coverage"
+            else EXPIRATION_COVERAGE_EXHAUSTIVE
         )
     with st.expander("Broad Universe Prefilter"):
         use_prefilter = st.checkbox(
@@ -2350,7 +2851,19 @@ with st.sidebar:
             step=5,
             disabled=not use_prefilter,
         )
+    price_move_mode = "Full"
     if st.session_state.get("results_unlocked"):
+        with st.expander("Scoring Experiments"):
+            price_move_mode = st.selectbox(
+                "Price-Move Adjustment Mode",
+                ["Full", "Conservative", "Shadow", "Off"],
+                index=0,
+                help=(
+                    "Full uses the current signal. Conservative caps positive "
+                    "bonuses at +3. Shadow records the signal without changing "
+                    "the score. Off disables it."
+                ),
+            )
         with st.expander("Alpaca Paper Auto Trading"):
             st.checkbox(
                 "Paper trade top 3 scan candidates",
@@ -2369,6 +2882,17 @@ with st.sidebar:
                 step=1,
                 key="auto_paper_trade_quantity",
             )
+            st.selectbox(
+                "Automatic Paper Exit",
+                [
+                    "No automatic exit",
+                    "Take profit at 50% of maximum profit",
+                    "Take profit at 75% of maximum profit",
+                ],
+                index=0,
+                key="paper_exit_policy_label",
+                help="Applies only to new Alpaca paper trades. No hard stop is enabled.",
+            )
     scan_button = st.button("Scan Watchlist", type="primary", width="stretch")
 
 if scan_button:
@@ -2376,7 +2900,10 @@ if scan_button:
     if not tickers:
         st.error("Enter at least one ticker.")
         st.stop()
-    
+
+    if not selected_strategies:
+        st.error("Select at least one strategy.")
+        st.stop()
 
     history_errors = update_history()
     preferences = ScanPreferences(
@@ -2385,6 +2912,8 @@ if scan_button:
         risk_tolerance=risk_tolerance,
         test_expiration=test_expiration,
         nearest_expiration=use_nearest_expiration,
+        price_move_mode=price_move_mode,
+        expiration_coverage=expiration_coverage,
     )
     with st.status("Scanning watchlist...", expanded=True) as scan_status:
         prefilter_rows = []
@@ -2439,29 +2968,78 @@ if scan_button:
             errors,
             event_analyses,
             price_moves,
-        ) = scan_watchlist(tickers, preferences)
+            scan_performance,
+        ) = scan_watchlist(tickers, preferences, selected_strategies)
+        execution_candidates = select_execution_candidates(scored_trades, limit=3)
+
+        st.write("Analyzing events for the top candidate tickers...")
+        post_selection_analysis = analyze_execution_candidates(
+            execution_candidates,
+            preferences,
+            price_moves,
+        )
+        event_analyses = post_selection_analysis.event_analyses
+        candidate_analyses = post_selection_analysis.candidate_analyses
         st.session_state["latest_event_analyses"] = event_analyses
+        for ticker, seconds in post_selection_analysis.event_seconds_by_ticker.items():
+            timing_row = scan_performance["tickers"].get(ticker)
+            if timing_row is not None:
+                timing_row["Top Candidate Ticker Event Analysis"] += seconds
+        for ticker, seconds in post_selection_analysis.review_seconds_by_ticker.items():
+            timing_row = scan_performance["tickers"].get(ticker)
+            if timing_row is not None:
+                timing_row["Top Candidate AI Review"] += seconds
+        scan_performance["whole_only"]["Top Candidate Ticker Event Analysis"] = sum(
+            post_selection_analysis.event_seconds_by_ticker.values()
+        )
+        scan_performance["whole_only"]["Top Candidate AI Review"] = sum(
+            post_selection_analysis.review_seconds_by_ticker.values()
+        )
+        scan_performance["analysis_diagnostics"] = (
+            post_selection_analysis.diagnostics
+        )
+        for row in ticker_data:
+            event_analysis = event_analyses.get(row["Ticker"])
+            if event_analysis is not None:
+                row["Event Label"] = event_analysis.label.title()
+                row["Supplemental Event Adjustment"] = event_analysis.adjustment
+                row["News Depth"] = "Top candidate deep analysis"
 
         st.write("Saving tracked candidates and updating snapshots...")
         history_candidates = select_history_candidates(scored_trades)
+        scan_run_id = new_scan_run_id()
         history_save_errors = save_history(
-            history_candidates, event_analyses, price_moves
+            history_candidates,
+            event_analyses,
+            price_moves,
+            execution_candidates=execution_candidates,
+            scan_run_id=scan_run_id,
         )
         errors = history_errors + errors + history_save_errors
 
         paper_order_results = []
+        alpaca_started = time.perf_counter()
         if (
             st.session_state.get("results_unlocked")
             and st.session_state.get("auto_paper_trade_scans")
         ):
             st.write("Submitting Alpaca paper orders for the top 3 candidates...")
             paper_candidates, duplicate_results = top_unplaced_paper_candidates(
-                scored_trades, limit=3
+                execution_candidates, limit=3
             )
+            exit_policy_by_label = {
+                "No automatic exit": "none",
+                "Take profit at 50% of maximum profit": "tp50",
+                "Take profit at 75% of maximum profit": "tp75",
+            }
             paper_order_results = paper_trade_scan_candidates(
                 paper_candidates,
                 quantity=int(st.session_state.get("auto_paper_trade_quantity", 1)),
                 limit=3,
+                exit_policy=exit_policy_by_label.get(
+                    st.session_state.get("paper_exit_policy_label"), "none"
+                ),
+                scan_run_id=scan_run_id,
             )
             paper_order_results = duplicate_results + paper_order_results
             errors.extend(append_alpaca_paper_orders(paper_order_results))
@@ -2483,21 +3061,23 @@ if scan_button:
                     "Message": "Unlock the owner panel before scanning to enable Alpaca paper trading.",
                 }
             ]
+        scan_performance["whole_only"]["Alpaca Preflight / Submission"] = (
+            time.perf_counter() - alpaca_started
+        )
 
-        st.write("Reviewing the top 3 candidates with AI...")
-        candidate_analyses = {}
-        for scored in scored_trades[:3]:
-            trade = scored.trade
-            candidate_analyses[candidate_analysis_key(scored)] = (
-                get_cached_candidate_analysis(
-                    scored,
-                    event_analyses.get(trade.ticker),
-                    price_moves.get(trade.ticker),
-                )
+        for timing_row in scan_performance["tickers"].values():
+            timing_row["Total"] = sum(
+                float(timing_row.get(phase, 0.0) or 0.0)
+                for phase in PERFORMANCE_PHASES
             )
+        scan_performance["total_elapsed"] = (
+            time.perf_counter() - scan_performance["started_at"]
+        )
         scan_status.update(label="Scan complete", state="complete", expanded=False)
     st.session_state["last_scan_output"] = {
         "scored_trades": scored_trades,
+        "execution_candidates": execution_candidates,
+        "scan_run_id": scan_run_id,
         "rejected_trades": rejected_trades,
         "trades": trades,
         "ticker_data": ticker_data,
@@ -2507,6 +3087,7 @@ if scan_button:
         "candidate_analyses": candidate_analyses,
         "history_candidates": history_candidates,
         "paper_order_results": paper_order_results,
+        "scan_performance": scan_performance,
         "prefilter_rows": prefilter_rows,
         "prefilter_selected_tickers": tickers if use_prefilter else [],
         "original_ticker_count": len(original_tickers) if use_prefilter else len(tickers),

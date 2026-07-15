@@ -1,5 +1,6 @@
 import os
-from collections import Counter
+import time
+from types import SimpleNamespace
 
 try:
     from alpaca_client import (
@@ -11,7 +12,7 @@ except ImportError:
     leg_key_from_legs = None
     submit_scored_multileg_orders = None
     trade_multileg_order_details = None
-from event_analysis import get_deep_event_analysis, get_event_analysis
+from event_analysis import analyze_candidate_setup, get_deep_event_analysis
 from history_tracker import (
     append_alpaca_paper_orders,
     append_alpaca_paper_snapshots,
@@ -21,80 +22,61 @@ from history_tracker import (
     update_expired_history,
 )
 from stock2dupe import (
+    EXPIRATION_COVERAGE_EXHAUSTIVE,
+    EXPIRATION_COVERAGE_MODES,
     ScanPreferences,
     build_bear_put_debit_spread,
     build_bull_call_debit_spread,
     build_call_credit_spreads,
-    build_iron_condor,
+    build_iron_condors_with_diagnostics,
     build_put_credit_spreads,
-    condor_diagnostics,
     get_option_chain,
     scan_trades,
+    select_execution_candidates,
+    select_history_candidates,
 )
+from scanner_post_selection import analyze_top_candidates
+from scanner_tracking import new_scan_run_id, setup_key_for_trade
 from stock_universe import prefilter_tickers
 
 
-def select_history_candidates(scored_trades, limit: int = 25, per_ticker: int = 4):
-    selected = []
-    selected_ids = set()
-    selected_by_strategy = Counter()
-    selected_by_ticker = Counter()
-
-    for scored in scored_trades:
-        strategy = scored.trade.strategy
-        if selected_by_strategy[strategy] >= 1:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        selected_by_strategy[strategy] += 1
-
-    for scored in scored_trades:
-        ticker = scored.trade.ticker
-        if id(scored) in selected_ids or selected_by_ticker[ticker] >= per_ticker:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        selected_by_ticker[ticker] += 1
-        if len(selected) == limit:
-            return selected
-
-    for scored in scored_trades:
-        if id(scored) in selected_ids:
-            continue
-        selected.append(scored)
-        selected_ids.add(id(scored))
-        if len(selected) == limit:
-            break
-
-    return selected
-
-
-def selected_deep_analysis_tickers(
-    scored_trades,
-    price_moves,
-    max_tickers: int = 5,
-    top_trade_count: int = 10,
-):
-    selected = []
-
-    for scored in scored_trades[:top_trade_count]:
-        ticker = scored.trade.ticker
-        if scored.total_score >= 70 and ticker not in selected:
-            selected.append(ticker)
-
-    unusual_movers = sorted(
-        price_moves.items(),
-        key=lambda item: abs(float(item[1].get("Move vs 20D Vol", 0) or 0)),
-        reverse=True,
+def unavailable_scheduled_event(ticker, error):
+    return SimpleNamespace(
+        adjustment=0,
+        confidence="low",
+        label="neutral",
+        summary=f"Scheduled event analysis was unavailable for {ticker}.",
+        headlines_used=[],
+        available=False,
     )
-    for ticker, move in unusual_movers:
-        move_multiple = abs(float(move.get("Move vs 20D Vol", 0) or 0))
-        if move_multiple >= 1.5 and ticker not in selected:
-            selected.append(ticker)
-        if len(selected) >= max_tickers:
-            break
 
-    return selected[:max_tickers]
+
+def unavailable_scheduled_review(scored, error):
+    return SimpleNamespace(
+        verdict="watch",
+        confidence="low",
+        summary=f"Scheduled candidate review was unavailable for {scored.trade.ticker}.",
+        strengths=[],
+        risks=[],
+        action="Review the quantitative setup manually.",
+        available=False,
+    )
+
+
+def analyze_execution_candidates(execution_candidates, preferences, price_moves):
+    return analyze_top_candidates(
+        execution_candidates,
+        price_moves,
+        load_ticker_event=lambda ticker: get_deep_event_analysis(
+            ticker, preferences.outlook
+        ),
+        review_candidate=lambda scored, event_analysis, price_move: (
+            analyze_candidate_setup(scored, event_analysis, price_move)
+        ),
+        candidate_key=lambda scored: setup_key_for_trade(scored.trade),
+        unavailable_event=unavailable_scheduled_event,
+        unavailable_review=unavailable_scheduled_review,
+    )
 
 
 def env_int(name: str, default: int) -> int:
@@ -103,6 +85,20 @@ def env_int(name: str, default: int) -> int:
         return int(value) if value else default
     except ValueError:
         return default
+
+
+def configured_expiration_coverage() -> str:
+    configured = os.getenv(
+        "SCAN_EXPIRATION_COVERAGE",
+        EXPIRATION_COVERAGE_EXHAUSTIVE,
+    ).strip()
+    if configured not in EXPIRATION_COVERAGE_MODES:
+        raise ValueError(
+            "Unsupported SCAN_EXPIRATION_COVERAGE value "
+            f"{configured!r}; expected one of "
+            f"{sorted(EXPIRATION_COVERAGE_MODES)}."
+        )
+    return configured
 
 
 def top_unplaced_paper_candidates(scored_trades, limit: int = 3):
@@ -168,6 +164,7 @@ def top_unplaced_paper_candidates(scored_trades, limit: int = 3):
 
 
 def main() -> int:
+    expiration_coverage = configured_expiration_coverage()
     tickers = [
         ticker.strip().upper()
         for ticker in os.getenv(
@@ -208,13 +205,14 @@ def main() -> int:
         max_risk=float(os.getenv("SCAN_MAX_RISK", "500")),
         outlook=os.getenv("SCAN_OUTLOOK", "neutral"),
         risk_tolerance=os.getenv("SCAN_RISK_TOLERANCE", "moderate"),
+        price_move_mode=os.getenv("PRICE_MOVE_MODE", "Full"),
+        expiration_coverage=expiration_coverage,
     )
     trades = []
     event_analyses = {}
-    event_adjustments = {}
-    event_labels = {}
     price_moves = {}
-    errors = update_expired_history(include_today=True)
+    errors = update_expired_history()
+    scan_started = time.perf_counter()
 
     for ticker in tickers:
         try:
@@ -224,21 +222,16 @@ def main() -> int:
                 earnings_date,
                 volatility_rank,
                 price_move,
-            ) = get_option_chain(ticker)
-            event_analysis = get_event_analysis(ticker, preferences.outlook)
-            event_analyses[ticker] = event_analysis
-            event_adjustments[ticker] = event_analysis.adjustment
-            event_labels[ticker] = event_analysis.label
+            ) = get_option_chain(
+                ticker,
+                expiration_coverage=preferences.expiration_coverage,
+            )
             price_moves[ticker] = price_move
-            condor_diag = condor_diagnostics(
+            condor_result = build_iron_condors_with_diagnostics(
                 option_chain, price, earnings_date, volatility_rank, preferences
             )
 
-            trades.extend(
-                build_iron_condor(
-                    option_chain, price, earnings_date, volatility_rank, preferences
-                )
-            )
+            trades.extend(condor_result.condors)
             trades.extend(
                 build_call_credit_spreads(
                     option_chain, price, earnings_date, volatility_rank, preferences
@@ -261,46 +254,68 @@ def main() -> int:
             )
             print(
                 f"{ticker}: fetched {len(option_chain)} contracts; "
-                f"condors built {condor_diag.built_condors}; "
-                f"blocker: {condor_diag.top_reason}"
+                f"condors built {condor_result.diagnostics.built_condors}; "
+                f"blocker: {condor_result.diagnostics.top_reason}; "
+                f"coverage: {preferences.expiration_coverage}"
             )
         except Exception as error:
             errors.append(f"{ticker}: {error}")
 
-    scored_trades, _ = scan_trades(
-        trades, preferences, event_adjustments, price_moves, event_labels
+    scored_trades, _ = scan_trades(trades, preferences, {}, price_moves, {})
+    execution_candidates = select_execution_candidates(scored_trades, limit=3)
+    post_selection_analysis = analyze_execution_candidates(
+        execution_candidates,
+        preferences,
+        price_moves,
     )
-    deep_tickers = selected_deep_analysis_tickers(scored_trades, price_moves)
-    for ticker in deep_tickers:
-        deep_analysis = get_deep_event_analysis(ticker, preferences.outlook)
-        event_analyses[ticker] = deep_analysis
-        event_adjustments[ticker] = deep_analysis.adjustment
-        event_labels[ticker] = deep_analysis.label
+    event_analyses = post_selection_analysis.event_analyses
+    for ticker, analysis in event_analyses.items():
         print(
-            f"{ticker}: deep news analysis {deep_analysis.label} "
-            f"({deep_analysis.adjustment:+d})"
+            f"{ticker}: supplemental event analysis {analysis.label} "
+            f"({analysis.adjustment:+d})"
         )
-
-    if deep_tickers:
-        scored_trades, _ = scan_trades(
-            trades, preferences, event_adjustments, price_moves, event_labels
+    for scored in execution_candidates:
+        candidate_analysis = post_selection_analysis.candidate_analyses.get(
+            setup_key_for_trade(scored.trade)
         )
+        if candidate_analysis is not None:
+            print(
+                f"{scored.trade.ticker}: candidate review "
+                f"{candidate_analysis.verdict} ({candidate_analysis.confidence})"
+            )
+    diagnostics = post_selection_analysis.diagnostics
+    print(
+        "Post-selection AI: "
+        f"{diagnostics['execution_candidates']} candidates, "
+        f"{diagnostics['unique_candidate_tickers']} unique tickers, "
+        f"{diagnostics['ticker_event_calls']} event calls, "
+        f"{diagnostics['candidate_review_calls']} candidate reviews."
+    )
 
     history_candidates = select_history_candidates(scored_trades)
+    scan_run_id = new_scan_run_id()
     errors.extend(
-        append_scan_history(history_candidates, event_analyses, price_moves)
+        append_scan_history(
+            history_candidates,
+            event_analyses,
+            price_moves,
+            execution_candidates=execution_candidates,
+            scan_run_id=scan_run_id,
+        )
     )
     if os.getenv("ALPACA_AUTO_PAPER_TRADE", "").lower() in {"1", "true", "yes"}:
         if submit_scored_multileg_orders is None:
             print("Warning: Alpaca paper trading helper is unavailable.")
         else:
             paper_candidates, duplicate_results = top_unplaced_paper_candidates(
-                scored_trades, limit=3
+                execution_candidates, limit=3
             )
             paper_results = submit_scored_multileg_orders(
                 paper_candidates,
                 quantity=env_int("ALPACA_PAPER_TRADE_QUANTITY", 1),
                 limit=3,
+                exit_policy=os.getenv("ALPACA_PAPER_EXIT_POLICY", "none"),
+                scan_run_id=scan_run_id,
             )
             paper_results = duplicate_results + paper_results
             errors.extend(append_alpaca_paper_orders(paper_results))
@@ -313,6 +328,7 @@ def main() -> int:
     errors.extend(append_alpaca_paper_snapshots())
 
     print(f"Saved {len(history_candidates)} candidates from {len(scored_trades)} passing trades.")
+    print(f"Total scan elapsed: {time.perf_counter() - scan_started:.3f} seconds")
     for error in errors:
         print(f"Warning: {error}")
 

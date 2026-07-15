@@ -1,7 +1,9 @@
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 from datetime import date
 import math
 from pathlib import Path
+import time
 import yfinance as yf
 from collections import Counter
 
@@ -14,6 +16,22 @@ except ImportError:
 
 CONTRACT_MULTIPLIER = 100
 MAX_SETUP_SCORE = 125
+PRICE_MOVE_MODES = {"Full", "Conservative", "Shadow", "Off"}
+EXPIRATION_COVERAGE_FAST_WEEKLY = "fast_weekly"
+EXPIRATION_COVERAGE_EXHAUSTIVE = "exhaustive"
+EXPIRATION_COVERAGE_MODES = {
+    EXPIRATION_COVERAGE_FAST_WEEKLY,
+    EXPIRATION_COVERAGE_EXHAUSTIVE,
+}
+BULLISH_STRATEGIES = {
+    "put credit spread",
+    "bull call debit spread",
+}
+BEARISH_STRATEGIES = {
+    "call credit spread",
+    "bear put debit spread",
+}
+NEUTRAL_STRATEGIES = {"iron condor"}
 YFINANCE_CACHE_DIR = Path(__file__).with_name(".yfinance-cache")
 YFINANCE_CACHE_DIR.mkdir(exist_ok=True)
 yf.set_tz_cache_location(YFINANCE_CACHE_DIR)
@@ -26,6 +44,11 @@ class ScanPreferences:
     risk_tolerance: str #conservative, moderate, aggressive
     test_expiration: date | None = None
     nearest_expiration: bool = False
+    price_move_mode: str = "Full"
+    condor_max_wings_per_side: int = 15
+    condor_max_bid_ask_width: float = 0.40
+    condor_max_bid_ask_to_credit_ratio: float | None = None
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE
 
 
 
@@ -45,6 +68,27 @@ class OptionContract:
     open_interest: int
     volume: int
     quote_source: str = "bid/ask"
+
+
+@dataclass(frozen=True)
+class OptionChainResult:
+    underlying_price: float
+    contracts: list[OptionContract]
+    earnings_date: date | None
+    volatility_rank: float
+    price_move: dict[str, float | str]
+    expirations_fetched: tuple[str, ...]
+    expiration_coverage: str
+    timings: dict[str, float]
+
+    def legacy_tuple(self):
+        return (
+            self.underlying_price,
+            self.contracts,
+            self.earnings_date,
+            self.volatility_rank,
+            self.price_move,
+        )
 
 
 def normal_cdf(value: float) -> float:
@@ -232,12 +276,65 @@ def realized_volatility_rank(stock: yf.Ticker) -> float:
     return volatility_rank
 
 
-def get_option_chain(
+def select_expirations(
+    available_expirations: list[str] | tuple[str, ...],
+    test_expiration: date | None = None,
+    nearest_expiration: bool = False,
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE,
+) -> list[str]:
+    dte_by_expiration = {
+        expiration: days_to_expiration(expiration)
+        for expiration in available_expirations
+    }
+    available = sorted(
+        (
+            expiration
+            for expiration in available_expirations
+            if dte_by_expiration[expiration] >= 0
+        ),
+        key=lambda expiration: (dte_by_expiration[expiration], expiration),
+    )
+
+    if test_expiration is not None:
+        selected_expiration = test_expiration.isoformat()
+        if selected_expiration not in available:
+            raise ValueError(
+                f"Yahoo Finance does not offer {selected_expiration} for this ticker."
+            )
+        return [selected_expiration]
+
+    if nearest_expiration:
+        return available[:5]
+
+    if expiration_coverage not in EXPIRATION_COVERAGE_MODES:
+        raise ValueError(
+            f"Unsupported expiration coverage mode: {expiration_coverage}"
+        )
+
+    in_range = [
+        expiration
+        for expiration in available
+        if 21 <= dte_by_expiration[expiration] <= 60
+    ]
+    if expiration_coverage == EXPIRATION_COVERAGE_EXHAUSTIVE:
+        return in_range
+
+    nearest_by_bucket = {}
+    for expiration in in_range:
+        bucket = (dte_by_expiration[expiration] - 21) // 7
+        nearest_by_bucket.setdefault(bucket, expiration)
+    return list(nearest_by_bucket.values())[:7]
+
+
+def get_option_chain_result(
     ticker: str,
     test_expiration: date | None = None,
     nearest_expiration: bool = False,
-) -> tuple[float, list[OptionContract], date | None, float, dict[str, float | str]]:
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE,
+) -> OptionChainResult:
+    timings = {}
     stock = yf.Ticker(ticker)
+    underlying_started = time.perf_counter()
     earnings_date = None
     etf_tickers = ["SPY", "QQQ"]
     if ticker not in etf_tickers:
@@ -260,33 +357,35 @@ def get_option_chain(
     except Exception:
         underlying_price = get_underlying_price(stock)
         volatility_rank, price_move = price_history_metrics(stock)
+    timings["underlying_history_data"] = time.perf_counter() - underlying_started
     contracts = []
 
-    available_expirations = [
-        expiration
-        for expiration in stock.options
-        if days_to_expiration(expiration) >= 0
-    ]
-    if test_expiration is not None:
-        selected_expiration = test_expiration.isoformat()
-        if selected_expiration not in available_expirations:
-            raise ValueError(
-                f"Yahoo Finance does not offer {selected_expiration} for {ticker}."
-            )
-        expirations_to_fetch = [selected_expiration]
-    elif nearest_expiration:
-        expirations_to_fetch = sorted(
-            available_expirations, key=days_to_expiration
-        )[:5]
-    else:
-        expirations_to_fetch = [
-            expiration
-            for expiration in available_expirations
-            if 21 <= days_to_expiration(expiration) <= 60
-        ]
+    expiration_list_started = time.perf_counter()
+    available_expirations = list(stock.options)
+    if (
+        test_expiration is not None
+        and test_expiration.isoformat() not in available_expirations
+    ):
+        raise ValueError(
+            f"Yahoo Finance does not offer {test_expiration.isoformat()} for {ticker}."
+        )
+    expirations_to_fetch = select_expirations(
+        available_expirations,
+        test_expiration=test_expiration,
+        nearest_expiration=nearest_expiration,
+        expiration_coverage=expiration_coverage,
+    )
+    timings["expiration_list_retrieval"] = (
+        time.perf_counter() - expiration_list_started
+    )
 
+    download_started = time.perf_counter()
+    dte_by_expiration = {
+        expiration: days_to_expiration(expiration)
+        for expiration in expirations_to_fetch
+    }
     for expiration in expirations_to_fetch:
-        dte = days_to_expiration(expiration)
+        dte = dte_by_expiration[expiration]
         chain = stock.option_chain(expiration)
         for option_type, table in (("call", chain.calls), ("put", chain.puts)):
             for _, row in table.iterrows():
@@ -324,6 +423,7 @@ def get_option_chain(
                         quote_source=quote_source,
                     )
                 )
+    timings["option_chain_downloads"] = time.perf_counter() - download_started
 
     if not contracts:
         expiration_range = (
@@ -335,7 +435,30 @@ def get_option_chain(
             f"Yahoo Finance returned no usable option contracts for {expiration_range}."
         )
 
-    return underlying_price, contracts, earnings_date, volatility_rank, price_move
+    return OptionChainResult(
+        underlying_price=underlying_price,
+        contracts=contracts,
+        earnings_date=earnings_date,
+        volatility_rank=volatility_rank,
+        price_move=price_move,
+        expirations_fetched=tuple(expirations_to_fetch),
+        expiration_coverage=expiration_coverage,
+        timings=timings,
+    )
+
+
+def get_option_chain(
+    ticker: str,
+    test_expiration: date | None = None,
+    nearest_expiration: bool = False,
+    expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE,
+) -> tuple[float, list[OptionContract], date | None, float, dict[str, float | str]]:
+    return get_option_chain_result(
+        ticker,
+        test_expiration=test_expiration,
+        nearest_expiration=nearest_expiration,
+        expiration_coverage=expiration_coverage,
+    ).legacy_tuple()
 
 
 def days_to_expiration(expiration: str) -> int:
@@ -379,6 +502,10 @@ class Trade:
     call_short_strike: float | None = None
     call_long_strike: float | None = None
     quote_source: str = "bid/ask"
+    put_expected_move_cushion: float | None = None
+    call_expected_move_cushion: float | None = None
+    minimum_expected_move_cushion: float | None = None
+    condor_bid_ask_to_credit_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -388,26 +515,81 @@ class ScoredTrade:
     category_scores: dict[str, int]
     quant_score: int
     event_adjustment: int
+    raw_price_move_adjustment: int
+    effective_price_move_adjustment: int
     price_move_adjustment: int
     price_move_style: str
+    base_score_without_price_move: int
     total_score: int
     reasons: list[str]
     explanation: str
     normalized_ticker_score: int = 0
+    raw_rank: int | None = None
+    diversified_rank: int | None = None
+    execution_rank: int | None = None
 
 
 @dataclass(frozen=True)
 class CondorDiagnostics:
     ticker: str
-    put_spreads_built: int
-    call_spreads_built: int
-    qualified_puts: int
-    qualified_calls: int
-    pairs_checked: int
-    matching_expiration_pairs: int
-    valid_order_pairs: int
-    built_condors: int
-    top_reason: str
+    raw_put_wings_built: int
+    raw_call_wings_built: int
+    put_wings_rejected_for_liquidity: int
+    call_wings_rejected_for_liquidity: int
+    wings_rejected_for_delta: int
+    wings_rejected_for_estimated_quotes: int
+    eligible_put_expirations: int
+    eligible_call_expirations: int
+    expirations_with_both_sides: int
+    pairs_attempted: int
+    pairs_rejected_for_mismatched_expiration: int
+    pairs_rejected_for_strike_overlap: int
+    condors_built: int
+    condors_rejected_for_nonpositive_combined_credit: int
+    condors_rejected_for_max_risk: int
+    condors_rejected_for_combined_credit_to_width: int
+    condors_rejected_for_put_expected_move: int
+    condors_rejected_for_call_expected_move: int
+    condors_rejected_for_bid_ask_width: int
+    condors_passing_final_filters: int
+    highest_passing_condor_score: int | None
+    highest_built_condor_score: int | None
+    primary_blocker: str
+
+    @property
+    def built_condors(self) -> int:
+        return self.condors_built
+
+    @property
+    def top_reason(self) -> str:
+        return self.primary_blocker
+
+
+@dataclass(frozen=True)
+class CondorConstructionResult:
+    condors: list[Trade]
+    diagnostics: CondorDiagnostics
+    timings: dict[str, float]
+    operation_counts: dict[str, int]
+
+
+def strategy_direction(strategy: str) -> str:
+    normalized = strategy.lower().strip()
+    if normalized in BULLISH_STRATEGIES:
+        return "bullish"
+    if normalized in BEARISH_STRATEGIES:
+        return "bearish"
+    if normalized in NEUTRAL_STRATEGIES:
+        return "neutral"
+    return "unknown"
+
+
+def scored_trade_sort_key(scored: ScoredTrade) -> tuple[int, int, int]:
+    return (
+        scored.total_score,
+        scored.normalized_ticker_score,
+        scored.quant_score,
+    )
 
 def strategy_fit_score(trade: Trade, preferences: ScanPreferences) -> int:
     if preferences.outlook == "bullish":
@@ -446,6 +628,8 @@ def bid_ask_spread(trade: Trade) -> float:
 
 def expected_move_cushion(trade: Trade) -> float:
     if trade.option_type == "mixed":
+        if trade.minimum_expected_move_cushion is not None:
+            return round(trade.minimum_expected_move_cushion, 2)
         put_side_cushion = trade.underlying_price - trade.short_strike - trade.expected_move
         call_side_cushion = trade.long_strike - trade.underlying_price - trade.expected_move
         return round(min(put_side_cushion, call_side_cushion), 2)
@@ -521,7 +705,129 @@ def risk_level(trade: Trade) -> str:
     return "Conservative"
 
 
+def condor_put_cushion(trade: Trade) -> float:
+    if trade.put_expected_move_cushion is not None:
+        return round(trade.put_expected_move_cushion, 2)
+    put_short_strike = (
+        trade.put_short_strike
+        if trade.put_short_strike is not None
+        else trade.short_strike
+    )
+    return round(
+        trade.underlying_price - put_short_strike - trade.expected_move,
+        2,
+    )
+
+
+def condor_call_cushion(trade: Trade) -> float:
+    if trade.call_expected_move_cushion is not None:
+        return round(trade.call_expected_move_cushion, 2)
+    call_short_strike = (
+        trade.call_short_strike
+        if trade.call_short_strike is not None
+        else trade.long_strike
+    )
+    return round(
+        call_short_strike - trade.underlying_price - trade.expected_move,
+        2,
+    )
+
+
+def condor_bid_ask_to_credit_ratio(trade: Trade) -> float | None:
+    if trade.credit <= 0:
+        return None
+    return round(bid_ask_spread(trade) / trade.credit, 4)
+
+
+def condor_wing_rejection_reasons(trade: Trade) -> list[str]:
+    reasons = []
+    width = spread_width(trade)
+    if trade.quote_source != "bid/ask":
+        reasons.append("quote is estimated from last price")
+    if not 0.10 <= abs(trade.delta) <= 0.30:
+        reasons.append("delta is outside the credit range of 0.10 to 0.30")
+    if trade.open_interest < 200:
+        reasons.append("open interest is below 200")
+    if trade.volume < 25:
+        reasons.append("volume is below 25")
+    if trade.dte <= 0:
+        reasons.append("DTE must be greater than zero")
+    if width <= 0 or width > 5:
+        reasons.append("wing width is outside the supported range")
+    if trade.credit <= 0:
+        reasons.append("wing credit must be greater than zero")
+    return reasons
+
+
+def passes_condor_wing_filters(trade: Trade) -> tuple[bool, list[str]]:
+    reasons = condor_wing_rejection_reasons(trade)
+    return len(reasons) == 0, reasons
+
+
+def condor_rejection_reasons(
+    trade: Trade,
+    preferences: ScanPreferences,
+) -> list[str]:
+    reasons = []
+    max_width = spread_width(trade)
+    put_cushion = condor_put_cushion(trade)
+    call_cushion = condor_call_cushion(trade)
+    four_leg_bid_ask_width = bid_ask_spread(trade)
+    bid_ask_credit_ratio = condor_bid_ask_to_credit_ratio(trade)
+
+    if trade.quote_source != "bid/ask":
+        reasons.append("quote is estimated from last price")
+    if trade.credit <= 0:
+        reasons.append("condor combined credit must be greater than zero")
+    if trade.max_risk <= 0:
+        reasons.append("max risk must be greater than 0")
+    if trade.max_risk * CONTRACT_MULTIPLIER > preferences.max_risk:
+        reasons.append("condor max risk too high")
+    if max_width <= 0 or trade.credit / max_width < 0.15:
+        reasons.append("condor credit is below 15% of maximum wing width")
+    if put_cushion < 0:
+        reasons.append("condor put short strike is inside the expected move")
+    if call_cushion < 0:
+        reasons.append("condor call short strike is inside the expected move")
+    if trade.earnings_before_exp:
+        reasons.append("earnings occur before expiration")
+    if trade.open_interest < 200:
+        reasons.append("open interest is below 200")
+    if trade.volume < 25:
+        reasons.append("volume is below 25")
+
+    if preferences.test_expiration is not None:
+        if trade.expiration != preferences.test_expiration.isoformat():
+            reasons.append("expiration does not match the test expiration")
+    elif preferences.nearest_expiration:
+        pass
+    elif not 21 <= trade.dte <= 60:
+        reasons.append("DTE is outside the 21 to 60 day range")
+
+    if four_leg_bid_ask_width > preferences.condor_max_bid_ask_width:
+        reasons.append("condor four-leg bid/ask spread is wider than configured maximum")
+    if (
+        preferences.condor_max_bid_ask_to_credit_ratio is not None
+        and bid_ask_credit_ratio is not None
+        and bid_ask_credit_ratio
+        > preferences.condor_max_bid_ask_to_credit_ratio
+    ):
+        reasons.append("condor bid/ask-to-credit ratio is too high")
+    return reasons
+
+
+def passes_condor_filters(
+    trade: Trade,
+    preferences: ScanPreferences,
+) -> tuple[bool, list[str]]:
+    reasons = condor_rejection_reasons(trade, preferences)
+    return len(reasons) == 0, reasons
+
+
 def passes_filters(trade: Trade, preferences: ScanPreferences) -> tuple[bool, list[str]]:
+    if trade.strategy == "iron condor":
+        return passes_condor_filters(trade, preferences)
+
     rejection_reasons = []
 
     if trade.quote_source != "bid/ask":
@@ -763,6 +1069,19 @@ def price_move_adjustment(
     return adjustment
 
 
+def apply_price_move_mode(raw_adjustment: int, mode: str) -> tuple[int, int]:
+    normalized_mode = mode.title()
+    if normalized_mode not in PRICE_MOVE_MODES:
+        normalized_mode = "Full"
+    if normalized_mode == "Off":
+        return raw_adjustment, 0
+    if normalized_mode == "Shadow":
+        return raw_adjustment, 0
+    if normalized_mode == "Conservative":
+        return raw_adjustment, min(raw_adjustment, 3)
+    return raw_adjustment, raw_adjustment
+
+
 def score_trade(
     trade: Trade,
     preferences: ScanPreferences,
@@ -781,10 +1100,19 @@ def score_trade(
     }
     raw_total_score = sum(category_scores.values())
     quant_score = max(0, min(100, round(raw_total_score / MAX_SETUP_SCORE * 100)))
-    price_adjustment, price_style = price_move_signal(
+    calculated_price_adjustment, price_style = price_move_signal(
         trade, price_move, event_label
     )
-    total_score = max(0, min(100, quant_score + event_adjustment + price_adjustment))
+    raw_price_adjustment, effective_price_adjustment = apply_price_move_mode(
+        calculated_price_adjustment,
+        preferences.price_move_mode,
+    )
+    base_score_without_price_move = max(
+        0, min(100, quant_score + event_adjustment)
+    )
+    total_score = max(
+        0, min(100, base_score_without_price_move + effective_price_adjustment)
+    )
     reasons = passing_reasons(trade)
 
     return ScoredTrade(
@@ -793,8 +1121,11 @@ def score_trade(
         category_scores=category_scores,
         quant_score=quant_score,
         event_adjustment=event_adjustment,
-        price_move_adjustment=price_adjustment,
+        raw_price_move_adjustment=raw_price_adjustment,
+        effective_price_move_adjustment=effective_price_adjustment,
+        price_move_adjustment=effective_price_adjustment,
         price_move_style=price_style,
+        base_score_without_price_move=base_score_without_price_move,
         total_score=total_score,
         reasons=reasons,
         explanation=beginner_explanation(trade, category_scores),
@@ -866,7 +1197,7 @@ def remove_similar_spreads(scored_trades: list[ScoredTrade]) -> list[ScoredTrade
     selected = []
     for scored in sorted(
         scored_trades,
-        key=lambda candidate: candidate.total_score,
+        key=scored_trade_sort_key,
         reverse=True,
     ):
         if any(similar_spread(scored, existing) for existing in selected):
@@ -883,18 +1214,141 @@ def diversify_scored_trades(scored_trades: list[ScoredTrade]) -> list[ScoredTrad
     for scored in normalized:
         key = (scored.trade.ticker, scored.trade.strategy)
         current_best = best_by_ticker_strategy.get(key)
-        if current_best is None or scored.total_score > current_best.total_score:
+        if current_best is None or scored_trade_sort_key(scored) > scored_trade_sort_key(
+            current_best
+        ):
             best_by_ticker_strategy[key] = scored
 
-    return sorted(
+    ranked = sorted(
         best_by_ticker_strategy.values(),
-        key=lambda scored: (
-            scored.total_score,
-            scored.normalized_ticker_score,
-            scored.quant_score,
-        ),
+        key=scored_trade_sort_key,
         reverse=True,
     )
+    return [
+        replace(scored, diversified_rank=rank)
+        for rank, scored in enumerate(ranked, start=1)
+    ]
+
+
+def select_execution_candidates(
+    scored_trades: list[ScoredTrade],
+    limit: int = 3,
+    max_per_ticker: int = 1,
+) -> list[ScoredTrade]:
+    if limit <= 0 or max_per_ticker <= 0:
+        return []
+
+    selected = []
+    selected_by_ticker = Counter()
+    for scored in sorted(scored_trades, key=scored_trade_sort_key, reverse=True):
+        ticker = scored.trade.ticker
+        if selected_by_ticker[ticker] >= max_per_ticker:
+            continue
+        selected.append(replace(scored, execution_rank=len(selected) + 1))
+        selected_by_ticker[ticker] += 1
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def select_history_candidates(
+    scored_trades: list[ScoredTrade],
+    limit: int = 25,
+    per_ticker: int = 4,
+    per_strategy: int = 1,
+) -> list[ScoredTrade]:
+    if limit <= 0 or per_ticker <= 0 or per_strategy < 0:
+        return []
+
+    ranked = sorted(scored_trades, key=scored_trade_sort_key, reverse=True)
+    selected = []
+    selected_ids = set()
+    selected_by_strategy = Counter()
+    selected_by_ticker = Counter()
+
+    # Reserve a small number of slots for each strategy, while still applying
+    # the same ticker cap used by the overall fill pass.
+    for scored in ranked:
+        strategy = scored.trade.strategy
+        ticker = scored.trade.ticker
+        scored_id = id(scored)
+        if (
+            selected_by_strategy[strategy] >= per_strategy
+            or selected_by_ticker[ticker] >= per_ticker
+            or scored_id in selected_ids
+        ):
+            continue
+        selected.append(scored)
+        selected_ids.add(scored_id)
+        selected_by_strategy[strategy] += 1
+        selected_by_ticker[ticker] += 1
+        if len(selected) >= limit:
+            return selected
+
+    for scored in ranked:
+        ticker = scored.trade.ticker
+        scored_id = id(scored)
+        if scored_id in selected_ids or selected_by_ticker[ticker] >= per_ticker:
+            continue
+        selected.append(scored)
+        selected_ids.add(scored_id)
+        selected_by_ticker[ticker] += 1
+        if len(selected) >= limit:
+            break
+
+    return selected
+
+
+def execution_selection_diagnostics(
+    scored_trades: list[ScoredTrade],
+    selected_trades: list[ScoredTrade],
+    requested_limit: int = 3,
+) -> list[dict[str, str | int]]:
+    selected_tickers = {scored.trade.ticker for scored in selected_trades}
+    selected_keys = {
+        (scored.trade.ticker, scored.trade.strategy, scored.trade.expiration)
+        for scored in selected_trades
+    }
+    diagnostics = []
+    for scored in scored_trades:
+        key = (
+            scored.trade.ticker,
+            scored.trade.strategy,
+            scored.trade.expiration,
+        )
+        if key in selected_keys:
+            continue
+        if scored.trade.ticker in selected_tickers:
+            diagnostics.append(
+                {
+                    "Ticker": scored.trade.ticker,
+                    "Strategy": scored.trade.strategy.title(),
+                    "Reason": (
+                        "Ticker already selected; this was a lower-ranked strategy "
+                        "for the same ticker."
+                    ),
+                }
+            )
+
+    diagnostics.append(
+        {
+            "Ticker": "All",
+            "Strategy": "Near duplicates",
+            "Reason": "Duplicate or similar spreads were removed before execution selection.",
+        }
+    )
+    if len(selected_trades) < requested_limit:
+        diagnostics.append(
+            {
+                "Ticker": "All",
+                "Strategy": "Execution selection",
+                "Reason": (
+                    f"Only {len(selected_trades)} distinct ticker(s) were available "
+                    f"for {requested_limit} requested slots."
+                ),
+            }
+        )
+    return diagnostics
 
 
 def passing_reasons(trade: Trade) -> list[str]:
@@ -1001,6 +1455,7 @@ def scan_trades(
     event_adjustments: dict[str, int] | None = None,
     price_moves: dict[str, dict[str, float | str]] | None = None,
     event_labels: dict[str, str] | None = None,
+    timing_by_ticker: dict[str, float] | None = None,
 ) -> tuple[list[ScoredTrade], list[tuple[Trade, list[str]]]]:
     passing = []
     rejected = []
@@ -1011,6 +1466,7 @@ def scan_trades(
     if event_labels is None:
         event_labels = {}
     for trade in trades:
+        trade_started = time.perf_counter() if timing_by_ticker is not None else None
         passed, reasons = passes_filters(trade, preferences)
 
         if passed:
@@ -1028,8 +1484,18 @@ def scan_trades(
             )
         else:
             rejected.append((trade, reasons))
+        if timing_by_ticker is not None:
+            timing_by_ticker[trade.ticker] = (
+                timing_by_ticker.get(trade.ticker, 0.0)
+                + time.perf_counter()
+                - trade_started
+            )
 
-    passing.sort(key=lambda scored_trade: scored_trade.total_score, reverse=True)
+    passing.sort(key=scored_trade_sort_key, reverse=True)
+    passing = [
+        replace(scored, raw_rank=rank)
+        for rank, scored in enumerate(passing, start=1)
+    ]
     return diversify_scored_trades(passing), rejected
 
 def build_put_credit_spreads(
@@ -1187,95 +1653,544 @@ def build_call_credit_spreads(
             )
             trades.append(trade)
     return trades
-def build_iron_condor(
-    option_chain, underlying_price: float, earnings_date, volatility_rank: float, preferences
-):
-    trades = []
-    iron_condors = []
-    credit_put = build_put_credit_spreads(
-        option_chain, underlying_price, earnings_date, volatility_rank, preferences
+def _condor_wing_trade(
+    short_contract: OptionContract,
+    long_contract: OptionContract,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    *,
+    dte: int | None = None,
+    expiration_date: date | None = None,
+    earnings_before_exp: bool | None = None,
+    expected_move_value: float | None = None,
+) -> Trade:
+    is_put = short_contract.option_type == "put"
+    width = (
+        short_contract.strike - long_contract.strike
+        if is_put
+        else long_contract.strike - short_contract.strike
     )
-    credit_call = build_call_credit_spreads(
-        option_chain, underlying_price, earnings_date, volatility_rank, preferences
-    )
-    qualified_puts = [
-        trade for trade in credit_put
-        if passes_filters(trade, preferences)[0]
-    ]
-    qualified_calls = [
-        trade for trade in credit_call
-        if passes_filters(trade, preferences)[0]
-    ]
-    top_puts = sorted(
-        qualified_puts,
-        key=lambda trade: score_trade(trade, preferences).total_score,
-        reverse=True
-    )[:5]
-
-    top_calls = sorted(
-        qualified_calls,
-        key=lambda trade: score_trade(trade, preferences).total_score,
-        reverse=True
-    )[:5]
-    for call_spread in top_calls:
-        for put_spread in top_puts:
-            if call_spread.expiration !=  put_spread.expiration:
-                continue
-            if call_spread.ticker != put_spread.ticker:
-                continue
-            if call_spread.short_strike <= put_spread.short_strike:
-                continue
-            total_credit = round(call_spread.credit + put_spread.credit, 2)
-            put_width = put_spread.short_strike - put_spread.long_strike
-            call_width = call_spread.long_strike - call_spread.short_strike
-            max_width = max(put_width, call_width)
-            max_risk = round(max_width - total_credit, 2)
-            combined_bid = round(put_spread.bid + call_spread.bid, 2)
-            combined_ask = round(put_spread.ask + call_spread.ask, 2)
-
-            if total_credit <= 0:
-                continue
-            if max_risk <=0:
-                continue
-
-            trade = Trade(
-                put_spread.ticker,
-                "iron condor",
-                put_spread.expiration,
-                "mixed",
-                max(abs(put_spread.delta), abs(call_spread.delta)),
-                volatility_rank,
-                put_spread.earnings_before_exp or call_spread.earnings_before_exp,
-                min(put_spread.open_interest, call_spread.open_interest),
-                min(put_spread.volume, call_spread.volume),
-                put_spread.dte,
-                combined_bid,
-                combined_ask,
-                combined_bid,
-                max_risk,
+    credit = round(short_contract.bid - long_contract.ask, 2)
+    expiration_date = expiration_date or date.fromisoformat(short_contract.expiration)
+    dte = dte if dte is not None else days_to_expiration(short_contract.expiration)
+    if earnings_before_exp is None:
+        earnings_before_exp = (
+            date.today() <= earnings_date <= expiration_date
+            if earnings_date is not None
+            else False
+        )
+    return Trade(
+        ticker=short_contract.ticker,
+        strategy=("put credit spread" if is_put else "call credit spread"),
+        expiration=short_contract.expiration,
+        option_type=short_contract.option_type,
+        delta=short_contract.delta,
+        volatility_rank=volatility_rank,
+        earnings_before_exp=earnings_before_exp,
+        open_interest=min(
+            short_contract.open_interest,
+            long_contract.open_interest,
+        ),
+        volume=min(short_contract.volume, long_contract.volume),
+        dte=dte,
+        bid=credit,
+        ask=round(short_contract.ask - long_contract.bid, 2),
+        credit=credit,
+        max_risk=round(width - credit, 2),
+        underlying_price=underlying_price,
+        expected_move=(
+            expected_move_value
+            if expected_move_value is not None
+            else expected_move(
                 underlying_price,
-                max(put_spread.expected_move, call_spread.expected_move),
-                put_spread.short_strike,
-                call_spread.short_strike,
-                put_spread.short_bid,
-                put_spread.short_ask,
-                call_spread.short_bid,
-                call_spread.short_ask,
-                put_spread.short_delta,
-                call_spread.short_delta,
-                put_short_strike=put_spread.short_strike,
-                put_long_strike=put_spread.long_strike,
-                call_short_strike=call_spread.short_strike,
-                call_long_strike=call_spread.long_strike,
-                quote_source=(
-                    "bid/ask"
-                    if put_spread.quote_source == "bid/ask"
-                    and call_spread.quote_source == "bid/ask"
-                    else "last price estimate"
-                ),
-            )      
-            trades.append(trade)  
-    return trades
+                short_contract.implied_volatility,
+                dte,
+            )
+        ),
+        short_strike=short_contract.strike,
+        long_strike=long_contract.strike,
+        short_bid=short_contract.bid,
+        short_ask=short_contract.ask,
+        long_bid=long_contract.bid,
+        long_ask=long_contract.ask,
+        short_delta=short_contract.delta,
+        long_delta=long_contract.delta,
+        quote_source=(
+            "bid/ask"
+            if short_contract.quote_source == "bid/ask"
+            and long_contract.quote_source == "bid/ask"
+            else "last price estimate"
+        ),
+    )
+
+
+def _build_condor_wings_for_type(
+    option_chain,
+    option_type: str,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    operation_stats: Counter | None = None,
+) -> tuple[list[Trade], Counter]:
+    contracts = [
+        contract
+        for contract in option_chain
+        if contract.option_type == option_type
+    ]
+    eligible_wings = []
+    stats = Counter()
+    grouped_contracts = {}
+    for contract in contracts:
+        grouped_contracts.setdefault(
+            (contract.ticker, contract.expiration, contract.option_type), []
+        ).append(contract)
+    strike_indexes = {}
+    for key, group in grouped_contracts.items():
+        by_strike = sorted(
+            enumerate(group),
+            key=lambda item: (item[1].strike, item[0]),
+        )
+        strike_indexes[key] = (
+            [contract.strike for _, contract in by_strike],
+            by_strike,
+        )
+
+    dte_by_expiration = {}
+    date_by_expiration = {}
+    earnings_by_expiration = {}
+    expected_move_by_contract = {}
+
+    for short_contract in contracts:
+        key = (
+            short_contract.ticker,
+            short_contract.expiration,
+            short_contract.option_type,
+        )
+        strikes, by_strike = strike_indexes[key]
+        expiration = short_contract.expiration
+        if expiration not in dte_by_expiration:
+            dte_by_expiration[expiration] = days_to_expiration(expiration)
+            date_by_expiration[expiration] = date.fromisoformat(expiration)
+            earnings_by_expiration[expiration] = (
+                date.today() <= earnings_date <= date_by_expiration[expiration]
+                if earnings_date is not None
+                else False
+            )
+        dte = dte_by_expiration[expiration]
+        if dte <= 0:
+            continue
+        expected_move_key = (
+            expiration,
+            short_contract.strike,
+            short_contract.implied_volatility,
+        )
+        if expected_move_key not in expected_move_by_contract:
+            expected_move_by_contract[expected_move_key] = expected_move(
+                underlying_price,
+                short_contract.implied_volatility,
+                dte,
+            )
+        if option_type == "put":
+            first = bisect_left(strikes, short_contract.strike - 5)
+            last = bisect_left(strikes, short_contract.strike)
+        else:
+            first = bisect_right(strikes, short_contract.strike)
+            last = bisect_right(strikes, short_contract.strike + 5)
+        protective_longs = sorted(
+            by_strike[first:last],
+            key=lambda item: item[0],
+        )
+        if operation_stats is not None:
+            operation_stats["reference_contract_pairs"] += len(contracts)
+            operation_stats["contract_pairs_considered"] += len(protective_longs)
+
+        for _, long_contract in protective_longs:
+            width = abs(short_contract.strike - long_contract.strike)
+            credit = round(short_contract.bid - long_contract.ask, 2)
+            if credit <= 0 or width - credit <= 0:
+                continue
+
+            stats["raw_wings_built"] += 1
+            wing = _condor_wing_trade(
+                short_contract,
+                long_contract,
+                underlying_price,
+                earnings_date,
+                volatility_rank,
+                dte=dte_by_expiration[expiration],
+                expiration_date=date_by_expiration[expiration],
+                earnings_before_exp=earnings_by_expiration[expiration],
+                expected_move_value=expected_move_by_contract[expected_move_key],
+            )
+            passed, reasons = passes_condor_wing_filters(wing)
+            if "open interest is below 200" in reasons or "volume is below 25" in reasons:
+                stats["rejected_for_liquidity"] += 1
+            if "delta is outside the credit range of 0.10 to 0.30" in reasons:
+                stats["rejected_for_delta"] += 1
+            if "quote is estimated from last price" in reasons:
+                stats["rejected_for_estimated_quotes"] += 1
+            if passed:
+                eligible_wings.append(wing)
+
+    return eligible_wings, stats
+
+
+def _group_ranked_condor_wings(
+    wings: list[Trade],
+    preferences: ScanPreferences,
+) -> dict[tuple[str, str], list[Trade]]:
+    grouped = {}
+    for wing in wings:
+        grouped.setdefault((wing.ticker, wing.expiration), []).append(wing)
+    limit = max(0, int(preferences.condor_max_wings_per_side))
+    rank_cache = {}
+
+    def rank_key(trade: Trade) -> tuple:
+        if trade not in rank_cache:
+            rank_cache[trade] = (
+                score_trade(trade, preferences).total_score,
+                trade.credit,
+                -bid_ask_spread(trade),
+                -abs(trade.delta),
+            )
+        return rank_cache[trade]
+
+    return {
+        key: sorted(
+            group,
+            key=rank_key,
+            reverse=True,
+        )[:limit]
+        for key, group in grouped.items()
+    }
+
+
+def _condor_from_wings(
+    put_spread: Trade,
+    call_spread: Trade,
+    underlying_price: float,
+    volatility_rank: float,
+) -> Trade:
+    total_credit = round(call_spread.credit + put_spread.credit, 2)
+    put_width = put_spread.short_strike - put_spread.long_strike
+    call_width = call_spread.long_strike - call_spread.short_strike
+    max_width = max(put_width, call_width)
+    max_risk = round(max_width - total_credit, 2)
+    combined_bid = round(put_spread.bid + call_spread.bid, 2)
+    combined_ask = round(put_spread.ask + call_spread.ask, 2)
+    combined_expected_move = max(
+        put_spread.expected_move,
+        call_spread.expected_move,
+    )
+    put_cushion = round(
+        underlying_price - put_spread.short_strike - combined_expected_move,
+        2,
+    )
+    call_cushion = round(
+        call_spread.short_strike - underlying_price - combined_expected_move,
+        2,
+    )
+    minimum_cushion = min(put_cushion, call_cushion)
+    bid_ask_credit_ratio = (
+        round((combined_ask - combined_bid) / total_credit, 4)
+        if total_credit > 0
+        else None
+    )
+    return Trade(
+        ticker=put_spread.ticker,
+        strategy="iron condor",
+        expiration=put_spread.expiration,
+        option_type="mixed",
+        delta=max(abs(put_spread.delta), abs(call_spread.delta)),
+        volatility_rank=volatility_rank,
+        earnings_before_exp=(
+            put_spread.earnings_before_exp
+            or call_spread.earnings_before_exp
+        ),
+        open_interest=min(put_spread.open_interest, call_spread.open_interest),
+        volume=min(put_spread.volume, call_spread.volume),
+        dte=put_spread.dte,
+        bid=combined_bid,
+        ask=combined_ask,
+        credit=total_credit,
+        max_risk=max_risk,
+        underlying_price=underlying_price,
+        expected_move=combined_expected_move,
+        short_strike=put_spread.short_strike,
+        long_strike=call_spread.short_strike,
+        short_bid=put_spread.short_bid,
+        short_ask=put_spread.short_ask,
+        long_bid=call_spread.short_bid,
+        long_ask=call_spread.short_ask,
+        short_delta=put_spread.short_delta,
+        long_delta=call_spread.short_delta,
+        put_short_strike=put_spread.short_strike,
+        put_long_strike=put_spread.long_strike,
+        call_short_strike=call_spread.short_strike,
+        call_long_strike=call_spread.long_strike,
+        quote_source=(
+            "bid/ask"
+            if put_spread.quote_source == "bid/ask"
+            and call_spread.quote_source == "bid/ask"
+            else "last price estimate"
+        ),
+        put_expected_move_cushion=put_cushion,
+        call_expected_move_cushion=call_cushion,
+        minimum_expected_move_cushion=minimum_cushion,
+        condor_bid_ask_to_credit_ratio=bid_ask_credit_ratio,
+    )
+
+
+def _combine_condor_wings(
+    put_wings: list[Trade],
+    call_wings: list[Trade],
+    underlying_price: float,
+    volatility_rank: float,
+    preferences: ScanPreferences,
+) -> tuple[list[Trade], Counter, int, int, int]:
+    put_groups = _group_ranked_condor_wings(put_wings, preferences)
+    call_groups = _group_ranked_condor_wings(call_wings, preferences)
+    common_keys = set(put_groups) & set(call_groups)
+    stats = Counter()
+    condors = []
+
+    for put_key, ranked_puts in put_groups.items():
+        for call_key, ranked_calls in call_groups.items():
+            if put_key != call_key:
+                stats["mismatched_expiration"] += len(ranked_puts) * len(ranked_calls)
+
+    for key in sorted(common_keys):
+        for call_spread in call_groups[key]:
+            for put_spread in put_groups[key]:
+                stats["pairs_attempted"] += 1
+                if call_spread.short_strike <= put_spread.short_strike:
+                    stats["strike_overlap"] += 1
+                    continue
+                total_credit = round(call_spread.credit + put_spread.credit, 2)
+                if total_credit <= 0:
+                    stats["nonpositive_credit"] += 1
+                    continue
+                condor = _condor_from_wings(
+                    put_spread,
+                    call_spread,
+                    underlying_price,
+                    volatility_rank,
+                )
+                if condor.max_risk <= 0:
+                    stats["nonpositive_risk"] += 1
+                    continue
+                condors.append(condor)
+
+    return (
+        condors,
+        stats,
+        len(put_groups),
+        len(call_groups),
+        len(common_keys),
+    )
+
+
+def combine_condor_wings(
+    put_wings: list[Trade],
+    call_wings: list[Trade],
+    underlying_price: float,
+    volatility_rank: float,
+    preferences: ScanPreferences,
+) -> list[Trade]:
+    condors, _, _, _, _ = _combine_condor_wings(
+        put_wings,
+        call_wings,
+        underlying_price,
+        volatility_rank,
+        preferences,
+    )
+    return condors
+
+
+def _condor_diagnostics_from_construction(
+    option_chain,
+    preferences: ScanPreferences,
+    condors: list[Trade],
+    put_wings: list[Trade],
+    call_wings: list[Trade],
+    put_stats: Counter,
+    call_stats: Counter,
+    pairing_stats: Counter,
+    put_expirations: int,
+    call_expirations: int,
+    common_expirations: int,
+) -> CondorDiagnostics:
+    rejection_counts = Counter()
+    passing_scores = []
+    built_scores = []
+    for condor in condors:
+        scored = score_trade(condor, preferences)
+        built_scores.append(scored.total_score)
+        passed, reasons = passes_condor_filters(condor, preferences)
+        if passed:
+            passing_scores.append(scored.total_score)
+        else:
+            rejection_counts.update(reasons)
+
+    if put_stats["raw_wings_built"] == 0:
+        primary_blocker = "no structurally valid put wings existed"
+    elif call_stats["raw_wings_built"] == 0:
+        primary_blocker = "no structurally valid call wings existed"
+    elif not put_wings:
+        primary_blocker = "all put wings failed construction-safety filters"
+    elif not call_wings:
+        primary_blocker = "all call wings failed construction-safety filters"
+    elif common_expirations == 0:
+        primary_blocker = "eligible put and call wings had no matching expiration"
+    elif pairing_stats["pairs_attempted"] == pairing_stats["strike_overlap"]:
+        primary_blocker = "put and call short strikes overlapped"
+    elif not condors:
+        primary_blocker = "combined credit or maximum risk was nonpositive"
+    elif not passing_scores:
+        primary_blocker = (
+            rejection_counts.most_common(1)[0][0]
+            if rejection_counts
+            else "all built condors failed final filtering"
+        )
+    else:
+        primary_blocker = (
+            "condors passed final filters; final display depends on ranking"
+        )
+
+    ticker = option_chain[0].ticker if option_chain else "Unknown"
+    return CondorDiagnostics(
+        ticker=ticker,
+        raw_put_wings_built=put_stats["raw_wings_built"],
+        raw_call_wings_built=call_stats["raw_wings_built"],
+        put_wings_rejected_for_liquidity=put_stats["rejected_for_liquidity"],
+        call_wings_rejected_for_liquidity=call_stats["rejected_for_liquidity"],
+        wings_rejected_for_delta=(
+            put_stats["rejected_for_delta"]
+            + call_stats["rejected_for_delta"]
+        ),
+        wings_rejected_for_estimated_quotes=(
+            put_stats["rejected_for_estimated_quotes"]
+            + call_stats["rejected_for_estimated_quotes"]
+        ),
+        eligible_put_expirations=put_expirations,
+        eligible_call_expirations=call_expirations,
+        expirations_with_both_sides=common_expirations,
+        pairs_attempted=pairing_stats["pairs_attempted"],
+        pairs_rejected_for_mismatched_expiration=pairing_stats[
+            "mismatched_expiration"
+        ],
+        pairs_rejected_for_strike_overlap=pairing_stats["strike_overlap"],
+        condors_built=len(condors),
+        condors_rejected_for_nonpositive_combined_credit=pairing_stats[
+            "nonpositive_credit"
+        ],
+        condors_rejected_for_max_risk=rejection_counts["condor max risk too high"],
+        condors_rejected_for_combined_credit_to_width=rejection_counts[
+            "condor credit is below 15% of maximum wing width"
+        ],
+        condors_rejected_for_put_expected_move=rejection_counts[
+            "condor put short strike is inside the expected move"
+        ],
+        condors_rejected_for_call_expected_move=rejection_counts[
+            "condor call short strike is inside the expected move"
+        ],
+        condors_rejected_for_bid_ask_width=rejection_counts[
+            "condor four-leg bid/ask spread is wider than configured maximum"
+        ],
+        condors_passing_final_filters=len(passing_scores),
+        highest_passing_condor_score=(
+            max(passing_scores) if passing_scores else None
+        ),
+        highest_built_condor_score=(max(built_scores) if built_scores else None),
+        primary_blocker=primary_blocker,
+    )
+
+
+def build_iron_condors_with_diagnostics(
+    option_chain,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    preferences: ScanPreferences,
+) -> CondorConstructionResult:
+    operation_stats = Counter()
+    wing_started = time.perf_counter()
+    put_wings, put_stats = _build_condor_wings_for_type(
+        option_chain,
+        "put",
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        operation_stats,
+    )
+    call_wings, call_stats = _build_condor_wings_for_type(
+        option_chain,
+        "call",
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        operation_stats,
+    )
+    wing_seconds = time.perf_counter() - wing_started
+
+    pairing_started = time.perf_counter()
+    (
+        condors,
+        pairing_stats,
+        put_expirations,
+        call_expirations,
+        common_expirations,
+    ) = _combine_condor_wings(
+        put_wings,
+        call_wings,
+        underlying_price,
+        volatility_rank,
+        preferences,
+    )
+    pairing_seconds = time.perf_counter() - pairing_started
+
+    diagnostics_started = time.perf_counter()
+    diagnostics = _condor_diagnostics_from_construction(
+        option_chain,
+        preferences,
+        condors,
+        put_wings,
+        call_wings,
+        put_stats,
+        call_stats,
+        pairing_stats,
+        put_expirations,
+        call_expirations,
+        common_expirations,
+    )
+    diagnostics_seconds = time.perf_counter() - diagnostics_started
+    return CondorConstructionResult(
+        condors=condors,
+        diagnostics=diagnostics,
+        timings={
+            "wing_construction": wing_seconds,
+            "pairing": pairing_seconds,
+            "diagnostics": diagnostics_seconds,
+        },
+        operation_counts=dict(operation_stats),
+    )
+
+
+def build_iron_condor(
+    option_chain,
+    underlying_price: float,
+    earnings_date,
+    volatility_rank: float,
+    preferences,
+):
+    return build_iron_condors_with_diagnostics(
+        option_chain,
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        preferences,
+    ).condors
 
 
 def condor_diagnostics(
@@ -1285,103 +2200,13 @@ def condor_diagnostics(
     volatility_rank: float,
     preferences,
 ) -> CondorDiagnostics:
-    put_spreads = build_put_credit_spreads(
-        option_chain, underlying_price, earnings_date, volatility_rank, preferences
-    )
-    call_spreads = build_call_credit_spreads(
-        option_chain, underlying_price, earnings_date, volatility_rank, preferences
-    )
-    qualified_puts = [
-        trade for trade in put_spreads
-        if passes_filters(trade, preferences)[0]
-    ]
-    qualified_calls = [
-        trade for trade in call_spreads
-        if passes_filters(trade, preferences)[0]
-    ]
-
-    top_puts = sorted(
-        qualified_puts,
-        key=lambda trade: score_trade(trade, preferences).total_score,
-        reverse=True,
-    )[:5]
-    top_calls = sorted(
-        qualified_calls,
-        key=lambda trade: score_trade(trade, preferences).total_score,
-        reverse=True,
-    )[:5]
-
-    pairs_checked = 0
-    matching_expiration_pairs = 0
-    valid_order_pairs = 0
-    nonpositive_credit_pairs = 0
-    nonpositive_risk_pairs = 0
-    built_condors = 0
-
-    for call_spread in top_calls:
-        for put_spread in top_puts:
-            pairs_checked += 1
-            if call_spread.expiration != put_spread.expiration:
-                continue
-            if call_spread.ticker != put_spread.ticker:
-                continue
-            matching_expiration_pairs += 1
-            if call_spread.short_strike <= put_spread.short_strike:
-                continue
-            valid_order_pairs += 1
-
-            total_credit = round(call_spread.credit + put_spread.credit, 2)
-            put_width = put_spread.short_strike - put_spread.long_strike
-            call_width = call_spread.long_strike - call_spread.short_strike
-            max_width = max(put_width, call_width)
-            max_risk = round(max_width - total_credit, 2)
-
-            if total_credit <= 0:
-                nonpositive_credit_pairs += 1
-                continue
-            if max_risk <= 0:
-                nonpositive_risk_pairs += 1
-                continue
-            built_condors += 1
-
-    if not put_spreads:
-        top_reason = "no put credit spreads built"
-    elif not call_spreads:
-        top_reason = "no call credit spreads built"
-    elif not qualified_puts and not qualified_calls:
-        top_reason = "no put or call side passed filters"
-    elif not qualified_puts:
-        top_reason = "no put side passed filters"
-    elif not qualified_calls:
-        top_reason = "no call side passed filters"
-    elif pairs_checked == 0:
-        top_reason = "no qualified put/call pairs to combine"
-    elif matching_expiration_pairs == 0:
-        top_reason = "no matching expiration between qualified sides"
-    elif valid_order_pairs == 0:
-        top_reason = "put/call short strikes overlap or are reversed"
-    elif nonpositive_credit_pairs:
-        top_reason = "combined credit was not positive"
-    elif nonpositive_risk_pairs:
-        top_reason = "combined max risk was not positive"
-    elif built_condors == 0:
-        top_reason = "no condors survived builder checks"
-    else:
-        top_reason = "condors built"
-
-    ticker = option_chain[0].ticker if option_chain else "Unknown"
-    return CondorDiagnostics(
-        ticker=ticker,
-        put_spreads_built=len(put_spreads),
-        call_spreads_built=len(call_spreads),
-        qualified_puts=len(qualified_puts),
-        qualified_calls=len(qualified_calls),
-        pairs_checked=pairs_checked,
-        matching_expiration_pairs=matching_expiration_pairs,
-        valid_order_pairs=valid_order_pairs,
-        built_condors=built_condors,
-        top_reason=top_reason,
-    )
+    return build_iron_condors_with_diagnostics(
+        option_chain,
+        underlying_price,
+        earnings_date,
+        volatility_rank,
+        preferences,
+    ).diagnostics
 
 
 def build_bull_call_debit_spread(
@@ -1642,8 +2467,11 @@ def ranking_test_scored(
         category_scores={},
         quant_score=score,
         event_adjustment=0,
+        raw_price_move_adjustment=0,
+        effective_price_move_adjustment=0,
         price_move_adjustment=0,
         price_move_style="normal",
+        base_score_without_price_move=score,
         total_score=score,
         reasons=[],
         explanation="ranking test",
@@ -1758,6 +2586,74 @@ def test_diversified_ranking() -> None:
     test_diversified_ranking_iron_condor_similarity()
     test_diversified_ranking_highest_score_survives_deduplication()
     print("Diversified ranking tests passed.")
+
+
+def test_execution_selection() -> None:
+    displayed = diversify_scored_trades(
+        [
+            ranking_test_scored("SPY", "bull call debit spread", 91, 605, 600),
+            ranking_test_scored("SPY", "bear put debit spread", 89, 590, 595, option_type="put"),
+            ranking_test_scored("NVDA", "bull call debit spread", 88, 210, 205),
+            ranking_test_scored("QQQ", "put credit spread", 84, 480, 475, option_type="put"),
+        ]
+    )
+    assert len([item for item in displayed if item.trade.ticker == "SPY"]) == 2
+
+    selected = select_execution_candidates(displayed, limit=3)
+    assert [item.trade.ticker for item in selected] == ["SPY", "NVDA", "QQQ"]
+    assert len({item.trade.ticker for item in selected}) == len(selected)
+    assert [item.execution_rank for item in selected] == [1, 2, 3]
+
+    two_tickers = select_execution_candidates(displayed[:3], limit=3)
+    assert len(two_tickers) == 2
+    assert two_tickers[0].total_score == 91
+
+    tied = [
+        replace(
+            ranking_test_scored("AAPL", "bull call debit spread", 80, 105, 100),
+            normalized_ticker_score=80,
+            quant_score=75,
+        ),
+        replace(
+            ranking_test_scored("MSFT", "bull call debit spread", 80, 505, 500),
+            normalized_ticker_score=90,
+            quant_score=70,
+        ),
+        replace(
+            ranking_test_scored("NVDA", "bull call debit spread", 80, 205, 200),
+            normalized_ticker_score=90,
+            quant_score=78,
+        ),
+    ]
+    tied_selected = select_execution_candidates(tied, limit=3)
+    assert [item.trade.ticker for item in tied_selected] == ["NVDA", "MSFT", "AAPL"]
+
+    assert strategy_direction("put credit spread") == "bullish"
+    assert strategy_direction("bull call debit spread") == "bullish"
+    assert strategy_direction("call credit spread") == "bearish"
+    assert strategy_direction("bear put debit spread") == "bearish"
+    assert strategy_direction("iron condor") == "neutral"
+    assert strategy_direction("calendar spread") == "unknown"
+    print("Execution selection tests passed.")
+
+
+def test_price_move_modes() -> None:
+    assert apply_price_move_mode(8, "Full") == (8, 8)
+    assert apply_price_move_mode(-6, "Full") == (-6, -6)
+    assert apply_price_move_mode(8, "Conservative") == (8, 3)
+    assert apply_price_move_mode(-6, "Conservative") == (-6, -6)
+    assert apply_price_move_mode(8, "Shadow") == (8, 0)
+    assert apply_price_move_mode(8, "Off") == (8, 0)
+
+    trade = ranking_test_trade("AAPL", "bull call debit spread", 105, 100)
+    price_move = {"1D Move %": 4, "5D Move %": 5, "Move vs 20D Vol": 2}
+    preferences = ScanPreferences(500, "bullish", "moderate", price_move_mode="Shadow")
+    scored = score_trade(trade, preferences, price_move=price_move)
+    assert scored.raw_price_move_adjustment > 0
+    assert scored.effective_price_move_adjustment == 0
+    assert scored.price_move_adjustment == 0
+    assert scored.total_score == scored.base_score_without_price_move
+    print("Price move mode tests passed.")
 
 
 def test_event_adjustments() -> None:

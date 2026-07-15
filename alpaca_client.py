@@ -1,8 +1,10 @@
+import math
 import os
 from datetime import date, timedelta
 
 import requests
 from dotenv import load_dotenv
+from scanner_tracking import SELECTION_EXECUTION, setup_key_for_trade
 
 
 load_dotenv()
@@ -174,17 +176,18 @@ def option_symbol(
 
 
 def scored_trade_paper_key(scored, trading_day: date | None = None) -> str:
-    trade = scored.trade
     trading_day = trading_day or date.today()
-    strike_key = f"{float(trade.long_strike):.3f}".replace(".", "p")
-    return (
-        f"{trade.ticker}-{trade.expiration}-{trade.option_type}-"
-        f"{strike_key}-{trading_day.isoformat()}"
+    return f"{setup_key_for_trade(scored.trade)}-{trading_day:%Y%m%d}"
+
+
+def scan_client_order_id(scored, scan_run_id: str | None = None) -> str:
+    setup_hash = setup_key_for_trade(scored.trade)[:24]
+    run_suffix = (
+        scan_run_id.replace("-", "")[:12]
+        if scan_run_id
+        else date.today().strftime("%Y%m%d")
     )
-
-
-def scan_client_order_id(scored) -> str:
-    return f"scan-{scored_trade_paper_key(scored)}"[:48]
+    return f"scan-{setup_hash}-{run_suffix}"[:48]
 
 
 def leg_key_from_legs(legs: list[dict]) -> str:
@@ -238,6 +241,46 @@ def strategy_from_order_legs(legs: list[dict]) -> str:
     return "multi-leg option order"
 
 
+ENTRY_TYPE_BY_STRATEGY = {
+    "bull call debit spread": "debit",
+    "bear put debit spread": "debit",
+    "put credit spread": "credit",
+    "call credit spread": "credit",
+    "iron condor": "credit",
+}
+
+
+def entry_type_for_strategy(strategy: str) -> str | None:
+    return ENTRY_TYPE_BY_STRATEGY.get(str(strategy or "").lower())
+
+
+def spread_width_from_order_legs(legs: list[dict], strategy: str) -> float | None:
+    symbols = [leg.get("symbol", "") for leg in legs if leg.get("symbol")]
+    if len(symbols) == 2:
+        return round(abs(int(symbols[0][-8:]) - int(symbols[1][-8:])) / 1000, 4)
+    if len(symbols) == 4 and strategy == "iron condor":
+        put_strikes = [int(symbol[-8:]) / 1000 for symbol in symbols if symbol[-9] == "P"]
+        call_strikes = [int(symbol[-8:]) / 1000 for symbol in symbols if symbol[-9] == "C"]
+        if len(put_strikes) != 2 or len(call_strikes) != 2:
+            return None
+        return round(
+            max(
+                abs(put_strikes[0] - put_strikes[1]),
+                abs(call_strikes[0] - call_strikes[1]),
+            ),
+            4,
+        )
+    return None
+
+
+def trade_spread_width_per_share(trade) -> float:
+    if trade.strategy == "iron condor":
+        put_width = abs(float(trade.put_short_strike) - float(trade.put_long_strike))
+        call_width = abs(float(trade.call_long_strike) - float(trade.call_short_strike))
+        return round(max(put_width, call_width), 4)
+    return round(abs(float(trade.short_strike) - float(trade.long_strike)), 4)
+
+
 def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
     legs = order.get("legs") or []
     if not legs:
@@ -257,6 +300,7 @@ def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
         return None
 
     first_symbol = normalized_legs[0]["symbol"]
+    strategy = strategy_from_order_legs(normalized_legs)
     return {
         "Candidate": "Alpaca backfill",
         "Symbol": order.get("symbol") or (
@@ -267,14 +311,23 @@ def paper_order_result_from_alpaca_order(order: dict) -> dict | None:
         "Order ID": order.get("id"),
         "Client Order ID": order.get("client_order_id"),
         "Ticker": ticker_from_option_symbol(first_symbol),
-        "Strategy": strategy_from_order_legs(normalized_legs),
+        "Strategy": strategy,
         "Expiration": expiration_from_option_symbol(first_symbol),
         "Setup Score": None,
-        "Entry Type": "credit" if float(order.get("limit_price") or 0) < 0 else "debit",
+        "Entry Type": entry_type_for_strategy(strategy),
         "Limit Price": float(order.get("limit_price") or 0),
+        "Spread Width Per Share": spread_width_from_order_legs(
+            normalized_legs, strategy
+        ),
+        "Max Profit": None,
+        "Max Risk": None,
         "Quantity": int(float(order.get("qty") or 1)),
         "Order Class": order.get("order_class") or "mleg",
         "Leg Key": leg_key_from_legs(normalized_legs),
+        "Exit Policy": "none",
+        "Opening Order Status": order.get("status"),
+        "Opening Filled At": order.get("filled_at"),
+        "Opening Filled Avg Price": order.get("filled_avg_price"),
     }
 
 
@@ -299,6 +352,66 @@ def get_alpaca_positions() -> tuple[list[dict], list[str]]:
     return positions or [], []
 
 
+def nonzero_alpaca_position_quantities(
+    positions: list[dict],
+) -> tuple[dict[str, float], list[str]]:
+    quantities = {}
+    errors = []
+    for position in positions:
+        symbol = str(position.get("symbol") or "").strip().upper()
+        raw_quantity = position.get("qty")
+        if not symbol:
+            errors.append("Alpaca returned a position without an option symbol.")
+            continue
+        try:
+            quantity = float(raw_quantity)
+        except (TypeError, ValueError):
+            errors.append(
+                f"Alpaca returned an invalid position quantity for {symbol}: "
+                f"{raw_quantity!r}."
+            )
+            continue
+        if not math.isfinite(quantity):
+            errors.append(
+                f"Alpaca returned an invalid position quantity for {symbol}: "
+                f"{raw_quantity!r}."
+            )
+            continue
+        if quantity != 0:
+            quantities[symbol] = quantity
+    return quantities, errors
+
+
+def _display_position_quantity(quantity: float) -> str:
+    return f"{quantity:g}"
+
+
+def _position_overlap_message(leg: dict, quantity: float) -> str:
+    symbol = leg["symbol"]
+    required_intent = leg["position_intent"]
+    inferred_intent = None
+    if quantity > 0 and leg.get("side") == "sell":
+        inferred_intent = "sell_to_close"
+    elif quantity < 0 and leg.get("side") == "buy":
+        inferred_intent = "buy_to_close"
+
+    if inferred_intent:
+        explanation = (
+            f"the candidate requires {required_intent} but Alpaca would infer "
+            f"{inferred_intent}"
+        )
+    else:
+        explanation = (
+            f"the candidate requires {required_intent}, and opening another setup "
+            "against an existing broker leg could cause Alpaca to infer a closing intent"
+        )
+    return (
+        f"Skipped because {symbol} already has broker position qty "
+        f"{_display_position_quantity(quantity)}; {explanation}, causing a "
+        "position_intent mismatch."
+    )
+
+
 def get_recent_alpaca_orders(limit: int = 10) -> tuple[list[dict], list[str]]:
     orders, errors = alpaca_request(
         "GET",
@@ -313,6 +426,26 @@ def get_recent_alpaca_orders(limit: int = 10) -> tuple[list[dict], list[str]]:
     if errors:
         return [], errors
     return orders or [], []
+
+
+def get_alpaca_order(order_id: str) -> tuple[dict | None, list[str]]:
+    order, errors = alpaca_request("GET", f"/v2/orders/{order_id}")
+    if errors:
+        return None, errors
+    return order or {}, []
+
+
+def get_alpaca_order_by_client_id(
+    client_order_id: str,
+) -> tuple[dict | None, list[str]]:
+    order, errors = alpaca_request(
+        "GET",
+        "/v2/orders:by_client_order_id",
+        params={"client_order_id": client_order_id},
+    )
+    if errors:
+        return None, errors
+    return order or {}, []
 
 
 def submit_option_order(
@@ -480,7 +613,50 @@ def submit_scored_multileg_orders(
     scored_candidates,
     quantity: int = 1,
     limit: int = 3,
+    exit_policy: str = "none",
+    scan_run_id: str | None = None,
 ) -> list[dict]:
+    selected_candidates = list(scored_candidates)[:limit]
+    if not selected_candidates:
+        return [
+            {
+                "Candidate": "Latest Scan",
+                "Symbol": "",
+                "Status": "Skipped",
+                "Message": "No candidates were available for paper trading.",
+            }
+        ]
+
+    positions, position_errors = get_alpaca_positions()
+    if position_errors:
+        return [
+            {
+                "Candidate": "Broker Position Safety Check",
+                "Symbol": "",
+                "Status": "Error",
+                "Message": (
+                    "Alpaca position lookup failed; no paper orders were submitted. "
+                    + "; ".join(position_errors)
+                ),
+            }
+        ]
+
+    live_position_quantities, quantity_errors = nonzero_alpaca_position_quantities(
+        positions
+    )
+    if quantity_errors:
+        return [
+            {
+                "Candidate": "Broker Position Safety Check",
+                "Symbol": "",
+                "Status": "Error",
+                "Message": (
+                    "Alpaca position data could not be validated; no paper orders "
+                    "were submitted. " + "; ".join(quantity_errors)
+                ),
+            }
+        ]
+
     recent_orders, recent_errors = get_recent_alpaca_orders(limit=100)
     recent_client_order_ids = {
         order.get("client_order_id")
@@ -498,7 +674,7 @@ def submit_scored_multileg_orders(
         for error in recent_errors
     ]
 
-    selected_candidates = list(scored_candidates)[:limit]
+    reserved_symbols = set()
 
     for scored in selected_candidates:
         trade = scored.trade
@@ -520,7 +696,48 @@ def submit_scored_multileg_orders(
             )
             continue
 
-        client_order_id = scan_client_order_id(scored)
+        overlapping_leg = next(
+            (
+                leg
+                for leg in legs
+                if leg["symbol"].upper() in live_position_quantities
+            ),
+            None,
+        )
+        if overlapping_leg is not None:
+            symbol = overlapping_leg["symbol"].upper()
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Skipped",
+                    "Message": _position_overlap_message(
+                        overlapping_leg, live_position_quantities[symbol]
+                    ),
+                }
+            )
+            continue
+
+        candidate_symbols = {leg["symbol"].upper() for leg in legs}
+        shared_symbols = candidate_symbols & reserved_symbols
+        if shared_symbols:
+            symbol = sorted(shared_symbols)[0]
+            results.append(
+                {
+                    "Candidate": candidate_label,
+                    "Symbol": symbol,
+                    "Status": "Skipped",
+                    "Message": (
+                        f"Skipped because {symbol} is already reserved by a "
+                        "higher-ranked candidate in this scan; no legs were "
+                        "submitted, preventing a position_intent conflict."
+                    ),
+                }
+            )
+            continue
+        reserved_symbols.update(candidate_symbols)
+
+        client_order_id = scan_client_order_id(scored, scan_run_id)
         if client_order_id in recent_client_order_ids:
             results.append(
                 {
@@ -567,21 +784,31 @@ def submit_scored_multileg_orders(
                 "Strategy": trade.strategy,
                 "Expiration": trade.expiration,
                 "Setup Score": scored.total_score,
+                "Ticker Score": scored.normalized_ticker_score,
+                "Quant Score": scored.quant_score,
+                "Setup Key": setup_key_for_trade(trade),
+                "Scan Run ID": scan_run_id,
+                "Execution Rank": scored.execution_rank,
+                "Selection Method": SELECTION_EXECUTION,
                 "Entry Type": trade.entry_type,
                 "Limit Price": limit_price,
+                "Spread Width Per Share": trade_spread_width_per_share(trade),
+                "Max Profit": round(
+                    float(
+                        trade.max_profit
+                        if trade.entry_type == "debit"
+                        else trade.credit
+                    ),
+                    2,
+                ),
+                "Max Risk": round(float(trade.max_risk), 2),
                 "Quantity": quantity,
                 "Order Class": order.get("order_class") or "mleg",
                 "Leg Key": leg_key,
-            }
-        )
-
-    if not selected_candidates:
-        results.append(
-            {
-                "Candidate": "Latest Scan",
-                "Symbol": "",
-                "Status": "Skipped",
-                "Message": "No candidates were available for paper trading.",
+                "Exit Policy": exit_policy,
+                "Opening Order Status": order.get("status"),
+                "Opening Filled At": order.get("filled_at"),
+                "Opening Filled Avg Price": order.get("filled_avg_price"),
             }
         )
 
