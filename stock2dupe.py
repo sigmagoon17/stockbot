@@ -46,8 +46,10 @@ class ScanPreferences:
     nearest_expiration: bool = False
     price_move_mode: str = "Full"
     condor_max_wings_per_side: int = 15
+    vertical_max_bid_ask_width: float = 0.20
     condor_max_bid_ask_width: float = 0.40
     condor_max_bid_ask_to_credit_ratio: float | None = None
+    max_bid_ask_to_trade_value_ratio: float | None = None
     expiration_coverage: str = EXPIRATION_COVERAGE_EXHAUSTIVE
 
 
@@ -530,6 +532,52 @@ class ScoredTrade:
 
 
 @dataclass(frozen=True)
+class FilterFailure:
+    filter_id: str
+    description: str
+    overridable: bool
+
+
+@dataclass(frozen=True)
+class ManualOverrideDecision:
+    allowed: bool
+    overridden_failures: tuple[FilterFailure, ...]
+    non_overridden_failures: tuple[FilterFailure, ...]
+    non_overridable_failures: tuple[FilterFailure, ...]
+
+
+OVERRIDABLE_FILTER_IDS = {
+    "earnings_before_expiration",
+    "delta_range",
+    "open_interest",
+    "volume",
+    "volatility_rank",
+    "dte_range",
+    "bid_ask_width",
+    "bid_ask_ratio",
+    "max_risk_limit",
+    "credit_to_width",
+    "expected_move",
+    "reward_to_risk",
+}
+
+FILTER_LABELS = {
+    "earnings_before_expiration": "Earnings Before Expiration",
+    "delta_range": "Delta Range",
+    "open_interest": "Open Interest",
+    "volume": "Volume",
+    "volatility_rank": "Realized Volatility Rank",
+    "dte_range": "DTE Range",
+    "bid_ask_width": "Bid/Ask Width",
+    "bid_ask_ratio": "Bid/Ask-to-Trade-Value Ratio",
+    "max_risk_limit": "Maximum Risk",
+    "credit_to_width": "Credit-to-Width Ratio",
+    "expected_move": "Expected-Move Cushion",
+    "reward_to_risk": "Debit Reward-to-Risk Ratio",
+}
+
+
+@dataclass(frozen=True)
 class CondorDiagnostics:
     ticker: str
     raw_put_wings_built: int
@@ -623,7 +671,11 @@ def strategy_fit_score(trade: Trade, preferences: ScanPreferences) -> int:
 
 
 def bid_ask_spread(trade: Trade) -> float:
-    return round(trade.ask - trade.bid, 2)
+    try:
+        width = float(trade.ask) - float(trade.bid)
+    except (TypeError, ValueError):
+        return math.nan
+    return round(width, 2) if math.isfinite(width) else math.nan
 
 
 def expected_move_cushion(trade: Trade) -> float:
@@ -739,6 +791,54 @@ def condor_bid_ask_to_credit_ratio(trade: Trade) -> float | None:
     return round(bid_ask_spread(trade) / trade.credit, 4)
 
 
+def bid_ask_to_trade_value_ratio(trade: Trade) -> float | None:
+    trade_value = trade.credit if trade.entry_type == "credit" else trade.max_risk
+    if trade_value <= 0:
+        return None
+    return round(bid_ask_spread(trade) / trade_value, 4)
+
+
+def filter_failure(filter_id: str, description: str) -> FilterFailure:
+    return FilterFailure(
+        filter_id=filter_id,
+        description=description,
+        overridable=filter_id in OVERRIDABLE_FILTER_IDS,
+    )
+
+
+def manual_override_decision(
+    failures: list[FilterFailure] | tuple[FilterFailure, ...],
+    selected_filter_ids,
+) -> ManualOverrideDecision:
+    selected = set(selected_filter_ids or ())
+    failure_ids = {failure.filter_id for failure in failures}
+    unknown = selected.difference(failure_ids)
+    if unknown:
+        raise ValueError(
+            f"Cannot override filters that did not fail: {sorted(unknown)}"
+        )
+
+    non_overridable = tuple(
+        failure for failure in failures if not failure.overridable
+    )
+    overridden = tuple(
+        failure
+        for failure in failures
+        if failure.overridable and failure.filter_id in selected
+    )
+    non_overridden = tuple(
+        failure
+        for failure in failures
+        if failure.overridable and failure.filter_id not in selected
+    )
+    return ManualOverrideDecision(
+        allowed=bool(failures) and not non_overridable and not non_overridden,
+        overridden_failures=overridden,
+        non_overridden_failures=non_overridden,
+        non_overridable_failures=non_overridable,
+    )
+
+
 def condor_wing_rejection_reasons(trade: Trade) -> list[str]:
     reasons = []
     width = spread_width(trade)
@@ -764,11 +864,11 @@ def passes_condor_wing_filters(trade: Trade) -> tuple[bool, list[str]]:
     return len(reasons) == 0, reasons
 
 
-def condor_rejection_reasons(
+def condor_filter_failures(
     trade: Trade,
     preferences: ScanPreferences,
-) -> list[str]:
-    reasons = []
+) -> list[FilterFailure]:
+    failures = []
     max_width = spread_width(trade)
     put_cushion = condor_put_cushion(trade)
     call_cushion = condor_call_cushion(trade)
@@ -776,44 +876,97 @@ def condor_rejection_reasons(
     bid_ask_credit_ratio = condor_bid_ask_to_credit_ratio(trade)
 
     if trade.quote_source != "bid/ask":
-        reasons.append("quote is estimated from last price")
+        failures.append(filter_failure("quote_source", "quote is estimated from last price"))
     if trade.credit <= 0:
-        reasons.append("condor combined credit must be greater than zero")
+        failures.append(
+            filter_failure(
+                "impossible_spread_economics",
+                "condor combined credit must be greater than zero",
+            )
+        )
     if trade.max_risk <= 0:
-        reasons.append("max risk must be greater than 0")
+        failures.append(filter_failure("max_risk_invalid", "max risk must be greater than 0"))
     if trade.max_risk * CONTRACT_MULTIPLIER > preferences.max_risk:
-        reasons.append("condor max risk too high")
+        failures.append(filter_failure("max_risk_limit", "condor max risk too high"))
     if max_width <= 0 or trade.credit / max_width < 0.15:
-        reasons.append("condor credit is below 15% of maximum wing width")
+        failures.append(
+            filter_failure(
+                "credit_to_width",
+                "condor credit is below 15% of maximum wing width",
+            )
+        )
     if put_cushion < 0:
-        reasons.append("condor put short strike is inside the expected move")
+        failures.append(
+            filter_failure(
+                "expected_move",
+                "condor put short strike is inside the expected move",
+            )
+        )
     if call_cushion < 0:
-        reasons.append("condor call short strike is inside the expected move")
+        failures.append(
+            filter_failure(
+                "expected_move",
+                "condor call short strike is inside the expected move",
+            )
+        )
     if trade.earnings_before_exp:
-        reasons.append("earnings occur before expiration")
+        failures.append(
+            filter_failure(
+                "earnings_before_expiration", "earnings occur before expiration"
+            )
+        )
     if trade.open_interest < 200:
-        reasons.append("open interest is below 200")
+        failures.append(filter_failure("open_interest", "open interest is below 200"))
     if trade.volume < 25:
-        reasons.append("volume is below 25")
+        failures.append(filter_failure("volume", "volume is below 25"))
 
     if preferences.test_expiration is not None:
         if trade.expiration != preferences.test_expiration.isoformat():
-            reasons.append("expiration does not match the test expiration")
+            failures.append(
+                filter_failure(
+                    "expiration_match",
+                    "expiration does not match the test expiration",
+                )
+            )
     elif preferences.nearest_expiration:
         pass
     elif not 21 <= trade.dte <= 60:
-        reasons.append("DTE is outside the 21 to 60 day range")
+        failures.append(
+            filter_failure("dte_range", "DTE is outside the 21 to 60 day range")
+        )
 
     if four_leg_bid_ask_width > preferences.condor_max_bid_ask_width:
-        reasons.append("condor four-leg bid/ask spread is wider than configured maximum")
+        failures.append(
+            filter_failure(
+                "bid_ask_width",
+                "condor four-leg bid/ask spread is wider than configured maximum",
+            )
+        )
+    configured_ratio = (
+        preferences.max_bid_ask_to_trade_value_ratio
+        if preferences.max_bid_ask_to_trade_value_ratio is not None
+        else preferences.condor_max_bid_ask_to_credit_ratio
+    )
     if (
-        preferences.condor_max_bid_ask_to_credit_ratio is not None
+        configured_ratio is not None
         and bid_ask_credit_ratio is not None
-        and bid_ask_credit_ratio
-        > preferences.condor_max_bid_ask_to_credit_ratio
+        and bid_ask_credit_ratio > configured_ratio
     ):
-        reasons.append("condor bid/ask-to-credit ratio is too high")
-    return reasons
+        failures.append(
+            filter_failure(
+                "bid_ask_ratio", "condor bid/ask-to-credit ratio is too high"
+            )
+        )
+    return failures
+
+
+def condor_rejection_reasons(
+    trade: Trade,
+    preferences: ScanPreferences,
+) -> list[str]:
+    return [
+        failure.description for failure in condor_filter_failures(trade, preferences)
+    ]
 
 
 def passes_condor_filters(
@@ -824,63 +977,207 @@ def passes_condor_filters(
     return len(reasons) == 0, reasons
 
 
-def passes_filters(trade: Trade, preferences: ScanPreferences) -> tuple[bool, list[str]]:
+def evaluate_filter_failures(
+    trade: Trade, preferences: ScanPreferences
+) -> list[FilterFailure]:
     if trade.strategy == "iron condor":
-        return passes_condor_filters(trade, preferences)
+        return condor_filter_failures(trade, preferences)
 
-    rejection_reasons = []
+    failures = []
 
     if trade.quote_source != "bid/ask":
-        rejection_reasons.append("quote is estimated from last price")
+        failures.append(filter_failure("quote_source", "quote is estimated from last price"))
 
     if trade.earnings_before_exp:
-        rejection_reasons.append("earnings occur before expiration")
+        failures.append(
+            filter_failure(
+                "earnings_before_expiration", "earnings occur before expiration"
+            )
+        )
 
     if trade.entry_type == "credit":
         if not 0.10 <= abs(trade.delta) <= 0.30:
-            rejection_reasons.append("delta is outside the credit range of 0.10 to 0.30")
+            failures.append(
+                filter_failure(
+                    "delta_range",
+                    "delta is outside the credit range of 0.10 to 0.30",
+                )
+            )
     elif trade.entry_type == "debit":
         if not 0.40 <= abs(trade.delta) <= 0.60:
-            rejection_reasons.append("delta is outside the debit range of 0.40 to 0.60")
+            failures.append(
+                filter_failure(
+                    "delta_range",
+                    "delta is outside the debit range of 0.40 to 0.60",
+                )
+            )
     if trade.open_interest < 200:
-        rejection_reasons.append("open interest is below 200")
+        failures.append(filter_failure("open_interest", "open interest is below 200"))
 
     if trade.volume < 25:
-        rejection_reasons.append("volume is below 25")
+        failures.append(filter_failure("volume", "volume is below 25"))
 
     if trade.volatility_rank < 35:
-        rejection_reasons.append("realized volatility rank is below 35")
+        failures.append(
+            filter_failure(
+                "volatility_rank", "realized volatility rank is below 35"
+            )
+        )
 
     if preferences.test_expiration is not None:
         if trade.expiration != preferences.test_expiration.isoformat():
-            rejection_reasons.append("expiration does not match the test expiration")
+            failures.append(
+                filter_failure(
+                    "expiration_match",
+                    "expiration does not match the test expiration",
+                )
+            )
     elif preferences.nearest_expiration:
         pass
     elif not 21 <= trade.dte <= 60:
-        rejection_reasons.append("DTE is outside the 21 to 60 day range")
+        failures.append(
+            filter_failure("dte_range", "DTE is outside the 21 to 60 day range")
+        )
 
-    if bid_ask_spread(trade) >= 0.20:
-        rejection_reasons.append("bid/ask spread is wider than 0.20")
+    if bid_ask_spread(trade) >= preferences.vertical_max_bid_ask_width:
+        description = (
+            "bid/ask spread is wider than 0.20"
+            if preferences.vertical_max_bid_ask_width == 0.20
+            else "bid/ask spread is wider than configured maximum"
+        )
+        failures.append(filter_failure("bid_ask_width", description))
+
+    relative_ratio = bid_ask_to_trade_value_ratio(trade)
+    if (
+        preferences.max_bid_ask_to_trade_value_ratio is not None
+        and relative_ratio is not None
+        and relative_ratio > preferences.max_bid_ask_to_trade_value_ratio
+    ):
+        failures.append(
+            filter_failure(
+                "bid_ask_ratio", "bid/ask-to-trade-value ratio is too high"
+            )
+        )
 
     if trade.max_risk <= 0:
-        rejection_reasons.append("max risk must be greater than 0")
+        failures.append(filter_failure("max_risk_invalid", "max risk must be greater than 0"))
 
     if trade.entry_type == "credit":
         if credit_to_width_ratio(trade) < 0.15:
-            rejection_reasons.append("credit is below 15% of spread width")
+            failures.append(
+                filter_failure(
+                    "credit_to_width", "credit is below 15% of spread width"
+                )
+            )
     
     if trade.max_risk * CONTRACT_MULTIPLIER > preferences.max_risk:
-        rejection_reasons.append("max risk too high")
+        failures.append(filter_failure("max_risk_limit", "max risk too high"))
     
     if trade.entry_type == "credit":
         if expected_move_cushion(trade) < 0:
-            rejection_reasons.append("short strike is inside the expected move")
+            failures.append(
+                filter_failure(
+                    "expected_move", "short strike is inside the expected move"
+                )
+            )
     
     if trade.entry_type == "debit" and trade.max_risk > 0:
         if trade.max_profit / trade.max_risk <= 0.3:
-            rejection_reasons.append("minimum reward to risk ratio is below 0.3")
-    
-    return len(rejection_reasons) == 0, rejection_reasons
+            failures.append(
+                filter_failure(
+                    "reward_to_risk",
+                    "minimum reward to risk ratio is below 0.3",
+                )
+            )
+    return failures
+
+
+def passes_filters(trade: Trade, preferences: ScanPreferences) -> tuple[bool, list[str]]:
+    failures = evaluate_filter_failures(trade, preferences)
+    reasons = [failure.description for failure in failures]
+    return len(reasons) == 0, reasons
+
+
+def manual_order_safety_failures(trade: Trade) -> list[FilterFailure]:
+    failures = []
+    supported_strategies = {
+        "put credit spread",
+        "call credit spread",
+        "bull call debit spread",
+        "bear put debit spread",
+        "iron condor",
+    }
+    if trade.strategy not in supported_strategies:
+        failures.append(
+            filter_failure("unsupported_strategy", "strategy is not supported")
+        )
+
+    quote_values = (
+        trade.bid,
+        trade.ask,
+        trade.short_bid,
+        trade.short_ask,
+        trade.long_bid,
+        trade.long_ask,
+    )
+    def quote_is_invalid(value) -> bool:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return True
+        return not math.isfinite(numeric) or numeric <= 0
+
+    try:
+        crossed_quote = float(trade.ask) < float(trade.bid)
+    except (TypeError, ValueError):
+        crossed_quote = True
+    if any(quote_is_invalid(value) for value in quote_values) or crossed_quote:
+        failures.append(
+            filter_failure("invalid_quotes", "quotes are missing or invalid")
+        )
+
+    if trade.max_risk <= 0:
+        failures.append(
+            filter_failure("max_risk_invalid", "max risk must be greater than 0")
+        )
+    if trade.entry_type == "debit" and trade.max_profit < 0:
+        failures.append(
+            filter_failure("max_profit_invalid", "max profit must not be negative")
+        )
+
+    width = spread_width(trade)
+    expected_width = (
+        trade.max_risk + trade.credit
+        if trade.entry_type == "credit"
+        else trade.max_risk + trade.max_profit
+    )
+    if (
+        width <= 0
+        or expected_width <= 0
+        or not math.isclose(width, expected_width, abs_tol=0.03)
+    ):
+        failures.append(
+            filter_failure(
+                "impossible_spread_economics", "spread economics are inconsistent"
+            )
+        )
+
+    try:
+        date.fromisoformat(trade.expiration)
+    except (TypeError, ValueError):
+        failures.append(
+            filter_failure("invalid_option_symbol", "expiration is invalid")
+        )
+    if (
+        not str(trade.ticker or "").strip()
+        or trade.option_type not in {"put", "call", "mixed"}
+        or trade.long_strike <= 0
+        or trade.short_strike <= 0
+    ):
+        failures.append(
+            filter_failure("invalid_option_symbol", "option identity is invalid")
+        )
+    return failures
 
 
 def score_expected_move(trade: Trade) -> int:

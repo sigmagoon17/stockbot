@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from datetime import date, timedelta
 
 import requests
@@ -459,6 +460,12 @@ def alpaca_open_order_symbols(
 
 
 def get_alpaca_opening_preflight_state() -> tuple[dict | None, list[str]]:
+    config = alpaca_config_status()
+    if not config["is_paper"]:
+        return None, [
+            "Refusing broker preflight because Alpaca is not using the paper endpoint; "
+            "no broker requests or paper orders were submitted."
+        ]
     positions, position_errors = get_alpaca_positions()
     if position_errors:
         return None, [
@@ -520,6 +527,40 @@ def opening_legs_conflict_message(
                 "position_intent conflict."
             )
     return None, None
+
+
+def validate_opening_option_legs(legs: list[dict]) -> list[str]:
+    errors = []
+    if not isinstance(legs, list) or len(legs) not in {2, 4}:
+        return ["The strategy must contain exactly two or four option legs."]
+
+    symbols = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            errors.append("A strategy leg is malformed.")
+            continue
+        symbol = str(leg.get("symbol") or "").strip().upper()
+        side = leg.get("side")
+        intent = leg.get("position_intent")
+        try:
+            ratio_quantity = int(leg.get("ratio_qty"))
+        except (TypeError, ValueError):
+            ratio_quantity = 0
+        if not re.fullmatch(r"[A-Z0-9]{1,6}\d{6}[CP]\d{8}", symbol):
+            errors.append(f"Invalid option symbol: {symbol or '[missing]' }.")
+        if (side, intent) not in {
+            ("buy", "buy_to_open"),
+            ("sell", "sell_to_open"),
+        }:
+            errors.append(
+                f"Invalid opening side or position intent for {symbol or '[missing]'}."
+            )
+        if ratio_quantity <= 0:
+            errors.append(f"Invalid leg quantity for {symbol or '[missing]' }.")
+        symbols.append(symbol)
+    if len(set(symbols)) != len(symbols):
+        errors.append("The strategy contains duplicate option symbols.")
+    return errors
 
 
 def get_recent_alpaca_orders(limit: int = 10) -> tuple[list[dict], list[str]]:
@@ -719,12 +760,55 @@ def submit_multileg_order(
     return order, []
 
 
+def validate_manual_limit_price(
+    entry_type: str,
+    limit_price,
+    spread_width_per_share,
+) -> list[str]:
+    normalized_entry_type = str(entry_type or "").strip().lower()
+    if normalized_entry_type not in {"debit", "credit"}:
+        return [f"Unsupported manual entry type: {entry_type!r}."]
+
+    try:
+        width = float(spread_width_per_share)
+    except (TypeError, ValueError):
+        return ["Manual spread width must be a finite number greater than $0.00."]
+    if not math.isfinite(width) or width <= 0:
+        return ["Manual spread width must be a finite number greater than $0.00."]
+
+    entry_label = normalized_entry_type.title()
+    range_message = (
+        f"{entry_label} limit must be greater than $0.00 and less than the "
+        f"${width:.2f} spread width."
+    )
+    try:
+        price = float(limit_price)
+    except (TypeError, ValueError):
+        return [range_message]
+    if not math.isfinite(price) or price <= 0 or price >= width:
+        return [range_message]
+    return []
+
+
 def submit_manual_multileg_order(
     legs: list[dict],
     quantity: int,
     limit_price: float,
     client_order_id: str | None = None,
+    expected_entry_type: str | None = None,
+    expected_spread_width: float | None = None,
 ) -> tuple[dict | None, list[str], str | None]:
+    if expected_entry_type is not None or expected_spread_width is not None:
+        limit_errors = validate_manual_limit_price(
+            expected_entry_type,
+            limit_price,
+            expected_spread_width,
+        )
+        if limit_errors:
+            return None, limit_errors, None
+    leg_errors = validate_opening_option_legs(legs)
+    if leg_errors:
+        return None, leg_errors, None
     preflight_state, preflight_errors = get_alpaca_opening_preflight_state()
     if preflight_errors:
         return None, preflight_errors, None
