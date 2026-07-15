@@ -312,55 +312,191 @@ def analyze_execution_candidates(execution_candidates, preferences, price_moves)
 st.markdown(
     """
     <style>
+        :root {
+            --bg-main: #0b1220;
+            --bg-panel: #111a2b;
+            --bg-panel-2: #162338;
+            --bg-card: #15243a;
+            --bg-input: #0f1727;
+            --bg-accent-soft: #102844;
+            --border: #253551;
+            --border-strong: #36507b;
+            --text-main: #ecf3ff;
+            --text-muted: #9caecf;
+            --text-soft: #7f93b8;
+            --accent: #63b3ff;
+            --accent-strong: #2f8fff;
+            --accent-deep: #1e6fe0;
+            --success: #5ad7a3;
+        }
         .stApp {
-            background: #f6f8f6;
-            color: #15221e;
+            background:
+                radial-gradient(circle at top left, rgba(47, 143, 255, 0.12), transparent 24%),
+                linear-gradient(180deg, #09111d 0%, #0b1220 38%, #0d1626 100%);
+            color: var(--text-main);
         }
         .block-container {
             max-width: 1440px;
             padding-top: 2rem;
             padding-bottom: 2.5rem;
         }
+        h1, h2, h3, h4, h5, h6 {
+            color: var(--text-main) !important;
+            letter-spacing: 0;
+        }
+        p, li, span, div {
+            color: inherit;
+        }
+        [data-testid="stCaptionContainer"] {
+            color: var(--text-muted) !important;
+        }
         [data-testid="stSidebar"] {
-            background: #eef2ef;
-            border-right: 1px solid #d8e0db;
+            background:
+                linear-gradient(180deg, rgba(20, 32, 52, 0.98) 0%, rgba(12, 20, 34, 0.98) 100%);
+            border-right: 1px solid var(--border);
+            box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.03);
+        }
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] .stMarkdown,
+        [data-testid="stSidebar"] .stCaption,
+        [data-testid="stSidebar"] [data-testid="stExpander"] summary,
+        [data-testid="stSidebar"] [data-testid="stSelectbox"] label,
+        [data-testid="stSidebar"] [data-testid="stTextArea"] label,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] label {
+            color: var(--text-main) !important;
+            font-weight: 600;
+        }
+        [data-testid="stSidebar"] [data-testid="collapsedControl"] svg,
+        [data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] svg,
+        [data-testid="stSidebar"] [data-testid="stExpander"] summary svg {
+            fill: var(--text-muted) !important;
+            color: var(--text-muted) !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="select"] > div,
+        [data-testid="stSidebar"] [data-testid="stTextArea"] textarea,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] input,
+        [data-testid="stSidebar"] [data-testid="stTextInput"] input {
+            background: var(--bg-input) !important;
+            color: var(--text-main) !important;
+            border: 1px solid var(--border) !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="select"] svg,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] button,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] button svg {
+            color: var(--text-muted) !important;
+            fill: var(--text-muted) !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stTextArea"] textarea::placeholder,
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] input::placeholder,
+        [data-testid="stSidebar"] [data-testid="stTextInput"] input::placeholder {
+            color: var(--text-soft) !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stExpander"] {
+            background: rgba(15, 23, 39, 0.7);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+        }
+        [data-testid="stSidebar"] [data-testid="stExpander"] details {
+            background: transparent;
+        }
+        [data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {
+            background: rgba(99, 179, 255, 0.06);
         }
         [data-testid="stMetric"] {
-            background: #ffffff;
-            border: 1px solid #d8e0db;
-            border-radius: 6px;
-            padding: 0.7rem 0.85rem;
+            background: linear-gradient(180deg, rgba(21, 36, 58, 0.96) 0%, rgba(17, 26, 43, 0.96) 100%);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 0.9rem 1rem;
+            box-shadow: 0 10px 24px rgba(3, 8, 16, 0.22);
         }
         [data-testid="stMetricLabel"] {
-            color: #53645c;
+            color: var(--text-muted) !important;
         }
         [data-testid="stMetricValue"] {
-            color: #0c604e;
+            color: var(--accent) !important;
         }
         div.stButton > button,
         div.stDownloadButton > button {
-            border-radius: 6px;
+            border-radius: 12px;
             font-weight: 600;
+            transition: all 0.18s ease;
         }
         div.stButton > button[kind="primary"] {
-            background: #000080;
-            border-color: #000080;
+            background: linear-gradient(135deg, var(--accent-deep) 0%, var(--accent-strong) 100%);
+            border: 1px solid rgba(99, 179, 255, 0.35);
+            color: #f6fbff;
+            box-shadow: 0 10px 26px rgba(30, 111, 224, 0.3);
         }
         div.stButton > button[kind="primary"]:hover {
-            background: #123499;
-            border-color: #123499;
+            background: linear-gradient(135deg, #2878eb 0%, #58b0ff 100%);
+            border-color: rgba(99, 179, 255, 0.5);
+            transform: translateY(-1px);
+        }
+        div.stButton > button:not([kind="primary"]),
+        div.stDownloadButton > button {
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+        }
+        div.stButton > button:not([kind="primary"]):hover,
+        div.stDownloadButton > button:hover {
+            border-color: var(--border-strong);
+            background: var(--bg-panel-2);
         }
         [data-baseweb="tab-list"] {
             gap: 1.25rem;
-            border-bottom: 1px solid #d8e0db;
+            border-bottom: 1px solid var(--border);
         }
         [data-baseweb="tab"] {
             height: 42px;
             padding: 0 0.2rem;
             font-weight: 600;
+            color: var(--text-muted) !important;
         }
         [data-baseweb="tab-highlight"] {
-            background-color: #0c604e;
+            background-color: var(--accent-strong);
+        }
+        [data-baseweb="tab"][aria-selected="true"] {
+            color: var(--text-main) !important;
+        }
+        [data-testid="stAlert"] {
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            background: rgba(16, 40, 68, 0.9);
+            color: var(--text-main);
+        }
+        [data-testid="stStatusWidget"] {
+            background: rgba(17, 26, 43, 0.94);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+        }
+        [data-testid="stStatusWidget"] * {
+            color: var(--text-main) !important;
+        }
+        [data-testid="stToolbar"] {
+            background: transparent;
+        }
+        [data-testid="stHeader"] {
+            background: rgba(9, 17, 29, 0.92);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        section[data-testid="stSidebar"] .stButton button[kind="secondary"] {
+            background: var(--bg-panel);
+            color: var(--text-main);
+        }
+        [data-testid="stSidebar"] .stButton button {
+            width: 100%;
+        }
+        [data-testid="stSidebar"] [data-testid="baseButton-secondary"] {
+            border-color: var(--border);
+        }
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] .stCaption {
+            color: var(--text-muted) !important;
+        }
+        [data-testid="stSidebarNav"] {
+            background: transparent;
         }
     </style>
     """,
