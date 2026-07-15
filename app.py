@@ -1,5 +1,5 @@
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timezone
 import hmac
 import os
 import pandas as pd
@@ -20,12 +20,14 @@ try:
         submit_manual_multileg_order,
         submit_scored_multileg_orders,
         trade_multileg_order_details,
+        validate_opening_option_legs,
     )
 except ImportError:
     leg_key_from_legs = None
     submit_manual_multileg_order = None
     submit_scored_multileg_orders = None
     trade_multileg_order_details = None
+    validate_opening_option_legs = None
 from history_tracker import (
     add_manual_position,
     append_scan_history as save_history,
@@ -76,7 +78,10 @@ from stock2dupe import (
     CONTRACT_MULTIPLIER,
     EXPIRATION_COVERAGE_EXHAUSTIVE,
     EXPIRATION_COVERAGE_FAST_WEEKLY,
+    FILTER_LABELS,
     ScanPreferences,
+    bid_ask_spread,
+    bid_ask_to_trade_value_ratio,
     build_call_credit_spreads,
     build_iron_condors_with_diagnostics,
     build_put_credit_spreads,
@@ -84,12 +89,20 @@ from stock2dupe import (
     build_bear_put_debit_spread,
     get_option_chain_result,
     execution_selection_diagnostics,
+    expected_move_cushion,
+    evaluate_filter_failures,
+    credit_to_width_ratio,
+    manual_order_safety_failures,
+    manual_override_decision,
+    reward_to_risk_ratio,
     scan_trades,
+    score_trade,
     select_execution_candidates,
     select_history_candidates,
+    spread_width,
     strategy_direction,
 )
-from scanner_tracking import new_scan_run_id
+from scanner_tracking import new_scan_run_id, setup_key_for_trade
 from scanner_post_selection import (
     BEAR_PUT_DEBIT_SPREADS,
     BULL_CALL_DEBIT_SPREADS,
@@ -800,6 +813,76 @@ def candidate_rows(scored_trades):
     return [candidate_row(scored) for scored in select_top_candidates(scored_trades)]
 
 
+def rejected_setup_row(trade, reasons):
+    width = bid_ask_spread(trade)
+    relative_width = bid_ask_to_trade_value_ratio(trade)
+    if trade.strategy == "iron condor":
+        strikes = (
+            f"{trade.put_long_strike}/{trade.put_short_strike} puts; "
+            f"{trade.call_short_strike}/{trade.call_long_strike} calls"
+        )
+    else:
+        strikes = f"{trade.long_strike}/{trade.short_strike}"
+    return {
+        "Ticker": trade.ticker,
+        "Strategy": trade.strategy.title(),
+        "Expiration": trade.expiration,
+        "Strikes": strikes,
+        "Entry Type": trade.entry_type.title(),
+        "Estimated Credit": (
+            round(trade.credit * CONTRACT_MULTIPLIER, 2)
+            if trade.entry_type == "credit"
+            else None
+        ),
+        "Estimated Debit": (
+            round(trade.max_risk * CONTRACT_MULTIPLIER, 2)
+            if trade.entry_type == "debit"
+            else None
+        ),
+        "Max Profit": round(
+            (
+                trade.max_profit
+                if trade.entry_type == "debit"
+                else trade.credit
+            )
+            * CONTRACT_MULTIPLIER,
+            2,
+        ),
+        "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
+        "Bid": round(trade.bid, 2),
+        "Ask": round(trade.ask, 2),
+        "Bid/Ask Width": width,
+        "Quoted Width Per Contract": round(width * CONTRACT_MULTIPLIER, 2),
+        "Bid/Ask % Of Trade Value": (
+            round(relative_width * 100, 1) if relative_width is not None else None
+        ),
+        "Open Interest": trade.open_interest,
+        "Volume": trade.volume,
+        "Delta": round(trade.delta, 3),
+        "DTE": trade.dte,
+        "Realized Volatility Rank": round(trade.volatility_rank, 1),
+        "Expected-Move Cushion": expected_move_cushion(trade),
+        "Credit/Width Ratio": (
+            round(credit_to_width_ratio(trade), 3)
+            if trade.entry_type == "credit"
+            else None
+        ),
+        "Reward/Risk Ratio": (
+            round(reward_to_risk_ratio(trade), 3)
+            if trade.entry_type == "debit"
+            else None
+        ),
+        "Rejection Reasons": "; ".join(reasons),
+    }
+
+
+def rejected_setup_label(index, trade):
+    return (
+        f"{index + 1}. {trade.ticker} | {trade.strategy.title()} | "
+        f"{trade.expiration} | {trade.long_strike}/{trade.short_strike}"
+    )
+
+
 def execution_candidate_rows(scored_trades):
     rows = []
     for rank, scored in enumerate(scored_trades, start=1):
@@ -1302,6 +1385,58 @@ def render_scan_output(scan_output):
                     st.dataframe(score_rows, width="content", hide_index=True)
         else:
             st.info("No candidates passed the current filters.")
+
+        st.subheader("Rejected Setups")
+        st.caption(
+            "These setups failed one or more normal hard filters. Inspecting a "
+            "rejected setup does not add it to recommendations, history, or "
+            "automatic paper trading. Quoted width is shown per share and per contract."
+        )
+        if rejected_trades:
+            rejected_rows = [
+                rejected_setup_row(trade, reasons)
+                for trade, reasons in rejected_trades
+            ]
+            st.dataframe(
+                pd.DataFrame(rejected_rows),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Estimated Credit": st.column_config.NumberColumn(format="$%.2f"),
+                    "Estimated Debit": st.column_config.NumberColumn(format="$%.2f"),
+                    "Max Profit": st.column_config.NumberColumn(format="$%.2f"),
+                    "Max Risk": st.column_config.NumberColumn(format="$%.2f"),
+                    "Bid": st.column_config.NumberColumn(format="$%.2f"),
+                    "Ask": st.column_config.NumberColumn(format="$%.2f"),
+                    "Bid/Ask Width": st.column_config.NumberColumn(format="$%.2f"),
+                    "Quoted Width Per Contract": st.column_config.NumberColumn(
+                        format="$%.2f"
+                    ),
+                    "Bid/Ask % Of Trade Value": st.column_config.NumberColumn(
+                        format="%.1f%%"
+                    ),
+                },
+            )
+            rejected_options = {
+                rejected_setup_label(index, trade): (trade, reasons)
+                for index, (trade, reasons) in enumerate(rejected_trades)
+            }
+            selected_rejected_label = st.selectbox(
+                "Inspect Rejected Setup",
+                list(rejected_options),
+                key="rejected_setup_inspection",
+            )
+            selected_rejected_trade, selected_reasons = rejected_options[
+                selected_rejected_label
+            ]
+            st.write(
+                rejected_setup_row(selected_rejected_trade, selected_reasons)
+            )
+            st.markdown("**Original rejection reasons**")
+            for reason in selected_reasons:
+                st.write(f"- {reason}")
+        else:
+            st.info("No setups were rejected in this scan.")
 
         debit_column, credit_column = st.columns(2)
         with debit_column:
@@ -2198,6 +2333,250 @@ def render_manual_positions():
                 st.rerun()
 
 
+def render_manual_override_paper_form(scan_output, paper_endpoint: bool):
+    st.divider()
+    st.subheader("Manual Rejected-Setup Override")
+    st.warning(
+        "Manual overrides can expose you to worse liquidity and fill quality. "
+        "They never become normal scanner passes and are never used by automatic "
+        "top-three paper trading."
+    )
+    rejected_trades = scan_output.get("rejected_trades", []) if scan_output else []
+    if not rejected_trades:
+        st.info("The latest scan has no rejected setups available for manual override.")
+        return
+    if (
+        submit_manual_multileg_order is None
+        or trade_multileg_order_details is None
+        or validate_opening_option_legs is None
+    ):
+        st.error("Manual paper-order safety helpers are unavailable.")
+        return
+
+    preferences = scan_output.get("preferences") or ScanPreferences(
+        500, "neutral", "moderate"
+    )
+    price_moves = scan_output.get("price_moves", {})
+    rejected_options = {
+        rejected_setup_label(index, trade): (trade, reasons)
+        for index, (trade, reasons) in enumerate(rejected_trades)
+    }
+    selected_label = st.selectbox(
+        "Rejected Setup",
+        list(rejected_options),
+        key="manual_override_rejected_setup",
+    )
+    trade, original_reasons = rejected_options[selected_label]
+    filter_failures = evaluate_filter_failures(trade, preferences)
+    safety_failures = manual_order_safety_failures(trade)
+    seen_failures = set()
+    all_failures = []
+    for failure in filter_failures + safety_failures:
+        key = (failure.filter_id, failure.description)
+        if key not in seen_failures:
+            seen_failures.add(key)
+            all_failures.append(failure)
+
+    failure_rows = [
+        {
+            "Filter ID": failure.filter_id,
+            "Failure": failure.description,
+            "Manual Override": "Allowed" if failure.overridable else "Blocked",
+        }
+        for failure in all_failures
+    ]
+    st.dataframe(pd.DataFrame(failure_rows), width="stretch", hide_index=True)
+    st.markdown("**All original rejection reasons**")
+    for reason in original_reasons:
+        st.write(f"- {reason}")
+
+    overridable_by_id = {
+        failure.filter_id: failure
+        for failure in all_failures
+        if failure.overridable
+    }
+    selected_override_ids = st.multiselect(
+        "Select Each Failed Filter To Override",
+        list(overridable_by_id),
+        format_func=lambda filter_id: (
+            f"{FILTER_LABELS.get(filter_id, filter_id)}: "
+            f"{overridable_by_id[filter_id].description}"
+        ),
+        key=f"manual_override_filter_ids_{setup_key_for_trade(trade)}",
+    )
+    decision = manual_override_decision(all_failures, selected_override_ids)
+
+    original_scored = score_trade(
+        trade,
+        preferences,
+        event_adjustment=0,
+        price_move=price_moves.get(trade.ticker),
+        event_label="neutral",
+    )
+    legs = []
+    suggested_limit_price = 0.0
+    quantity_type = trade.entry_type
+    leg_errors = []
+    try:
+        legs, suggested_limit_price, quantity_type = trade_multileg_order_details(
+            original_scored
+        )
+        leg_errors = validate_opening_option_legs(legs)
+    except (TypeError, ValueError) as error:
+        leg_errors = [str(error)]
+
+    if decision.overridden_failures:
+        st.markdown("**Selected overrides**")
+        for failure in decision.overridden_failures:
+            st.write(f"- {failure.description}")
+    if decision.non_overridden_failures:
+        st.markdown("**Failures not overridden**")
+        for failure in decision.non_overridden_failures:
+            st.error(failure.description)
+    if decision.non_overridable_failures or leg_errors:
+        st.markdown("**Non-overridable safety failures**")
+        for failure in decision.non_overridable_failures:
+            st.error(failure.description)
+        for error in leg_errors:
+            st.error(error)
+    if not paper_endpoint:
+        st.error(
+            "Manual override submission is disabled because Alpaca is not using "
+            "the paper endpoint."
+        )
+
+    duplicate_errors = []
+    duplicate_leg_key = False
+    if decision.allowed and not leg_errors and paper_endpoint:
+        existing_leg_keys, duplicate_errors = fetch_alpaca_paper_leg_keys()
+        if duplicate_errors:
+            st.markdown("**Non-overridable order-identity failure**")
+            for error in duplicate_errors:
+                st.error(error)
+        else:
+            duplicate_leg_key = leg_key_from_legs(legs) in existing_leg_keys
+            if duplicate_leg_key:
+                st.error(
+                    "This exact setup already has an active tracked paper order. "
+                    "Duplicate protection cannot be overridden."
+                )
+
+    st.caption(
+        f"Original quantitative score: {original_scored.quant_score}/100. "
+        "The override does not improve or replace this score."
+    )
+    if legs:
+        st.dataframe(pd.DataFrame(legs), width="stretch", hide_index=True)
+
+    can_submit = (
+        decision.allowed
+        and not leg_errors
+        and paper_endpoint
+        and not duplicate_errors
+        and not duplicate_leg_key
+    )
+    with st.form("manual_rejected_override_order_form"):
+        order_columns = st.columns(2)
+        quantity = order_columns[0].number_input(
+            "Override Contracts", min_value=1, max_value=10, value=1, step=1
+        )
+        limit_price = order_columns[1].number_input(
+            "Override Limit Price",
+            min_value=0.01,
+            value=max(round(float(suggested_limit_price), 2), 0.01),
+            step=0.01,
+        )
+        override_confirmation = st.text_input("Type OVERRIDE")
+        paper_confirmation = st.text_input("Type PAPER")
+        submitted = st.form_submit_button(
+            "Submit Overridden Paper Setup",
+            disabled=not can_submit,
+        )
+
+    if not submitted:
+        return
+    if override_confirmation != "OVERRIDE":
+        st.error("Type OVERRIDE exactly before submitting.")
+        return
+    if paper_confirmation != "PAPER":
+        st.error("Type PAPER exactly before submitting.")
+        return
+
+    override_key = f"override-{paper_trade_key(original_scored)}"
+    submitted_override_keys = st.session_state.setdefault(
+        "manual_override_order_keys", set()
+    )
+    if override_key in submitted_override_keys:
+        st.warning("This overridden setup was already submitted during this app session.")
+        return
+
+    order, submit_errors, skip_message = submit_manual_multileg_order(
+        legs,
+        quantity=int(quantity),
+        limit_price=float(limit_price),
+        client_order_id=override_key,
+    )
+    if skip_message:
+        st.warning(skip_message)
+        return
+    if submit_errors:
+        for error in submit_errors:
+            st.error(error)
+        return
+
+    submitted_override_keys.add(override_key)
+    override_timestamp = datetime.now(timezone.utc).isoformat()
+    save_errors = append_alpaca_paper_orders(
+        [
+            {
+                "Candidate": (
+                    f"{trade.ticker} {trade.strategy} {trade.expiration} "
+                    "manual override"
+                ),
+                "Symbol": order.get("symbol")
+                or ("2-leg order" if len(legs) == 2 else "4-leg order"),
+                "Status": order.get("status", "submitted"),
+                "Message": (
+                    f"Manual override {quantity_type} limit "
+                    f"${float(limit_price):.2f}; order {order.get('id')}"
+                ),
+                "Order ID": order.get("id"),
+                "Client Order ID": order.get("client_order_id"),
+                "Ticker": trade.ticker,
+                "Strategy": trade.strategy,
+                "Expiration": trade.expiration,
+                "Setup Score": original_scored.total_score,
+                "Quant Score": original_scored.quant_score,
+                "Setup Key": setup_key_for_trade(trade),
+                "Selection Method": "manual_override",
+                "Entry Type": trade.entry_type,
+                "Limit Price": float(limit_price),
+                "Spread Width Per Share": spread_width(trade),
+                "Max Profit": (
+                    trade.max_profit if trade.entry_type == "debit" else trade.credit
+                ),
+                "Max Risk": trade.max_risk,
+                "Quantity": int(quantity),
+                "Order Class": order.get("order_class") or "mleg",
+                "Leg Key": leg_key_from_legs(legs),
+                "Opening Order Status": order.get("status"),
+                "Opening Filled At": order.get("filled_at"),
+                "Opening Filled Avg Price": order.get("filled_avg_price"),
+                "Manual Override": True,
+                "Overridden Filters": list(selected_override_ids),
+                "Original Rejection Reasons": list(original_reasons),
+                "Override Timestamp": override_timestamp,
+                "Original Quantitative Score": original_scored.quant_score,
+            }
+        ]
+    )
+    st.success(
+        f"Overridden paper order submitted with status {order.get('status', 'submitted')}."
+    )
+    for error in save_errors:
+        st.warning(error)
+
+
 def render_alpaca_account_status():
     st.subheader("Alpaca Paper Account")
     st.caption(
@@ -2544,13 +2923,19 @@ def render_alpaca_account_status():
             st.success(f"Backfilled {len(backfill_results)} Alpaca paper orders.")
             st.rerun()
 
+    scan_output = st.session_state.get("last_scan_output")
+    if scan_output:
+        render_manual_override_paper_form(
+            scan_output,
+            paper_endpoint=bool(account.get("_is_paper")),
+        )
+
     st.divider()
     st.subheader("Paper Trade A Scan Candidate")
     st.caption(
         "Submits the full spread as an Alpaca multi-leg paper order. The order "
         "fills together or not at all."
     )
-    scan_output = st.session_state.get("last_scan_output")
     if not scan_output or not scan_output.get("scored_trades"):
         st.info("Run a scan first, then come back here to paper trade a candidate.")
         return
@@ -2814,6 +3199,50 @@ with st.sidebar:
             if expiration_coverage_label == "Fast weekly coverage"
             else EXPIRATION_COVERAGE_EXHAUSTIVE
         )
+    with st.expander("Advanced Quote Filters"):
+        vertical_max_bid_ask_width = st.number_input(
+            "Maximum Vertical Bid/Ask Width",
+            min_value=0.01,
+            max_value=1.00,
+            value=0.20,
+            step=0.01,
+            format="%.2f",
+            help="The default rejects vertical spreads at a quoted width of $0.20 or wider.",
+        )
+        st.caption(
+            f"Approximately ${float(vertical_max_bid_ask_width) * CONTRACT_MULTIPLIER:.0f} "
+            "of quoted width per one-contract vertical spread."
+        )
+        condor_max_bid_ask_width = st.number_input(
+            "Maximum Iron Condor Bid/Ask Width",
+            min_value=0.01,
+            max_value=2.00,
+            value=0.40,
+            step=0.01,
+            format="%.2f",
+            help="The default allows four-leg condors up to a $0.40 quoted width.",
+        )
+        st.caption(
+            f"Approximately ${float(condor_max_bid_ask_width) * CONTRACT_MULTIPLIER:.0f} "
+            "of quoted width per one-contract iron condor."
+        )
+        use_relative_bid_ask_limit = st.checkbox(
+            "Limit Bid/Ask Width Relative To Trade Value",
+            value=False,
+            help=(
+                "For credit trades this is width divided by credit. For debit "
+                "trades this is width divided by debit."
+            ),
+        )
+        max_bid_ask_to_trade_value_ratio = st.number_input(
+            "Maximum Bid/Ask-to-Trade-Value Ratio",
+            min_value=0.01,
+            max_value=5.00,
+            value=0.50,
+            step=0.05,
+            format="%.2f",
+            disabled=not use_relative_bid_ask_limit,
+        )
     with st.expander("Broad Universe Prefilter"):
         use_prefilter = st.checkbox(
             "Prefilter before options scan",
@@ -2915,6 +3344,13 @@ if scan_button:
         test_expiration=test_expiration,
         nearest_expiration=use_nearest_expiration,
         price_move_mode=price_move_mode,
+        vertical_max_bid_ask_width=float(vertical_max_bid_ask_width),
+        condor_max_bid_ask_width=float(condor_max_bid_ask_width),
+        max_bid_ask_to_trade_value_ratio=(
+            float(max_bid_ask_to_trade_value_ratio)
+            if use_relative_bid_ask_limit
+            else None
+        ),
         expiration_coverage=expiration_coverage,
     )
     with st.status("Scanning watchlist...", expanded=True) as scan_status:
@@ -3089,6 +3525,8 @@ if scan_button:
         "candidate_analyses": candidate_analyses,
         "history_candidates": history_candidates,
         "paper_order_results": paper_order_results,
+        "preferences": preferences,
+        "price_moves": price_moves,
         "scan_performance": scan_performance,
         "prefilter_rows": prefilter_rows,
         "prefilter_selected_tickers": tickers if use_prefilter else [],

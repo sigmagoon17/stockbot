@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -122,6 +123,15 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
                 "scan_run_id": result.get("Scan Run ID"),
                 "execution_rank": result.get("Execution Rank"),
                 "selection_method": result.get("Selection Method"),
+                "manual_override": result.get("Manual Override") or False,
+                "overridden_filters": result.get("Overridden Filters"),
+                "original_rejection_reasons": result.get(
+                    "Original Rejection Reasons"
+                ),
+                "override_timestamp": result.get("Override Timestamp"),
+                "original_quantitative_score": result.get(
+                    "Original Quantitative Score"
+                ),
                 "entry_type": result.get("Entry Type"),
                 "limit_price": result.get("Limit Price"),
                 "entry_price": opening_fill,
@@ -141,6 +151,15 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
                 "position_status": position_status,
             }
         )
+        if not result.get("Manual Override"):
+            for override_column in (
+                "manual_override",
+                "overridden_filters",
+                "original_rejection_reasons",
+                "override_timestamp",
+                "original_quantitative_score",
+            ):
+                rows[-1].pop(override_column, None)
 
     if not rows:
         return []
@@ -182,7 +201,47 @@ def append_alpaca_paper_orders(order_results: list[dict]) -> list[str]:
             new_rows.append(row)
 
         if new_rows:
-            supabase.table("alpaca_paper_orders").insert(new_rows).execute()
+            try:
+                supabase.table("alpaca_paper_orders").insert(new_rows).execute()
+            except Exception as insert_error:
+                override_columns = {
+                    "manual_override",
+                    "overridden_filters",
+                    "original_rejection_reasons",
+                    "override_timestamp",
+                    "original_quantitative_score",
+                }
+                error_text = str(insert_error).lower()
+                missing_override_schema = any(
+                    column in error_text for column in override_columns
+                ) or "schema cache" in error_text
+                if not missing_override_schema or not any(
+                    row.get("manual_override") for row in new_rows
+                ):
+                    raise
+
+                fallback_rows = []
+                for row in new_rows:
+                    fallback = dict(row)
+                    metadata = {
+                        column: fallback.pop(column, None)
+                        for column in override_columns
+                    }
+                    if metadata.get("manual_override"):
+                        metadata_text = json.dumps(metadata, sort_keys=True)
+                        fallback["message"] = (
+                            f"{fallback.get('message') or ''} | "
+                            f"manual_override_metadata={metadata_text}"
+                        ).strip(" |")
+                    fallback_rows.append(fallback)
+                supabase.table("alpaca_paper_orders").insert(
+                    fallback_rows
+                ).execute()
+                return [
+                    "Manual override metadata columns are not applied yet; "
+                    "metadata was stored in the order message. Run "
+                    "supabase_manual_filter_overrides.sql."
+                ]
         return []
     except Exception as error:
         return [f"Could not save Alpaca paper orders: {error}"]
