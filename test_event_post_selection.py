@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from alpaca_client import submit_scored_multileg_orders
 from event_analysis import client, configured_openai_timeout_seconds
+from streamlit.testing.v1 import AppTest
 from scanner_post_selection import (
     BEAR_PUT_DEBIT_SPREADS,
     BULL_CALL_DEBIT_SPREADS,
@@ -237,6 +238,26 @@ class StrategySelectionTests(unittest.TestCase):
             [item for rows in results.values() for item in rows],
         )
 
+    def test_each_stable_strategy_id_calls_only_its_builder(self):
+        for strategy_id in STRATEGY_OPTIONS:
+            with self.subTest(strategy_id=strategy_id):
+                calls = []
+                results = run_selected_strategy_builders(
+                    [strategy_id],
+                    self.builders(calls),
+                )
+                self.assertEqual([strategy_id], calls)
+                self.assertEqual([strategy_id], list(results))
+
+    def test_empty_selection_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "at least one strategy"):
+            run_selected_strategy_builders([], self.builders([]))
+
+    def test_unknown_strategy_id_fails_clearly(self):
+        unknown = "calendar_spread"
+        with self.assertRaisesRegex(ValueError, unknown):
+            run_selected_strategy_builders([unknown], self.builders([]))
+
     def test_disabled_strategy_builder_is_not_called(self):
         calls = []
         selected = [
@@ -248,6 +269,46 @@ class StrategySelectionTests(unittest.TestCase):
         results = run_selected_strategy_builders(selected, self.builders(calls))
         self.assertNotIn(IRON_CONDORS, calls)
         self.assertNotIn(IRON_CONDORS, results)
+
+
+class StrategySelectionUIBoundaryTests(unittest.TestCase):
+    def test_empty_ui_selection_stops_before_every_side_effect(self):
+        with (
+            patch("history_tracker.update_expired_history") as update_history,
+            patch("stock_universe.prefilter_tickers") as prefilter,
+            patch("stock2dupe.get_option_chain_result") as option_chain,
+            patch("event_analysis.get_deep_event_analysis") as event_analysis,
+            patch("event_analysis.analyze_candidate_setup") as candidate_review,
+            patch("alpaca_client.get_alpaca_positions") as alpaca_positions,
+        ):
+            app = AppTest.from_file("app.py", default_timeout=30)
+            app.run()
+            next(
+                widget
+                for widget in app.multiselect
+                if widget.label == "Strategies"
+            ).set_value([])
+            next(
+                widget
+                for widget in app.checkbox
+                if widget.label == "Prefilter before options scan"
+            ).set_value(True)
+            next(
+                widget
+                for widget in app.button
+                if widget.label == "Scan Watchlist"
+            ).click()
+            app.run()
+
+        self.assertTrue(
+            any("Select at least one strategy." in error.value for error in app.error)
+        )
+        update_history.assert_not_called()
+        prefilter.assert_not_called()
+        option_chain.assert_not_called()
+        event_analysis.assert_not_called()
+        candidate_review.assert_not_called()
+        alpaca_positions.assert_not_called()
 
 
 class OpenAITimeoutConfigurationTests(unittest.TestCase):

@@ -4,11 +4,19 @@ from time import perf_counter
 from typing import Callable
 
 
-PUT_CREDIT_SPREADS = "Put Credit Spreads"
-CALL_CREDIT_SPREADS = "Call Credit Spreads"
-BULL_CALL_DEBIT_SPREADS = "Bull Call Debit Spreads"
-BEAR_PUT_DEBIT_SPREADS = "Bear Put Debit Spreads"
-IRON_CONDORS = "Iron Condors"
+PUT_CREDIT_SPREADS = "put_credit_spread"
+CALL_CREDIT_SPREADS = "call_credit_spread"
+BULL_CALL_DEBIT_SPREADS = "bull_call_debit_spread"
+BEAR_PUT_DEBIT_SPREADS = "bear_put_debit_spread"
+IRON_CONDORS = "iron_condor"
+
+STRATEGY_LABELS = {
+    PUT_CREDIT_SPREADS: "Put Credit Spreads",
+    CALL_CREDIT_SPREADS: "Call Credit Spreads",
+    BULL_CALL_DEBIT_SPREADS: "Bull Call Debit Spreads",
+    BEAR_PUT_DEBIT_SPREADS: "Bear Put Debit Spreads",
+    IRON_CONDORS: "Iron Condors",
+}
 
 STRATEGY_OPTIONS = (
     PUT_CREDIT_SPREADS,
@@ -28,11 +36,18 @@ STRATEGY_BUILD_ORDER = (
 )
 
 
-def run_selected_strategy_builders(selected_strategies, builders):
+def validate_strategy_selection(selected_strategies):
     selected = set(STRATEGY_OPTIONS if selected_strategies is None else selected_strategies)
+    if not selected:
+        raise ValueError("Select at least one strategy.")
     unsupported = selected.difference(STRATEGY_OPTIONS)
     if unsupported:
         raise ValueError(f"Unsupported strategies: {sorted(unsupported)}")
+    return selected
+
+
+def run_selected_strategy_builders(selected_strategies, builders):
+    selected = validate_strategy_selection(selected_strategies)
     return {
         strategy: builders[strategy]()
         for strategy in STRATEGY_BUILD_ORDER

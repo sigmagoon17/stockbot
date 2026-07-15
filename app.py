@@ -96,9 +96,11 @@ from scanner_post_selection import (
     CALL_CREDIT_SPREADS,
     IRON_CONDORS,
     PUT_CREDIT_SPREADS,
+    STRATEGY_LABELS,
     STRATEGY_OPTIONS,
     analyze_top_candidates,
     run_selected_strategy_builders,
+    validate_strategy_selection,
 )
 from stock_universe import prefilter_tickers
 
@@ -406,6 +408,7 @@ def scan_watchlist(
     preferences: ScanPreferences,
     selected_strategies=None,
 ):
+    validate_strategy_selection(selected_strategies)
     scan_started = time.perf_counter()
     trades = []
     ticker_data = []
@@ -483,7 +486,7 @@ def scan_watchlist(
                     "Fetched Expirations": ", ".join(market_result.expirations_fetched),
                     "Market Data Cache": "Hit" if market_data_cache_hit else "Miss",
                     "Event Label": "Neutral",
-                    "Event Adjustment": 0,
+                    "Supplemental Event Adjustment": 0,
                     "News Depth": "Not analyzed",
                 }
             )
@@ -645,10 +648,9 @@ def candidate_row(scored):
             else None
         ),
         "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
-        "Setup Score": scored.total_score,
+        "Selection Score": scored.total_score,
         "Ticker Score": scored.normalized_ticker_score,
         "Quant Score": scored.quant_score,
-        "Event Adjustment": scored.event_adjustment,
         "Price Move Adjustment": scored.effective_price_move_adjustment,
         "Raw Price Move Adjustment": scored.raw_price_move_adjustment,
         "Base Score Without Price Move": scored.base_score_without_price_move,
@@ -672,10 +674,9 @@ def execution_candidate_rows(scored_trades):
                 "Ticker": trade.ticker,
                 "Strategy": trade.strategy.title(),
                 "Direction": strategy_direction(trade.strategy).title(),
-                "Setup Score": scored.total_score,
+                "Selection Score": scored.total_score,
                 "Ticker Score": scored.normalized_ticker_score,
                 "Quant Score": scored.quant_score,
-                "Event Adjustment": scored.event_adjustment,
                 "Price-Move Adjustment": scored.effective_price_move_adjustment,
                 "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "Expiration": trade.expiration,
@@ -698,20 +699,18 @@ def candidate_column_config():
         "Max Risk": st.column_config.NumberColumn(
             "Max Risk", help="Maximum loss per spread at expiration.", format="$%.2f"
         ),
-        "Setup Score": st.column_config.NumberColumn(
-            "Setup Score",
-            help="Final score after quant rules, event analysis, and recent price movement.",
+        "Selection Score": st.column_config.NumberColumn(
+            "Selection Score",
+            help=(
+                "Quantitative score used to select and rank candidates before "
+                "post-selection AI event analysis."
+            ),
             format="%d / 100",
         ),
         "Quant Score": st.column_config.NumberColumn(
             "Quant Score",
-            help="Score from the scanner's mathematical filters before event analysis.",
+            help="Score from the scanner's mathematical categories.",
             format="%d / 100",
-        ),
-        "Event Adjustment": st.column_config.NumberColumn(
-            "Event Adjustment",
-            help="Score change from the event-analysis layer. It is zero until event analysis is connected.",
-            format="%d",
         ),
         "Price Move Adjustment": st.column_config.NumberColumn(
             "Price Move Adjustment",
@@ -965,10 +964,9 @@ def debit_candidate_rows(scored_trades):
                 "Short Strike": trade.short_strike,
                 "Debit": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "Max Profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
-                "Setup Score": scored.total_score,
+                "Selection Score": scored.total_score,
                 "Ticker Score": scored.normalized_ticker_score,
                 "Quant Score": scored.quant_score,
-                "Event Adjustment": scored.event_adjustment,
                 "Price Move Adjustment": scored.price_move_adjustment,
                 "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
@@ -996,10 +994,9 @@ def credit_candidate_rows(scored_trades):
                 "Long Strike": trade.long_strike,
                 "Credit": round(trade.credit * CONTRACT_MULTIPLIER, 2),
                 "Max Risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
-                "Setup Score": scored.total_score,
+                "Selection Score": scored.total_score,
                 "Ticker Score": scored.normalized_ticker_score,
                 "Quant Score": scored.quant_score,
-                "Event Adjustment": scored.event_adjustment,
                 "Price Move Adjustment": scored.price_move_adjustment,
                 "Move Setup": scored.price_move_style,
                 "Risk Level": scored.risk_level,
@@ -1031,7 +1028,9 @@ def render_scan_output(scan_output):
     top_score = scored_trades[0].total_score if scored_trades else None
     metric_candidates, metric_score, metric_tracked, metric_tickers = st.columns(4)
     metric_candidates.metric("Passing Candidates", len(scored_trades))
-    metric_score.metric("Highest Score", f"{top_score}/100" if top_score else "None")
+    metric_score.metric(
+        "Highest Selection Score", f"{top_score}/100" if top_score else "None"
+    )
     metric_tracked.metric("Saved to History", len(history_candidates))
     metric_tickers.metric(
         "Tickers Scanned",
@@ -1142,16 +1141,16 @@ def render_scan_output(scan_output):
                 trade = scored.trade
                 with st.expander(
                     f"{trade.ticker} | {trade.strategy.title()} | "
-                    f"Score {scored.total_score}/100"
+                    f"Selection Score {scored.total_score}/100"
                 ):
                     st.write(scored.explanation)
                     event_analysis = event_analyses.get(trade.ticker)
                     if event_analysis:
-                        st.subheader("AI Event View")
+                        st.subheader("Post-Selection AI Event View")
                         event_label, event_adjustment, event_confidence = st.columns(3)
                         event_label.metric("Event Label", event_analysis.label.title())
                         event_adjustment.metric(
-                            "Event Adjustment",
+                            "Supplemental Event Adjustment",
                             f"{event_analysis.adjustment:+d}",
                         )
                         event_confidence.metric(
@@ -2503,7 +2502,7 @@ def render_alpaca_account_status():
                         "Ticker": selected_trade.ticker,
                         "Strategy": selected_trade.strategy,
                         "Expiration": selected_trade.expiration,
-                        "Setup Score": selected_scored.total_score,
+                        "Selection Score": selected_scored.total_score,
                         "Entry Type": selected_trade.entry_type,
                         "Limit Price": float(limit_price),
                         "Quantity": int(quantity),
@@ -2650,6 +2649,7 @@ with st.sidebar:
         "Strategies",
         list(STRATEGY_OPTIONS),
         default=list(STRATEGY_OPTIONS),
+        format_func=lambda strategy_id: STRATEGY_LABELS[strategy_id],
     )
     with st.expander("Advanced Expiration Settings"):
         expiration_coverage_label = st.selectbox(
@@ -2764,7 +2764,10 @@ if scan_button:
     if not tickers:
         st.error("Enter at least one ticker.")
         st.stop()
-    
+
+    if not selected_strategies:
+        st.error("Select at least one strategy.")
+        st.stop()
 
     history_errors = update_history()
     preferences = ScanPreferences(
@@ -2863,7 +2866,7 @@ if scan_button:
             event_analysis = event_analyses.get(row["Ticker"])
             if event_analysis is not None:
                 row["Event Label"] = event_analysis.label.title()
-                row["Event Adjustment"] = event_analysis.adjustment
+                row["Supplemental Event Adjustment"] = event_analysis.adjustment
                 row["News Depth"] = "Top candidate deep analysis"
 
         st.write("Saving tracked candidates and updating snapshots...")
