@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from openai import APIError, OpenAI
+from openai import APIError, APITimeoutError, OpenAI
 import json
 import os
 import re
@@ -9,7 +9,21 @@ import requests
 
 
 load_dotenv()
-client = OpenAI()
+
+
+def configured_openai_timeout_seconds(value=None) -> float:
+    configured = value
+    if configured is None:
+        configured = os.getenv("EVENT_ANALYSIS_OPENAI_TIMEOUT_SECONDS", "20")
+    try:
+        timeout = float(configured)
+    except (TypeError, ValueError):
+        timeout = 20.0
+    return timeout if timeout > 0 else 20.0
+
+
+OPENAI_TIMEOUT_SECONDS = configured_openai_timeout_seconds()
+client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
 
 COMPANY_NAMES = {
     "AAPL": ["Apple"],
@@ -486,7 +500,13 @@ def get_event_analysis(ticker, scanner_outlook):
     try:
         headlines = get_recent_headlines(ticker)
         return analyze_events(ticker, scanner_outlook, headlines)
-    except (APIError, requests.RequestException, RuntimeError, ValueError):
+    except (
+        APIError,
+        APITimeoutError,
+        requests.RequestException,
+        RuntimeError,
+        ValueError,
+    ):
         return neutral_event_analysis(
             ticker,
             [],
@@ -505,7 +525,13 @@ def get_deep_event_analysis(ticker, scanner_outlook):
                 "Deep event analysis found no recent material headlines for {ticker}.",
             )
         return analyze_events(ticker, scanner_outlook, headlines)
-    except (APIError, requests.RequestException, RuntimeError, ValueError):
+    except (
+        APIError,
+        APITimeoutError,
+        requests.RequestException,
+        RuntimeError,
+        ValueError,
+    ):
         return neutral_event_analysis(
             ticker,
             [],
@@ -541,7 +567,7 @@ def analyze_candidate_setup(scored_trade, event_analysis=None, price_move=None):
     Delta: {trade.delta:.2f}
     Realized volatility rank: {trade.volatility_rank:.1f}
     Quant score: {scored_trade.quant_score}
-    Event adjustment: {scored_trade.event_adjustment}
+    Supplemental event adjustment: {getattr(event_analysis, "adjustment", 0)}
     Price move adjustment: {scored_trade.price_move_adjustment}
     Final setup score: {scored_trade.total_score}
     Risk level: {scored_trade.risk_level}
@@ -593,7 +619,14 @@ def analyze_candidate_setup(scored_trade, event_analysis=None, price_move=None):
             risks=[str(item) for item in risks[:2]],
             action=data["action"],
         )
-    except (APIError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+    except (
+        APIError,
+        APITimeoutError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
         return unavailable_candidate_analysis(
             f"AI candidate review was unavailable for {trade.ticker}."
         )

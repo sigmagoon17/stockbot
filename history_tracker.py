@@ -934,7 +934,11 @@ def append_scan_history(
                 "max_risk": round(trade.max_risk * CONTRACT_MULTIPLIER, 2),
                 "max_profit": round(trade.max_profit * CONTRACT_MULTIPLIER, 2),
                 "quant_score": scored.quant_score,
-                "event_adjustment": scored.event_adjustment,
+                "event_adjustment": (
+                    getattr(event_analysis, "adjustment", scored.event_adjustment)
+                    if event_analysis is not None
+                    else scored.event_adjustment
+                ),
                 "raw_price_move_adjustment": scored.raw_price_move_adjustment,
                 "effective_price_move_adjustment": scored.effective_price_move_adjustment,
                 "price_move_adjustment": scored.effective_price_move_adjustment,
